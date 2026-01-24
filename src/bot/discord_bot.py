@@ -78,59 +78,20 @@ class ClaudeBot(commands.Bot):
 
         @self.command(name="join")
         async def join_voice(ctx: commands.Context):
-            """Join the user's voice channel and start listening."""
+            """Switch to the user's voice channel."""
             if not ctx.author.voice:
                 await ctx.send("You need to be in a voice channel!")
                 return
 
             channel = ctx.author.voice.channel
 
-            # Check if already in a session
-            if self._session is not None:
-                await ctx.send("Already in a voice session! Use !leave first.")
+            # Check if already in this channel
+            if ctx.voice_client and ctx.voice_client.channel == channel:
+                await ctx.send(f"Already in **{channel.name}**!")
                 return
 
-            # Disconnect from any existing voice connection
-            if ctx.voice_client:
-                await ctx.voice_client.disconnect()
-
-            try:
-                # Create session with pre-loaded components
-                # Note: LLM is NOT passed here - VoiceSession creates it with the
-                # image callback that needs access to voice_client
-                self._session = VoiceSession(
-                    wake_detector=self._wake_detector,
-                    vad=self._vad,
-                    transcriber=self._transcriber,
-                    # llm created in _init_components with image callback
-                    tts=self._tts,
-                )
-
-                # Initialize any remaining components (STT clients)
-                loop = asyncio.get_running_loop()
-                await loop.run_in_executor(None, self._session._init_components)
-
-                # NOW connect to voice channel
-                logger.info(f"Connecting to voice channel: {channel.name}")
-                voice_client = await channel.connect()
-
-                await ctx.send(
-                    f"Joined **{channel.name}**! "
-                    f"Say '{self.settings.wake_word_model.replace('_', ' ')}' to activate."
-                )
-
-                # Start session in background task
-                self._session_task = asyncio.create_task(
-                    self._run_session(voice_client, ctx)
-                )
-
-            except Exception as e:
-                logger.error(f"Failed to join voice: {e}", exc_info=True)
-                await ctx.send(f"Failed to join: {e}")
-                self._session = None
-                # Disconnect if we managed to connect
-                if ctx.voice_client:
-                    await ctx.voice_client.disconnect()
+            # Join (or switch to) the channel
+            await self._join_channel(channel, ctx.channel)
 
         @self.command(name="leave")
         async def leave_voice(ctx: commands.Context):
@@ -176,13 +137,13 @@ class ClaudeBot(commands.Bot):
     async def _run_session(
         self,
         voice_client: discord.VoiceClient,
-        ctx: commands.Context,
+        notify_channel: Optional[discord.abc.Messageable] = None,
     ):
         """Run voice session and handle errors.
 
         Args:
             voice_client: Connected voice client
-            ctx: Command context for sending messages
+            notify_channel: Optional channel for error messages
         """
         try:
             await self._session.start(voice_client)
@@ -190,7 +151,8 @@ class ClaudeBot(commands.Bot):
             logger.info("Session task cancelled")
         except Exception as e:
             logger.error(f"Session error: {e}", exc_info=True)
-            await ctx.send(f"Voice session error: {e}")
+            if notify_channel:
+                await notify_channel.send(f"Voice session error: {e}")
         finally:
             # Clean up
             self._session = None
@@ -198,11 +160,103 @@ class ClaudeBot(commands.Bot):
             if voice_client.is_connected():
                 await voice_client.disconnect()
 
+    async def _cleanup_session(self) -> None:
+        """Stop current session and disconnect from voice."""
+        if self._session:
+            await self._session.stop()
+            self._session = None
+
+        if self._session_task:
+            self._session_task.cancel()
+            try:
+                await self._session_task
+            except asyncio.CancelledError:
+                pass
+            self._session_task = None
+
+        # Disconnect from all voice clients
+        for vc in self.voice_clients:
+            if vc.is_connected():
+                await vc.disconnect()
+
+    async def _join_channel(
+        self,
+        channel: discord.VoiceChannel,
+        notify_channel: Optional[discord.abc.Messageable] = None,
+    ) -> bool:
+        """Join a voice channel and start session.
+
+        Args:
+            channel: Voice channel to join
+            notify_channel: Optional channel for error messages
+
+        Returns:
+            True if joined successfully
+        """
+        # If already in a session, leave first
+        if self._session is not None:
+            await self._cleanup_session()
+
+        try:
+            # Create session with pre-loaded components
+            self._session = VoiceSession(
+                wake_detector=self._wake_detector,
+                vad=self._vad,
+                transcriber=self._transcriber,
+                tts=self._tts,
+            )
+
+            # Initialize any remaining components
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(None, self._session._init_components)
+
+            # Connect to voice channel
+            logger.info(f"Connecting to voice channel: {channel.name}")
+            voice_client = await channel.connect()
+
+            # Start session in background task
+            self._session_task = asyncio.create_task(
+                self._run_session(voice_client, notify_channel)
+            )
+            logger.info(f"Joined voice channel: {channel.name}")
+            return True
+
+        except Exception as e:
+            logger.error(f"Failed to join voice: {e}", exc_info=True)
+            self._session = None
+            if notify_channel:
+                await notify_channel.send(f"Failed to join: {e}")
+            return False
+
+    async def _auto_join(self) -> None:
+        """Auto-join first available voice channel on startup."""
+        for guild in self.guilds:
+            # Find target channel
+            if self.settings.auto_join_channel:
+                # Find by name
+                channel = discord.utils.get(
+                    guild.voice_channels, name=self.settings.auto_join_channel
+                )
+            else:
+                # First available
+                channel = guild.voice_channels[0] if guild.voice_channels else None
+
+            if channel:
+                logger.info(f"Auto-joining voice channel: {channel.name} in {guild.name}")
+                await self._join_channel(channel)
+                return  # Only join one channel
+
+        logger.warning("No voice channels available for auto-join")
+
     async def on_ready(self) -> None:
         """Handle bot ready event."""
         logger.info(f"Bot ready: {self.user.name} ({self.user.id})")
         logger.info(f"Connected to {len(self.guilds)} guilds")
         logger.info(f"Wake word: {self.settings.wake_word_model.replace('_', ' ')}")
+
+        # Auto-join voice channel if enabled
+        if self.settings.auto_join_voice:
+            await self._auto_join()
 
     async def close(self) -> None:
         """Clean up on shutdown."""

@@ -18,6 +18,10 @@ class Settings(BaseSettings):
     discord_token: str = Field(..., alias="DISCORD_TOKEN")
     discord_guild_id: Optional[str] = Field(default=None, alias="DISCORD_GUILD_ID")
 
+    # Auto-join voice channel on startup
+    auto_join_voice: bool = Field(default=True, alias="AUTO_JOIN_VOICE")
+    auto_join_channel: Optional[str] = Field(default=None, alias="AUTO_JOIN_CHANNEL")
+
     # Wake Word Detection
     wake_word_method: str = Field(default="openwakeword", alias="WAKE_WORD_METHOD")
     wake_word_confidence: float = Field(default=0.5, alias="WAKE_WORD_CONFIDENCE")
