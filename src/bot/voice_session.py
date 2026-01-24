@@ -15,7 +15,7 @@ import numpy as np
 
 from ..config import get_settings
 from ..detection import VAD, WakeWordDetector
-from ..stt import Transcriber, DeepgramFluxClient
+from ..stt import Transcriber, DeepgramFluxClient, GroqWhisperClient
 from ..llm import ClaudeClient
 from ..tts import TTSSynthesizer
 from .voice_sink import StreamingSink
@@ -48,6 +48,7 @@ class VoiceSession:
         wake_detector: Optional[WakeWordDetector] = None,
         vad: Optional[VAD] = None,
         transcriber: Optional[Transcriber] = None,
+        groq_client: Optional[GroqWhisperClient] = None,
         deepgram_client: Optional[DeepgramFluxClient] = None,
         claude: Optional[ClaudeClient] = None,
         tts: Optional[TTSSynthesizer] = None,
@@ -60,7 +61,8 @@ class VoiceSession:
             wake_detector: WakeWordDetector instance
             vad: VAD instance
             transcriber: Transcriber instance (Whisper, fallback)
-            deepgram_client: DeepgramFluxClient instance (primary STT)
+            groq_client: GroqWhisperClient instance (primary STT)
+            deepgram_client: DeepgramFluxClient instance (alternative STT)
             claude: ClaudeClient instance
             tts: TTSSynthesizer instance
         """
@@ -70,6 +72,7 @@ class VoiceSession:
         self.wake_detector = wake_detector
         self.vad = vad
         self.transcriber = transcriber
+        self.groq_client = groq_client
         self.deepgram_client = deepgram_client
         self.claude = claude
         self.tts = tts
@@ -129,6 +132,18 @@ class VoiceSession:
         # Initialize STT based on provider setting
         stt_provider = self.settings.stt_provider.lower()
 
+        if stt_provider == "groq" and self.groq_client is None:
+            if not self.settings.groq_api_key:
+                logger.warning("GROQ_API_KEY not set, falling back to Deepgram")
+                stt_provider = "deepgram"
+            else:
+                logger.info("Initializing Groq Whisper STT...")
+                self.groq_client = GroqWhisperClient(
+                    api_key=self.settings.groq_api_key,
+                    model="whisper-large-v3-turbo",
+                    language="en",
+                )
+
         if stt_provider == "deepgram" and self.deepgram_client is None:
             if not self.settings.deepgram_api_key:
                 logger.warning("DEEPGRAM_API_KEY not set, falling back to Whisper")
@@ -138,6 +153,8 @@ class VoiceSession:
                 self.deepgram_client = DeepgramFluxClient(
                     api_key=self.settings.deepgram_api_key,
                     sample_rate=16000,
+                    eot_threshold=0.7,  # End-of-turn confidence (0.5-0.9)
+                    eot_timeout_ms=2000,  # Max silence before forcing EOT
                 )
 
         if stt_provider == "whisper" and self.transcriber is None:
@@ -310,8 +327,8 @@ class VoiceSession:
                 # Process the speech
                 await self._process_speech(audio)
 
-                # Follow-up loop
-                await self._followup_loop()
+                # Skip follow-up - require wake word each time
+                # await self._followup_loop()
 
             except asyncio.CancelledError:
                 break
@@ -402,7 +419,10 @@ class VoiceSession:
         t0 = time.perf_counter()
         logger.info("[TIMING] Starting transcription...")
 
-        if self.deepgram_client is not None:
+        if self.groq_client is not None:
+            logger.info("[STT] Using Groq Whisper")
+            text = await self.groq_client.transcribe_audio(audio)
+        elif self.deepgram_client is not None:
             logger.info("[STT] Using Deepgram Flux")
             text = await self.deepgram_client.transcribe_audio(audio)
         elif self.transcriber is not None:

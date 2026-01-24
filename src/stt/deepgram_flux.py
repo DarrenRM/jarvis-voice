@@ -94,6 +94,9 @@ class DeepgramFluxClient:
                 model="flux-general-en",
                 encoding="linear16",
                 sample_rate=str(self.sample_rate),
+                # EOT params commented out for debugging - may not be SDK-compatible
+                # eot_threshold=str(self.eot_threshold),
+                # eot_timeout_ms=str(self.eot_timeout_ms),
             ) as connection:
 
                 def on_message(message) -> None:
@@ -133,8 +136,15 @@ class DeepgramFluxClient:
                     logger.error(f"[FLUX] Error: {error}")
                     transcript_complete.set()
 
+                # Event to wait for connection to be ready
+                connection_ready = asyncio.Event()
+
+                def on_open(_) -> None:
+                    logger.info("[FLUX] Connected")
+                    connection_ready.set()
+
                 # Register handlers
-                connection.on(EventType.OPEN, lambda _: logger.info("[FLUX] Connected"))
+                connection.on(EventType.OPEN, on_open)
                 connection.on(EventType.MESSAGE, on_message)
                 connection.on(EventType.CLOSE, on_close)
                 connection.on(EventType.ERROR, on_error)
@@ -142,6 +152,13 @@ class DeepgramFluxClient:
                 # Start listening as a background task (doesn't block)
                 listen_task = asyncio.create_task(connection.start_listening())
                 logger.info("[FLUX] Listening task started")
+
+                # Wait for connection to be ready before sending audio
+                try:
+                    await asyncio.wait_for(connection_ready.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.error("[FLUX] Timeout waiting for connection")
+                    return ""
 
                 # Send audio in chunks (80ms = 1280 samples at 16kHz)
                 chunk_samples = int(self.sample_rate * 0.08)  # 80ms chunks
@@ -192,6 +209,8 @@ class FluxStreamingSession:
         self,
         client,
         sample_rate: int = 16000,
+        eot_threshold: float = 0.5,
+        eot_timeout_ms: int = 2000,
         on_transcript: Optional[Callable[[str, bool], None]] = None,
         on_end_of_turn: Optional[Callable[[str], None]] = None,
     ):
@@ -200,11 +219,15 @@ class FluxStreamingSession:
         Args:
             client: AsyncDeepgramClient instance
             sample_rate: Audio sample rate
+            eot_threshold: End-of-turn confidence threshold (0.5-0.9)
+            eot_timeout_ms: Max silence before forcing end-of-turn
             on_transcript: Callback(text, is_final) for transcript updates
             on_end_of_turn: Callback(final_text) when speaker finished
         """
         self._client = client
         self._sample_rate = sample_rate
+        self._eot_threshold = eot_threshold
+        self._eot_timeout_ms = eot_timeout_ms
         self._on_transcript = on_transcript
         self._on_end_of_turn = on_end_of_turn
         self._connection = None
@@ -223,6 +246,8 @@ class FluxStreamingSession:
                 model="flux-general-en",
                 encoding="linear16",
                 sample_rate=str(self._sample_rate),
+                eot_threshold=str(self._eot_threshold),
+                eot_timeout_ms=str(self._eot_timeout_ms),
             )
             self._connection = await self._context_manager.__aenter__()
 

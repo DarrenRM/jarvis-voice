@@ -263,11 +263,15 @@ class StreamingSink(discord.sinks.Sink):
                 elif endpoint == "end" and self._speech_started:
                     buffer_duration = buffer_samples / 16000
                     logger.info(f"[SINK] VAD detected speech END, buffer={buffer_duration:.2f}s")
+                    # Reset state before callback
+                    self._speech_started = False
                     if self._on_speech_end:
                         audio = self.get_audio_buffer()
                         self._on_speech_end(audio)
                     else:
                         logger.warning("[SINK] No _on_speech_end callback set!")
+                    # Clear buffer after speech end
+                    self._audio_buffer = []
 
                 # Force end if speech has been going too long (background noise protection)
                 elif self._speech_started:
@@ -277,9 +281,13 @@ class StreamingSink(discord.sinks.Sink):
                             f"[SINK] Forcing speech END after {speech_duration:.1f}s "
                             "(max duration reached - possible background noise)"
                         )
+                        # Reset state BEFORE callback to prevent spam
+                        self._speech_started = False
                         if self._on_speech_end:
                             audio = self.get_audio_buffer()
                             self._on_speech_end(audio)
+                        # Clear buffer after forced end
+                        self._audio_buffer = []
 
     def cleanup(self) -> None:
         """Clean up resources when recording stops."""

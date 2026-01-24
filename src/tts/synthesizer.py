@@ -17,16 +17,19 @@ class TTSSynthesizer:
     Target output: 24kHz mono float32 audio
     """
 
-    # Available Inworld voices
+    # Available Inworld voices (from API: /tts/v1/voices?filter=language=en)
     INWORLD_VOICES = [
-        "alex", "ashley", "craig", "deborah", "dennis",
-        "emma", "james", "jennifer", "lisa", "michael",
-        "michelle", "peter", "rachel", "robert", "sarah",
+        # Male voices
+        "alex", "blake", "carter", "clive", "craig", "dennis", "dominus",
+        "edward", "hades", "mark", "ronald", "shaun", "theodore", "timothy",
+        # Female voices
+        "ashley", "deborah", "elizabeth", "hana", "julia", "luna",
+        "olivia", "pixie", "priya", "sarah", "wendy",
     ]
 
     def __init__(
         self,
-        model: str = "inworld-tts-1.5-max",
+        model: str = "inworld-tts-1-max",
         device: str = "cuda:0",  # Not used for Inworld but kept for API compatibility
         voice: str = "alex",
         api_key: Optional[str] = None,
@@ -34,7 +37,7 @@ class TTSSynthesizer:
         """Initialize TTS synthesizer.
 
         Args:
-            model: Inworld model (inworld-tts-1.5-max or inworld-tts-1.5-mini)
+            model: Inworld model (inworld-tts-1-max or inworld-tts-1)
             device: Compute device (not used for Inworld, kept for compatibility)
             voice: Voice name (alex, ashley, craig, deborah, etc.)
             api_key: Inworld API key (or set INWORLD_API_KEY env var)
@@ -111,6 +114,9 @@ class TTSSynthesizer:
                 "speakingRate": 1.0,
             },
         }
+
+        # Log what we're sending (for debugging emotion tags)
+        logger.info(f"[TTS] Sending to Inworld: model={self.model_name}, text={text[:100]}...")
 
         audio_chunks = []
 

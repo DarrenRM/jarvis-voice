@@ -24,9 +24,10 @@ class Settings(BaseSettings):
     wake_word_model: str = Field(default="hey_jarvis", alias="WAKE_WORD_MODEL")
     wake_word_phrase: str = Field(default="hey claude", alias="WAKE_WORD_PHRASE")
 
-    # STT - Deepgram Flux (primary) or Whisper (fallback)
+    # STT - Groq Whisper (primary), Deepgram Flux, or local Whisper (fallback)
+    groq_api_key: Optional[str] = Field(default=None, alias="GROQ_API_KEY")
     deepgram_api_key: Optional[str] = Field(default=None, alias="DEEPGRAM_API_KEY")
-    stt_provider: str = Field(default="deepgram", alias="STT_PROVIDER")  # deepgram or whisper
+    stt_provider: str = Field(default="groq", alias="STT_PROVIDER")  # groq, deepgram, or whisper
     # Whisper settings (fallback)
     whisper_model: str = Field(default="medium", alias="WHISPER_MODEL")
     whisper_device: str = Field(default="cuda", alias="WHISPER_DEVICE")
@@ -34,7 +35,7 @@ class Settings(BaseSettings):
 
     # TTS (Inworld)
     inworld_api_key: Optional[str] = Field(default=None, alias="INWORLD_API_KEY")
-    tts_model: str = Field(default="inworld-tts-1.5-max", alias="TTS_MODEL")
+    tts_model: str = Field(default="inworld-tts-1-max", alias="TTS_MODEL")
     tts_device: str = Field(default="cuda:0", alias="TTS_DEVICE")
     tts_voice: str = Field(default="alex", alias="TTS_VOICE")
 
