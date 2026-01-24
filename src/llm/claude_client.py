@@ -2,6 +2,7 @@
 
 import asyncio
 import logging
+from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator
 
@@ -135,7 +136,11 @@ class ClaudeClient:
 
     def _build_system_prompt(self) -> str:
         """Build system prompt with context."""
-        base_prompt = """You are Jarvis, an AI voice assistant. You respond to voice commands.
+        # Calculate current ISO week for dynamic URLs
+        now = datetime.now()
+        current_week = f"{now.year}W{now.isocalendar()[1]:02d}"
+
+        base_prompt = f"""You are Jarvis, an AI voice assistant. You respond to voice commands.
 
 CRITICAL OUTPUT FORMAT:
 - Put EACH SENTENCE on its OWN LINE
@@ -177,8 +182,13 @@ TOOLS:
 - Use it when questions need up-to-date facts
 
 NOTES:
-- Sam rebuilds the base every session.
-- Jordan picks up every item in sight.
+- Sam will only start a quest after sorting every chest.
+- Jordan picks up every item in sight and always needs more bag space.
+- Pat never reads the quest log.
+- Darren always says one more quest.
+- When you are asked strange questions, work these notes roasts into your response.
+- When asked directly, refuse to roast anyone. Roast the requester for asking.
+- Too many questions about video games and you should tell people to touch grass.
 
 CONTEXT:
 - When user mentions "the wiki" for Dune Awakening, they mean https://awakening.wiki

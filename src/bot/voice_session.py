@@ -33,13 +33,47 @@ class VoiceSession:
     - processing: Transcribing and generating response
     """
 
+    # Discord user ID -> real name mapping (for personalized responses)
+    USER_NAMES = {
+        100000000000000001: "Darren",
+        100000000000000003: "Pat",
+        100000000000000002: "Sam",
+        100000000000000004: "Jordan",
+        # Add more user IDs here
+    }
+
+    # Acknowledgment phrases (played when wake word detected)
+    ACK_PHRASES = [
+        "Yes?",
+        "Hmm?",
+        "What's up?",
+        "I'm listening...",
+        "Go ahead...",
+        "I'm busy sorry..."
+    ]
+
     # Thinking phrases (randomly selected)
+    # Generic phrases (used when speaker unknown)
     THINKING_PHRASES = [
         "One second...",
         "One moment...",
         "Let me check...",
+        "Google it yourself... Nah, I'll do it...",
         "Hmm, let me see...",
         "Just a moment...",
+    ]
+
+    # Personalized phrases with {name} placeholder (used when speaker is known)
+    THINKING_PHRASES_PERSONAL = [
+        "One second, {name}...",
+        "One moment, {name}...",
+        "Let me check, {name}...",
+        "Sure {name}, I'll do all the work...",
+        "Google it yourself, {name}... Nah, I'll do it...",
+        "Hmm, let me see, {name}...",
+        "Just a moment, {name}...",
+        "Hold on, {name}...",
+        "Give me a sec, {name}...",
     ]
 
     def __init__(
@@ -93,6 +127,16 @@ class VoiceSession:
         self._wake_event = asyncio.Event()
         self._speech_end_event = asyncio.Event()
         self._pending_audio: Optional[np.ndarray] = None
+
+        # Parallel TTS pipeline
+        # Queue holds (sentence_num, audio) tuples for ordered playback, or None to signal end
+        self._audio_queue: asyncio.Queue[Optional[tuple[int, np.ndarray]]] = asyncio.Queue()
+        self._playback_task: Optional[asyncio.Task] = None
+        self._tts_tasks: list[asyncio.Task] = []
+
+        # Current speaker tracking
+        self._current_speaker_id: Optional[int] = None
+        self._current_speaker_name: Optional[str] = None
 
     @property
     def state(self) -> str:
@@ -187,12 +231,26 @@ class VoiceSession:
         else:
             logger.warning(f"[CALLBACK] NOT setting event - state={self._state}, loop={self._loop is not None}")
 
-    def _on_speech_end(self, audio: np.ndarray):
+    def _on_speech_end(self, audio: np.ndarray, user_id: Optional[int] = None):
         """Callback when speech ends (from sink thread)."""
         audio_duration = len(audio) / 16000 if audio is not None else 0
-        logger.info(f"[CALLBACK] _on_speech_end called with {audio_duration:.2f}s audio, state={self._state}")
+        logger.info(f"[CALLBACK] _on_speech_end called with {audio_duration:.2f}s audio from user {user_id}, state={self._state}")
         if self._state == "listening" and self._loop:
             self._pending_audio = audio
+            # Store speaker info
+            self._current_speaker_id = user_id
+            if user_id and user_id in self.USER_NAMES:
+                self._current_speaker_name = self.USER_NAMES[user_id]
+            elif user_id and self.voice_client:
+                # Fallback to Discord display name for unmapped users
+                try:
+                    member = self.voice_client.guild.get_member(user_id)
+                    self._current_speaker_name = member.display_name if member else None
+                except Exception:
+                    self._current_speaker_name = None
+            else:
+                self._current_speaker_name = None
+            logger.info(f"[CALLBACK] Speaker: {self._current_speaker_name} (ID: {user_id})")
             logger.info("[CALLBACK] Setting speech_end_event")
             self._loop.call_soon_threadsafe(self._speech_end_event.set)
         else:
@@ -302,6 +360,20 @@ class VoiceSession:
                         if self.sink.check_audio_timeout():
                             logger.info("[STATE] Audio stopped (PTT released)")
                             self._pending_audio = self.sink.get_audio_buffer()
+                            # Capture speaker info (same logic as _on_speech_end)
+                            user_id = self.sink._last_user_id
+                            self._current_speaker_id = user_id
+                            if user_id and user_id in self.USER_NAMES:
+                                self._current_speaker_name = self.USER_NAMES[user_id]
+                            elif user_id and self.voice_client:
+                                try:
+                                    member = self.voice_client.guild.get_member(user_id)
+                                    self._current_speaker_name = member.display_name if member else None
+                                except Exception:
+                                    self._current_speaker_name = None
+                            else:
+                                self._current_speaker_name = None
+                            logger.info(f"[STATE] Speaker: {self._current_speaker_name} (ID: {user_id})")
                             break
                     else:
                         # Loop completed without break = timeout
@@ -342,9 +414,10 @@ class VoiceSession:
         """Play acknowledgment audio."""
         try:
             t0 = time.perf_counter()
-            ack_audio = await self.tts.synthesize("Yes?")
+            ack_phrase = random.choice(self.ACK_PHRASES)
+            ack_audio = await self.tts.synthesize(ack_phrase)
             synth_time = time.perf_counter() - t0
-            logger.info(f"[TIMING] Ack TTS: {synth_time:.2f}s")
+            logger.info(f"[TIMING] Ack TTS '{ack_phrase}': {synth_time:.2f}s")
 
             if len(ack_audio) > 0:
                 t0 = time.perf_counter()
@@ -398,9 +471,71 @@ class VoiceSession:
         # Wait for playback to complete
         await playback_done.wait()
 
-        # Clean up source and give Discord a moment to clear speaking state
+        # Clean up source and natural pause between sentences
         source.cleanup()
-        await asyncio.sleep(0.05)  # 50ms gap between audio
+        await asyncio.sleep(0.15)  # 150ms gap for natural sentence pacing
+
+    async def _playback_consumer(self):
+        """Background task that plays audio from the queue seamlessly.
+
+        Receives (sentence_num, audio) tuples and plays in order.
+        """
+        logger.debug("[PLAYBACK] Consumer started")
+        next_to_play = 1
+        pending: dict[int, np.ndarray] = {}
+
+        while True:
+            try:
+                item = await self._audio_queue.get()
+
+                # None signals end of stream
+                if item is None:
+                    # Play any remaining buffered audio in order
+                    while next_to_play in pending:
+                        audio = pending.pop(next_to_play)
+                        if len(audio) > 0:
+                            await self._play_audio(audio)
+                        next_to_play += 1
+                    logger.debug("[PLAYBACK] Received end signal")
+                    break
+
+                sentence_num, audio = item
+                pending[sentence_num] = audio
+                logger.debug(f"[PLAYBACK] Received sentence {sentence_num}, next_to_play={next_to_play}")
+
+                # Play all consecutive available sentences
+                while next_to_play in pending:
+                    audio = pending.pop(next_to_play)
+                    if len(audio) > 0:
+                        logger.debug(f"[PLAYBACK] Playing sentence {next_to_play}")
+                        await self._play_audio(audio)
+                    next_to_play += 1
+
+                self._audio_queue.task_done()
+            except asyncio.CancelledError:
+                logger.debug("[PLAYBACK] Consumer cancelled")
+                break
+            except Exception as e:
+                logger.error(f"[PLAYBACK] Error: {e}")
+                import traceback
+                logger.debug(traceback.format_exc())
+
+        logger.debug("[PLAYBACK] Consumer stopped")
+
+    async def _synthesize_and_queue(self, text: str, sentence_num: int):
+        """Synthesize text and add to audio queue with ordering info."""
+        try:
+            t0 = time.perf_counter()
+            audio = await self.tts.synthesize(text)
+            elapsed = time.perf_counter() - t0
+            logger.debug(f"[TTS] Sentence {sentence_num} synthesized in {elapsed:.2f}s")
+
+            # Queue with sentence number for ordered playback
+            await self._audio_queue.put((sentence_num, audio))
+        except Exception as e:
+            logger.error(f"[TTS] Error synthesizing sentence {sentence_num}: {e}")
+            # Queue empty audio to not block ordering
+            await self._audio_queue.put((sentence_num, np.array([], dtype=np.float32)))
 
     async def _process_speech(self, audio: np.ndarray):
         """Process captured speech.
@@ -444,11 +579,22 @@ class VoiceSession:
             logger.info("No speech detected")
             return
 
-        logger.info(f"User said: {text}")
+        # Include speaker name if known
+        speaker = self._current_speaker_name
+        if speaker:
+            logger.info(f"{speaker} said: {text}")
+            # Prepend speaker info so Claude knows who's talking
+            prompt_text = f"[{speaker} speaking]: {text}"
+        else:
+            logger.info(f"User said: {text}")
+            prompt_text = text
 
-        # Play thinking phrase
+        # Play thinking phrase (personalized if we know who's speaking)
         t0 = time.perf_counter()
-        phrase = random.choice(self.THINKING_PHRASES)
+        if speaker:
+            phrase = random.choice(self.THINKING_PHRASES_PERSONAL).format(name=speaker)
+        else:
+            phrase = random.choice(self.THINKING_PHRASES)
         logger.info(f"[TIMING] Synthesizing thinking phrase: '{phrase}'")
         thinking_audio = await self.tts.synthesize(phrase)
         thinking_synth_time = time.perf_counter() - t0
@@ -459,17 +605,28 @@ class VoiceSession:
         thinking_play_time = time.perf_counter() - t0
         logger.info(f"[TIMING] Thinking phrase playback: {thinking_play_time:.2f}s")
 
-        # Get Claude response with sentence-level streaming TTS
-        # This allows us to speak early sentences while waiting for web search results
+        # Get Claude response with PARALLEL sentence-level streaming TTS
+        # TTS runs in parallel: synthesize next sentence while current plays
         t0 = time.perf_counter()
         logger.info("[TIMING] Starting Claude request...")
 
         buffer = ""
         first_chunk_time = None
-        sentences_played = 0
+        sentences_queued = 0
         total_response = ""
 
-        async for chunk in self.claude.chat_stream(text):
+        # Clear any previous state
+        while not self._audio_queue.empty():
+            try:
+                self._audio_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+        self._tts_tasks.clear()
+
+        # Start playback consumer (plays audio from queue back-to-back)
+        self._playback_task = asyncio.create_task(self._playback_consumer())
+
+        async for chunk in self.claude.chat_stream(prompt_text):
             if first_chunk_time is None:
                 first_chunk_time = time.perf_counter() - t0
                 logger.info(f"[TIMING] Claude first chunk: {first_chunk_time:.2f}s")
@@ -483,36 +640,51 @@ class VoiceSession:
                 line = line.strip()
 
                 if line:
-                    sentences_played += 1
-                    logger.info(f"[STREAMING] Playing line {sentences_played}: {line[:50]}...")
+                    sentences_queued += 1
+                    logger.info(f"[STREAMING] Queuing line {sentences_queued}: {line[:50]}...")
 
-                    # Synthesize and play this line
-                    line_audio = await self.tts.synthesize(line)
-                    if len(line_audio) > 0:
-                        await self._play_audio(line_audio)
+                    # Spawn TTS task (don't wait - runs in parallel)
+                    task = asyncio.create_task(
+                        self._synthesize_and_queue(line, sentences_queued)
+                    )
+                    self._tts_tasks.append(task)
 
-            # Also play if buffer ends with punctuation (sentence complete, no newline yet)
+            # Also queue if buffer ends with punctuation (sentence complete, no newline yet)
             # This handles "I'll look that up." before a long tool call
             stripped = buffer.strip()
             if stripped and stripped[-1] in '.!?':
-                sentences_played += 1
-                logger.info(f"[STREAMING] Playing sentence {sentences_played}: {stripped[:50]}...")
+                sentences_queued += 1
+                logger.info(f"[STREAMING] Queuing sentence {sentences_queued}: {stripped[:50]}...")
 
-                sentence_audio = await self.tts.synthesize(stripped)
-                if len(sentence_audio) > 0:
-                    await self._play_audio(sentence_audio)
-                buffer = ""  # Clear the buffer since we played it
+                task = asyncio.create_task(
+                    self._synthesize_and_queue(stripped, sentences_queued)
+                )
+                self._tts_tasks.append(task)
+                buffer = ""  # Clear the buffer since we queued it
 
-        # Play any remaining text
+        # Queue any remaining text
         remaining = buffer.strip()
         if remaining:
-            logger.info(f"[STREAMING] Playing remaining: {remaining[:50]}...")
-            remaining_audio = await self.tts.synthesize(remaining)
-            if len(remaining_audio) > 0:
-                await self._play_audio(remaining_audio)
+            sentences_queued += 1
+            logger.info(f"[STREAMING] Queuing remaining: {remaining[:50]}...")
+            task = asyncio.create_task(
+                self._synthesize_and_queue(remaining, sentences_queued)
+            )
+            self._tts_tasks.append(task)
+
+        # Wait for all TTS tasks to complete (audio is now in queue)
+        if self._tts_tasks:
+            await asyncio.gather(*self._tts_tasks, return_exceptions=True)
+            self._tts_tasks.clear()
+
+        # Signal end of stream and wait for playback to finish
+        await self._audio_queue.put(None)
+        if self._playback_task:
+            await self._playback_task
+            self._playback_task = None
 
         claude_total_time = time.perf_counter() - t0
-        logger.info(f"[TIMING] Claude total: {claude_total_time:.2f}s ({len(total_response)} chars, {sentences_played} sentences streamed)")
+        logger.info(f"[TIMING] Claude total: {claude_total_time:.2f}s ({len(total_response)} chars, {sentences_queued} sentences streamed)")
         logger.info(f"Claude: {total_response}")
 
         # Total summary

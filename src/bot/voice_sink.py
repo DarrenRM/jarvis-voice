@@ -33,7 +33,7 @@ class StreamingSink(discord.sinks.Sink):
         wake_detector=None,
         vad=None,
         on_wake_word: Optional[Callable[[], None]] = None,
-        on_speech_end: Optional[Callable[[np.ndarray], None]] = None,
+        on_speech_end: Optional[Callable[[np.ndarray, Optional[int]], None]] = None,
         filters=None,
     ):
         """Initialize streaming sink.
@@ -42,7 +42,7 @@ class StreamingSink(discord.sinks.Sink):
             wake_detector: WakeWordDetector instance
             vad: VAD instance
             on_wake_word: Callback when wake word detected
-            on_speech_end: Callback when speech ends, receives audio buffer
+            on_speech_end: Callback when speech ends, receives (audio buffer, user_id)
             filters: Optional pycord audio filters
         """
         super().__init__(filters=filters)
@@ -204,8 +204,10 @@ class StreamingSink(discord.sinks.Sink):
             self._last_stats_time = now
 
         # Get user id for logging (user might be an int or User object)
+        # Only update user ID when idle - this locks in the wake word speaker
+        # and prevents someone else's noise from stealing attribution
         user_id = user if isinstance(user, int) else getattr(user, "id", user)
-        if self._last_user_id != user_id:
+        if self._state == "idle" and self._last_user_id != user_id:
             self._last_user_id = user_id
             logger.info(f"[SINK] Receiving audio from user: {user_id}")
 
@@ -267,7 +269,7 @@ class StreamingSink(discord.sinks.Sink):
                     self._speech_started = False
                     if self._on_speech_end:
                         audio = self.get_audio_buffer()
-                        self._on_speech_end(audio)
+                        self._on_speech_end(audio, self._last_user_id)
                     else:
                         logger.warning("[SINK] No _on_speech_end callback set!")
                     # Clear buffer after speech end
@@ -285,7 +287,7 @@ class StreamingSink(discord.sinks.Sink):
                         self._speech_started = False
                         if self._on_speech_end:
                             audio = self.get_audio_buffer()
-                            self._on_speech_end(audio)
+                            self._on_speech_end(audio, self._last_user_id)
                         # Clear buffer after forced end
                         self._audio_buffer = []
 
