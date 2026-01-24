@@ -25,6 +25,7 @@ GROQ_MODEL_MAP = {
 def create_llm_client(
     settings: "Settings",
     on_image_generated: Optional[Callable[[bytes, str], Awaitable[str]]] = None,
+    on_user_tagged: Optional[Callable[[str, str], Awaitable[str]]] = None,
 ) -> BaseLLMClient:
     """Factory function to create the appropriate LLM client.
 
@@ -37,6 +38,7 @@ def create_llm_client(
     Args:
         settings: Application settings
         on_image_generated: Callback for posting generated images (Groq only)
+        on_user_tagged: Callback for tagging users in Discord (Groq only)
 
     Returns:
         LLM client instance based on LLM_PROVIDER setting
@@ -71,6 +73,7 @@ def create_llm_client(
 
         logger.info(f"Creating Groq client (provider: {provider}, model: {model})")
         logger.info(f"Image callback provided: {on_image_generated is not None}")
+        logger.info(f"Tag callback provided: {on_user_tagged is not None}")
         return GroqClient(
             api_key=settings.groq_api_key,
             model=model,
@@ -78,6 +81,7 @@ def create_llm_client(
             search_service=search_service,
             image_service=image_service,
             on_image_generated=on_image_generated,
+            on_user_tagged=on_user_tagged,
         )
 
     elif provider == "claude":

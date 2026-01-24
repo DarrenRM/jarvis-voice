@@ -87,6 +87,27 @@ TOOLS = [
                 "required": ["instruction"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "tag_user",
+            "description": "Tag/mention a Discord user in chat with a message. Use when user says 'tag', 'message', 'tell', 'ping', or 'let X know'.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "target_name": {
+                        "type": "string",
+                        "description": "Name of the person to tag (e.g., 'Jordan', 'Pat', 'Sam')"
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The message to send to the tagged user"
+                    }
+                },
+                "required": ["target_name", "message"]
+            }
+        }
     }
 ]
 
@@ -107,6 +128,7 @@ class GroqClient(BaseLLMClient):
         search_service: Optional[SearchService] = None,
         image_service: Optional["NanoBananaClient"] = None,
         on_image_generated: Optional[Callable[[bytes, str], Awaitable[str]]] = None,
+        on_user_tagged: Optional[Callable[[str, str], Awaitable[str]]] = None,
     ):
         """Initialize Groq client.
 
@@ -118,6 +140,7 @@ class GroqClient(BaseLLMClient):
             search_service: Search service for tool execution
             image_service: Image generation service (Nano Banana)
             on_image_generated: Callback to post generated image (bytes, prompt) -> result
+            on_user_tagged: Callback to tag a user in Discord (target_name, message) -> result
         """
         self.api_key = api_key
         self.model = model
@@ -128,6 +151,7 @@ class GroqClient(BaseLLMClient):
         self._search_service = search_service
         self._image_service = image_service
         self._on_image_generated = on_image_generated
+        self._on_user_tagged = on_user_tagged
         self._client = None
 
     def _ensure_client(self) -> None:
@@ -338,6 +362,15 @@ class GroqClient(BaseLLMClient):
                     return f"{result} The image has been edited. You can make more edits using edit_image."
                 return "Image edited but no channel to post to"
 
+            # Tag user tool
+            if function_name == "tag_user":
+                if not self._on_user_tagged:
+                    return "User tagging not available - not connected to Discord"
+                target_name = args.get("target_name", "")
+                message = args.get("message", "")
+                logger.info(f"[TAG] Tagging user: {target_name} with message: {message}")
+                return await self._on_user_tagged(target_name, message)
+
             # Search tools
             if not self._search_service:
                 return "Search service not available"
@@ -436,7 +469,7 @@ GAME CONTEXT:
 - If someone asks a vague question that sounds gaming-related, USE THEIR ACTIVITY to infer context
 - Don't mention you're inferring from their activity - just answer naturally
 
-ROASTS (DO NOT USE):
+ROASTS (RARE USE ONLY):
 - Sam is known to rebuild the base every session.
 - Jordan picks up every item in sight and always needs more bag space.
 - Pat never reads the quest log.

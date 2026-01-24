@@ -218,6 +218,7 @@ class VoiceSession:
             self.llm = create_llm_client(
                 self.settings,
                 on_image_generated=self._post_image_to_discord,
+                on_user_tagged=self._post_tag_to_discord,
             )
 
         if self.tts is None:
@@ -284,6 +285,52 @@ class VoiceSession:
             logger.error(f"[IMAGE] Failed to post image: {e}", exc_info=True)
             return f"Failed to post image: {str(e)}"
 
+    async def _post_tag_to_discord(self, target_name: str, message: str) -> str:
+        """Post a tagged message to Discord.
+
+        Args:
+            target_name: Name of user to tag (fuzzy matched)
+            message: Message content
+
+        Returns:
+            Result message to send back to the LLM
+        """
+        logger.info(f"[TAG] _post_tag_to_discord called: target={target_name}, message={message[:50]}...")
+
+        if not self.voice_client or not self.voice_client.guild:
+            logger.warning("[TAG] Cannot tag user - no voice client or guild")
+            return "Could not tag user - not connected to a server"
+
+        target_member = self._find_member_by_name(target_name)
+        if not target_member:
+            known = list(self.USER_NAMES.values())
+            logger.warning(f"[TAG] Could not find user '{target_name}'. Known: {known}")
+            return f"Could not find user '{target_name}'. Known users: {', '.join(known)}"
+
+        channel_name = self.settings.image_channel_name
+        logger.info(f"[TAG] Looking for channel: #{channel_name}")
+
+        channel = discord.utils.get(
+            self.voice_client.guild.text_channels,
+            name=channel_name,
+        )
+
+        if not channel:
+            available = [ch.name for ch in self.voice_client.guild.text_channels]
+            logger.warning(f"[TAG] Could not find channel #{channel_name}. Available: {available}")
+            return f"Could not find channel #{channel_name}"
+
+        requester = self._current_speaker_name or "Someone"
+        formatted = f"{target_member.mention} - {requester} says: {message}"
+
+        try:
+            await channel.send(formatted)
+            logger.info(f"[TAG] Posted tag message to #{channel_name}")
+            return f"Done! I've tagged {target_member.display_name} in {channel_name} chat."
+        except Exception as e:
+            logger.error(f"[TAG] Failed to post tag: {e}", exc_info=True)
+            return f"Failed to send message: {str(e)}"
+
     def _get_member_activity(self, member: discord.Member) -> Optional[str]:
         """Get the member's current activity (game, etc.)."""
         if not member or not member.activities:
@@ -294,6 +341,40 @@ class VoiceSession:
             elif isinstance(activity, discord.Activity):
                 # activity.type is an enum (playing, streaming, listening, watching, etc.)
                 return f"{activity.type.name.title()} {activity.name}"
+        return None
+
+    def _find_member_by_name(self, name: str) -> Optional[discord.Member]:
+        """Find Discord member by fuzzy name match.
+
+        Args:
+            name: Name to search for (case-insensitive, partial match)
+
+        Returns:
+            Discord Member if found, None otherwise
+        """
+        if not self.voice_client or not self.voice_client.guild:
+            return None
+
+        guild = self.voice_client.guild
+        name_lower = name.lower().strip()
+
+        # Exact match in USER_NAMES
+        for user_id, friendly_name in self.USER_NAMES.items():
+            if friendly_name.lower() == name_lower:
+                if member := guild.get_member(user_id):
+                    return member
+
+        # Partial match (e.g., "sa" matches "Sam")
+        for user_id, friendly_name in self.USER_NAMES.items():
+            if name_lower in friendly_name.lower():
+                if member := guild.get_member(user_id):
+                    return member
+
+        # Fallback: search guild display names
+        for member in guild.members:
+            if name_lower in member.display_name.lower():
+                return member
+
         return None
 
     def _on_speech_end(self, audio: np.ndarray, user_id: Optional[int] = None):
