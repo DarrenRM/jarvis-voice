@@ -138,6 +138,7 @@ class VoiceSession:
         # Current speaker tracking
         self._current_speaker_id: Optional[int] = None
         self._current_speaker_name: Optional[str] = None
+        self._current_speaker_activity: Optional[str] = None
 
     @property
     def state(self) -> str:
@@ -232,6 +233,18 @@ class VoiceSession:
         else:
             logger.warning(f"[CALLBACK] NOT setting event - state={self._state}, loop={self._loop is not None}")
 
+    def _get_member_activity(self, member: discord.Member) -> Optional[str]:
+        """Get the member's current activity (game, etc.)."""
+        if not member or not member.activities:
+            return None
+        for activity in member.activities:
+            if isinstance(activity, discord.Game):
+                return f"Playing {activity.name}"
+            elif isinstance(activity, discord.Activity):
+                # activity.type is an enum (playing, streaming, listening, watching, etc.)
+                return f"{activity.type.name.title()} {activity.name}"
+        return None
+
     def _on_speech_end(self, audio: np.ndarray, user_id: Optional[int] = None):
         """Callback when speech ends (from sink thread)."""
         audio_duration = len(audio) / 16000 if audio is not None else 0
@@ -240,18 +253,27 @@ class VoiceSession:
             self._pending_audio = audio
             # Store speaker info
             self._current_speaker_id = user_id
+            self._current_speaker_activity = None
             if user_id and user_id in self.USER_NAMES:
                 self._current_speaker_name = self.USER_NAMES[user_id]
+                # Still get activity even for mapped users
+                if self.voice_client:
+                    try:
+                        member = self.voice_client.guild.get_member(user_id)
+                        self._current_speaker_activity = self._get_member_activity(member)
+                    except Exception:
+                        pass
             elif user_id and self.voice_client:
                 # Fallback to Discord display name for unmapped users
                 try:
                     member = self.voice_client.guild.get_member(user_id)
                     self._current_speaker_name = member.display_name if member else None
+                    self._current_speaker_activity = self._get_member_activity(member)
                 except Exception:
                     self._current_speaker_name = None
             else:
                 self._current_speaker_name = None
-            logger.info(f"[CALLBACK] Speaker: {self._current_speaker_name} (ID: {user_id})")
+            logger.info(f"[CALLBACK] Speaker: {self._current_speaker_name} (ID: {user_id}), Activity: {self._current_speaker_activity}")
             logger.info("[CALLBACK] Setting speech_end_event")
             self._loop.call_soon_threadsafe(self._speech_end_event.set)
         else:
@@ -364,17 +386,26 @@ class VoiceSession:
                             # Capture speaker info (same logic as _on_speech_end)
                             user_id = self.sink._last_user_id
                             self._current_speaker_id = user_id
+                            self._current_speaker_activity = None
                             if user_id and user_id in self.USER_NAMES:
                                 self._current_speaker_name = self.USER_NAMES[user_id]
+                                # Still get activity even for mapped users
+                                if self.voice_client:
+                                    try:
+                                        member = self.voice_client.guild.get_member(user_id)
+                                        self._current_speaker_activity = self._get_member_activity(member)
+                                    except Exception:
+                                        pass
                             elif user_id and self.voice_client:
                                 try:
                                     member = self.voice_client.guild.get_member(user_id)
                                     self._current_speaker_name = member.display_name if member else None
+                                    self._current_speaker_activity = self._get_member_activity(member)
                                 except Exception:
                                     self._current_speaker_name = None
                             else:
                                 self._current_speaker_name = None
-                            logger.info(f"[STATE] Speaker: {self._current_speaker_name} (ID: {user_id})")
+                            logger.info(f"[STATE] Speaker: {self._current_speaker_name} (ID: {user_id}), Activity: {self._current_speaker_activity}")
                             break
                     else:
                         # Loop completed without break = timeout
@@ -582,10 +613,14 @@ class VoiceSession:
 
         # Include speaker name if known
         speaker = self._current_speaker_name
+        activity = self._current_speaker_activity
         if speaker:
-            logger.info(f"{speaker} said: {text}")
-            # Prepend speaker info so Claude knows who's talking
-            prompt_text = f"[{speaker} speaking]: {text}"
+            logger.info(f"{speaker} said: {text}" + (f" (Activity: {activity})" if activity else ""))
+            # Prepend speaker info and activity so Claude knows who's talking and what they're doing
+            if activity:
+                prompt_text = f"[{speaker} speaking, currently {activity}]: {text}"
+            else:
+                prompt_text = f"[{speaker} speaking]: {text}"
         else:
             logger.info(f"User said: {text}")
             prompt_text = text
