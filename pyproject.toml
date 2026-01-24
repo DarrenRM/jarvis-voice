@@ -1,0 +1,61 @@
+[project]
+name = "discord-voice-claude-bot"
+version = "0.1.0"
+description = "Voice-activated AI assistant for Discord using Claude Code"
+requires-python = ">=3.10"
+dependencies = [
+    # Discord
+    "py-cord[voice]>=2.6.0",
+
+    # Audio Processing
+    "numpy>=1.24.0",
+    "soundfile>=0.12.0",
+    "sounddevice>=0.4.6",
+    "pydub>=0.25.0",
+    "scipy>=1.12.0",  # Audio resampling for Discord format conversion
+
+    # STT (Speech-to-Text)
+    "faster-whisper>=1.0.0",
+
+    # VAD (Voice Activity Detection)
+    "onnxruntime-gpu>=1.17.0",
+    "silero-vad>=5.1",
+
+    # Wake Word Detection
+    "openwakeword>=0.6.0",
+
+    # TTS (Inworld API)
+    "aiohttp>=3.9.0",
+
+    # Claude Code SDK (headless mode - no API key needed)
+    "claude-code-sdk>=0.0.20",
+
+    # Configuration
+    "pydantic-settings>=2.0.0",
+    "python-dotenv>=1.0.0",
+
+    # Logging
+    "structlog>=24.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.23.0",
+    "pytest-cov>=4.1.0",
+    "ruff>=0.1.0",
+]
+
+[project.scripts]
+claude-bot = "src.main:main"
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W", "UP"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

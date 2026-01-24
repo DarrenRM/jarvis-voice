@@ -1,0 +1,5 @@
+# Audio assets directory
+# Place pre-recorded acknowledgment files here:
+# - yes.wav: "Yes?" acknowledgment (played when wake word detected)
+# - thinking.wav: Optional thinking sound
+# - error.wav: Optional error sound
