@@ -80,6 +80,7 @@ class StreamingSink(discord.sinks.Sink):
 
         # Track if we've already flushed wake detector for current gap
         self._idle_flush_done = False
+        self._silence_attempts = 0
 
     @property
     def state(self) -> str:
@@ -186,20 +187,21 @@ class StreamingSink(discord.sinks.Sink):
         if self._last_audio_time is None:
             return False
 
-        # Only try once per gap (flag is reset when new audio arrives)
-        if self._idle_flush_done:
-            return False
-
         gap = time.perf_counter() - self._last_audio_time
         # Only check if there's been a significant gap (250ms+)
+        # Allow up to 5 attempts (2.5s of silence total) before giving up
         if gap >= 0.25 and self.wake_detector:
-            self._idle_flush_done = True  # Mark as done for this gap
+            if self._silence_attempts >= 5:
+                return False  # Give up after 5 attempts
 
-            # Feed a small amount of silence to the wake detector.
-            # This "completes" any pending detection - OpenWakeWord's internal
-            # state may have the wake word loaded but needs more audio frames
-            # to trigger the final detection.
-            silence = np.zeros(1600, dtype=np.float32)  # 100ms of silence at 16kHz
+            self._silence_attempts += 1
+            logger.debug(f"[SINK] Feeding silence attempt {self._silence_attempts}/5 (gap={gap:.2f}s)")
+
+            # Feed silence to the wake detector to complete any pending detection.
+            # OpenWakeWord's internal state may have the wake word loaded but needs
+            # more audio frames to trigger the final detection.
+            # Use 500ms of silence (increased from 100ms) to ensure detection completes.
+            silence = np.zeros(8000, dtype=np.float32)  # 500ms of silence at 16kHz
             detected = self.wake_detector.process(silence)
             if detected:
                 logger.info(f"[SINK] Wake word detected from silence padding ({gap:.2f}s gap)")
@@ -265,6 +267,7 @@ class StreamingSink(discord.sinks.Sink):
 
         # Track when we last received audio (for PTT detection)
         now = time.perf_counter()
+        gap_since_last = (now - self._last_audio_time) if self._last_audio_time else 0
         if self._last_audio_time is not None:
             gap = now - self._last_audio_time
             # Log if there was a significant gap in audio (Discord wasn't sending)
@@ -272,6 +275,7 @@ class StreamingSink(discord.sinks.Sink):
                 logger.info(f"[SINK] Audio resumed after {gap:.1f}s gap")
                 # Reset idle flush flag since new audio arrived
                 self._idle_flush_done = False
+                self._silence_attempts = 0
                 # Flush wake word detector's buffer - it may have stale audio from before the gap
                 if self.wake_detector and hasattr(self.wake_detector, 'flush'):
                     if self.wake_detector.flush():
@@ -282,12 +286,23 @@ class StreamingSink(discord.sinks.Sink):
         self._last_audio_time = now
         # Reset idle flush flag when audio arrives (allows periodic flush after next gap)
         self._idle_flush_done = False
+        self._silence_attempts = 0
 
         # Convert to 16kHz mono float32
         audio_16k = resample_48k_stereo_to_16k_mono(data)
 
         if len(audio_16k) == 0:
             return
+
+        # === DIAGNOSTIC LOGGING (both states) ===
+        chunk_size = len(data) if data else 0
+        gap_ms = gap_since_last * 1000
+        energy = np.sqrt(np.mean(audio_16k**2)) if len(audio_16k) > 0 else 0
+        logger.info(
+            f"[DIAG] state={self._state}, gap={gap_ms:.0f}ms, chunk={chunk_size}B, "
+            f"energy={energy:.4f}, samples={len(audio_16k)}"
+        )
+        # === END DIAGNOSTIC ===
 
         if self._state == "idle":
             # Check for wake word
