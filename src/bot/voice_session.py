@@ -381,6 +381,11 @@ class VoiceSession:
         if self.voice_client and self.voice_client.is_playing():
             self.voice_client.stop()
 
+        # Reset image editing context (Gemini chat session)
+        if self.llm and hasattr(self.llm, '_image_service') and self.llm._image_service:
+            self.llm._image_service.reset_chat()
+            logger.debug("Reset image chat context on session stop")
+
     async def _run_loop(self):
         """Main session loop."""
         logger.info("Voice session ready - say wake word to activate")
@@ -393,10 +398,20 @@ class VoiceSession:
                 self._speech_end_event.clear()
                 self.sink.state = "idle"
 
-                # Wait for wake word
+                # Wait for wake word with periodic flush check
+                # This handles the PTT edge case where user says wake word and stops
+                # talking before more audio arrives to trigger detection
                 logger.debug("Waiting for wake word...")
                 idle_start = time.perf_counter()
-                await self._wake_event.wait()
+                while not self._wake_event.is_set():
+                    try:
+                        await asyncio.wait_for(self._wake_event.wait(), timeout=0.2)
+                    except asyncio.TimeoutError:
+                        # Check if wake word is in buffer but not yet detected
+                        if self.sink and self.sink.check_idle_audio_gap():
+                            logger.info("[STATE] Wake word detected from periodic flush")
+                            self._wake_event.set()
+                            break
                 idle_time = time.perf_counter() - idle_start
                 logger.info(f"[TIMING] Wake word detected after {idle_time:.1f}s idle")
 
@@ -418,6 +433,7 @@ class VoiceSession:
                 try:
                     logger.info("[STATE] Waiting for speech_end_event...")
                     deadline = time.perf_counter() + 10.0
+                    speech_end_reason = None  # Track why speech ended
                     while time.perf_counter() < deadline:
                         # Check if VAD detected speech end
                         try:
@@ -426,14 +442,19 @@ class VoiceSession:
                                 timeout=0.2  # Poll every 200ms
                             )
                             # Event was set - speech ended via VAD
+                            buffer_duration = len(self.sink.get_audio_buffer()) / 16000
+                            speech_end_reason = f"VAD detected silence (buffer={buffer_duration:.2f}s)"
+                            logger.info(f"[SPEECH_END] {speech_end_reason}")
                             break
                         except asyncio.TimeoutError:
                             pass
 
                         # Check if audio stopped (push-to-talk released)
                         if self.sink.check_audio_timeout():
-                            logger.info("[STATE] Audio stopped (PTT released)")
                             self._pending_audio = self.sink.get_audio_buffer()
+                            buffer_duration = len(self._pending_audio) / 16000 if self._pending_audio is not None else 0
+                            speech_end_reason = f"PTT released / no audio packets (buffer={buffer_duration:.2f}s)"
+                            logger.info(f"[SPEECH_END] {speech_end_reason}")
                             # Capture speaker info (same logic as _on_speech_end)
                             user_id = self.sink._last_user_id
                             self._current_speaker_id = user_id

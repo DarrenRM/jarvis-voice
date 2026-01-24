@@ -68,13 +68,16 @@ class StreamingSink(discord.sinks.Sink):
 
         # Push-to-talk detection: track last audio received
         self._last_audio_time: Optional[float] = None
-        self._silence_timeout = 0.3  # Seconds of no audio = speech end (for PTT)
+        self._silence_timeout = 0.5  # Seconds of no audio = speech end (for PTT)
         self._audio_timeout_detected = False  # Once detected, commit to it
 
         # Skip initial audio after wake word to avoid capturing "jarvis" tail
         self._listen_start_time: Optional[float] = None
         self._skip_initial_audio = False
         self._initial_skip_duration = 0.3  # Skip first 300ms
+
+        # Track if we've already flushed wake detector for current gap
+        self._idle_flush_done = False
 
     @property
     def state(self) -> str:
@@ -164,6 +167,34 @@ class StreamingSink(discord.sinks.Sink):
             return True
         return False
 
+    def check_idle_audio_gap(self) -> bool:
+        """Check if audio has stopped while idle and flush wake word detector.
+
+        This handles the case where user says wake word and stops talking
+        before more audio arrives to trigger detection.
+
+        Returns:
+            True if wake word was detected from flush, False otherwise
+        """
+        if self._state != "idle":
+            return False
+
+        if self._last_audio_time is None:
+            return False
+
+        # Only flush once per gap (flag is reset when new audio arrives)
+        if self._idle_flush_done:
+            return False
+
+        gap = time.perf_counter() - self._last_audio_time
+        # Only flush if there's been a significant gap (similar to resume detection)
+        if gap >= 0.25 and self.wake_detector and hasattr(self.wake_detector, 'flush'):
+            self._idle_flush_done = True  # Mark as flushed for this gap
+            if self.wake_detector.flush():
+                logger.info(f"[SINK] Wake word detected from idle gap flush ({gap:.2f}s gap)")
+                return True
+        return False
+
     def init(self, vc) -> None:
         """Initialize sink with voice client reference.
 
@@ -222,6 +253,8 @@ class StreamingSink(discord.sinks.Sink):
             # Log if there was a significant gap in audio (Discord wasn't sending)
             if gap > 0.2 and self._state == "idle":
                 logger.info(f"[SINK] Audio resumed after {gap:.1f}s gap")
+                # Reset idle flush flag since new audio arrived
+                self._idle_flush_done = False
                 # Flush wake word detector's buffer - it may have stale audio from before the gap
                 if self.wake_detector and hasattr(self.wake_detector, 'flush'):
                     if self.wake_detector.flush():
@@ -230,6 +263,8 @@ class StreamingSink(discord.sinks.Sink):
                             self._on_wake_word()
                             return  # Don't process current audio if wake word found
         self._last_audio_time = now
+        # Reset idle flush flag when audio arrives (allows periodic flush after next gap)
+        self._idle_flush_done = False
 
         # Convert to 16kHz mono float32
         audio_16k = resample_48k_stereo_to_16k_mono(data)
@@ -282,7 +317,7 @@ class StreamingSink(discord.sinks.Sink):
 
                 elif endpoint == "end" and self._speech_started:
                     buffer_duration = buffer_samples / 16000
-                    logger.info(f"[SINK] VAD detected speech END, buffer={buffer_duration:.2f}s")
+                    logger.info(f"[SPEECH_END] VAD silence threshold reached, buffer={buffer_duration:.2f}s")
                     # Reset state before callback
                     self._speech_started = False
                     if self._on_speech_end:
@@ -298,8 +333,8 @@ class StreamingSink(discord.sinks.Sink):
                     speech_duration = buffer_samples / 16000
                     if speech_duration >= self._max_speech_duration:
                         logger.warning(
-                            f"[SINK] Forcing speech END after {speech_duration:.1f}s "
-                            "(max duration reached - possible background noise)"
+                            f"[SPEECH_END] Max duration ({self._max_speech_duration}s) reached, "
+                            f"buffer={speech_duration:.1f}s - forcing end"
                         )
                         # Reset state BEFORE callback to prevent spam
                         self._speech_started = False
