@@ -301,11 +301,14 @@ class VoiceSession:
             logger.warning("[TAG] Cannot tag user - no voice client or guild")
             return "Could not tag user - not connected to a server"
 
-        target_member = self._find_member_by_name(target_name)
-        if not target_member:
+        result = self._find_user_by_name(target_name)
+        if not result:
             known = list(self.USER_NAMES.values())
             logger.warning(f"[TAG] Could not find user '{target_name}'. Known: {known}")
             return f"Could not find user '{target_name}'. Known users: {', '.join(known)}"
+
+        target_id, target_display_name = result
+        logger.info(f"[TAG] Found user: {target_display_name} (ID: {target_id})")
 
         channel_name = self.settings.image_channel_name
         logger.info(f"[TAG] Looking for channel: #{channel_name}")
@@ -321,12 +324,13 @@ class VoiceSession:
             return f"Could not find channel #{channel_name}"
 
         requester = self._current_speaker_name or "Someone"
-        formatted = f"{target_member.mention} - {requester} says: {message}"
+        # Use <@user_id> format for mention - works even if user is offline/uncached
+        formatted = f"<@{target_id}> - {requester} says: {message}"
 
         try:
             await channel.send(formatted)
             logger.info(f"[TAG] Posted tag message to #{channel_name}")
-            return f"Done! I've tagged {target_member.display_name} in {channel_name} chat."
+            return f"Done! I've tagged {target_display_name} in {channel_name} chat."
         except Exception as e:
             logger.error(f"[TAG] Failed to post tag: {e}", exc_info=True)
             return f"Failed to send message: {str(e)}"
@@ -343,14 +347,14 @@ class VoiceSession:
                 return f"{activity.type.name.title()} {activity.name}"
         return None
 
-    def _find_member_by_name(self, name: str) -> Optional[discord.Member]:
-        """Find Discord member by fuzzy name match.
+    def _find_user_by_name(self, name: str) -> Optional[tuple[int, str]]:
+        """Find Discord user by fuzzy name match.
 
         Args:
             name: Name to search for (case-insensitive, partial match)
 
         Returns:
-            Discord Member if found, None otherwise
+            Tuple of (user_id, display_name) if found, None otherwise
         """
         if not self.voice_client or not self.voice_client.guild:
             return None
@@ -358,22 +362,20 @@ class VoiceSession:
         guild = self.voice_client.guild
         name_lower = name.lower().strip()
 
-        # Exact match in USER_NAMES
+        # Exact match in USER_NAMES (works even if user is offline)
         for user_id, friendly_name in self.USER_NAMES.items():
             if friendly_name.lower() == name_lower:
-                if member := guild.get_member(user_id):
-                    return member
+                return (user_id, friendly_name)
 
         # Partial match (e.g., "sa" matches "Sam")
         for user_id, friendly_name in self.USER_NAMES.items():
             if name_lower in friendly_name.lower():
-                if member := guild.get_member(user_id):
-                    return member
+                return (user_id, friendly_name)
 
-        # Fallback: search guild display names
+        # Fallback: search cached guild members by display name
         for member in guild.members:
             if name_lower in member.display_name.lower():
-                return member
+                return (member.id, member.display_name)
 
         return None
 

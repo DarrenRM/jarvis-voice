@@ -291,11 +291,14 @@ class GroqClient(BaseLLMClient):
         Yields:
             Response text chunks
         """
+        # Explicitly disable tools in final response to prevent
+        # "Tool choice is none, but model called a tool" error
         stream = await self._client.chat.completions.create(
             model=self.model,
             messages=messages,
             max_tokens=self.max_tokens,
             stream=True,
+            tool_choice="none",
         )
 
         full_response = ""
