@@ -134,33 +134,45 @@ class DeepgramFluxClient:
                     transcript_complete.set()
 
                 # Register handlers
-                connection.on(EventType.OPEN, lambda _: logger.debug("[FLUX] Connected"))
+                connection.on(EventType.OPEN, lambda _: logger.info("[FLUX] Connected"))
                 connection.on(EventType.MESSAGE, on_message)
                 connection.on(EventType.CLOSE, on_close)
                 connection.on(EventType.ERROR, on_error)
 
-                # Start listening
-                await connection.start_listening()
+                # Start listening as a background task (doesn't block)
+                listen_task = asyncio.create_task(connection.start_listening())
+                logger.info("[FLUX] Listening task started")
 
                 # Send audio in chunks (80ms = 1280 samples at 16kHz)
                 chunk_samples = int(self.sample_rate * 0.08)  # 80ms chunks
+                total_chunks = (len(audio_int16) + chunk_samples - 1) // chunk_samples
+                logger.info(f"[FLUX] Sending {total_chunks} audio chunks ({len(audio_int16)} samples)")
+
                 for i in range(0, len(audio_int16), chunk_samples):
                     chunk = audio_int16[i:i + chunk_samples]
-                    # send_media takes raw bytes directly
                     await connection.send_media(chunk.tobytes())
-                    # Small delay to simulate real-time (optional)
-                    await asyncio.sleep(0.01)
+                    await asyncio.sleep(0.01)  # Small delay between chunks
+
+                logger.info("[FLUX] All audio sent, signaling end of stream")
 
                 # Signal end of audio
                 await connection.send_close_stream(
                     ListenV2CloseStream(type="CloseStream")
                 )
 
-                # Wait for processing to complete (with timeout)
+                # Wait for EndOfTurn or timeout
                 try:
-                    await asyncio.wait_for(transcript_complete.wait(), timeout=5.0)
+                    await asyncio.wait_for(transcript_complete.wait(), timeout=10.0)
+                    logger.info(f"[FLUX] Got final transcript: {final_transcript[:50] if final_transcript else 'empty'}...")
                 except asyncio.TimeoutError:
-                    logger.warning("[FLUX] Timeout waiting for transcript completion")
+                    logger.warning("[FLUX] Timeout waiting for EndOfTurn")
+
+                # Cancel the listening task
+                listen_task.cancel()
+                try:
+                    await listen_task
+                except asyncio.CancelledError:
+                    pass
 
             return final_transcript.strip()
 
@@ -199,6 +211,7 @@ class FluxStreamingSession:
         self._is_active = False
         self._accumulated_transcript = ""
         self._context_manager = None
+        self._listen_task = None
 
     async def start(self) -> bool:
         """Start the streaming session."""
@@ -246,7 +259,8 @@ class FluxStreamingSession:
             self._connection.on(EventType.CLOSE, on_close)
             self._connection.on(EventType.ERROR, on_error)
 
-            await self._connection.start_listening()
+            # Start listening as background task
+            self._listen_task = asyncio.create_task(self._connection.start_listening())
             self._is_active = True
             logger.info("Flux streaming session started")
             return True
@@ -288,6 +302,14 @@ class FluxStreamingSession:
             except Exception as e:
                 logger.warning(f"Error closing Flux connection: {e}")
 
+        # Cancel listen task
+        if self._listen_task:
+            self._listen_task.cancel()
+            try:
+                await self._listen_task
+            except asyncio.CancelledError:
+                pass
+
         if self._context_manager:
             try:
                 await self._context_manager.__aexit__(None, None, None)
@@ -297,6 +319,7 @@ class FluxStreamingSession:
         self._is_active = False
         self._connection = None
         self._context_manager = None
+        self._listen_task = None
         logger.info("Flux streaming session stopped")
 
         return remaining
