@@ -36,7 +36,7 @@ class DeepgramFluxClient:
             api_key: Deepgram API key
             eot_threshold: End-of-turn confidence threshold (0.5-0.9)
             eot_timeout_ms: Max silence before forcing end-of-turn (500-10000ms)
-            sample_rate: Audio sample rate (must be 16000 for Flux)
+            sample_rate: Audio sample rate (16000 for Flux)
         """
         self.api_key = api_key
         self.eot_threshold = eot_threshold
@@ -44,36 +44,23 @@ class DeepgramFluxClient:
         self.sample_rate = sample_rate
 
         self._client = None
-        self._connection = None
-        self._transcript = ""
-        self._end_of_turn_event = asyncio.Event()
-        self._is_connected = False
-        self._on_interim_transcript: Optional[Callable[[str], None]] = None
+        self._is_initialized = False
 
-    async def connect(self) -> None:
-        """Establish connection to Deepgram Flux."""
+    async def _ensure_client(self) -> None:
+        """Initialize the async client if not already done."""
+        if self._client is not None:
+            return
+
         try:
-            from deepgram import DeepgramClient, DeepgramClientOptions
+            from deepgram import AsyncDeepgramClient
 
-            # Create client with API key
-            config = DeepgramClientOptions(api_key=self.api_key)
-            self._client = DeepgramClient(config=config)
-
+            self._client = AsyncDeepgramClient(api_key=self.api_key)
+            self._is_initialized = True
             logger.info("Deepgram Flux client initialized")
-            self._is_connected = True
 
         except ImportError:
             logger.error("deepgram-sdk not installed. Install with: pip install deepgram-sdk")
             raise
-        except Exception as e:
-            logger.error(f"Failed to initialize Deepgram client: {e}")
-            raise
-
-    async def disconnect(self) -> None:
-        """Close connection to Deepgram."""
-        self._is_connected = False
-        self._client = None
-        logger.info("Deepgram client disconnected")
 
     async def transcribe_audio(
         self,
@@ -82,7 +69,7 @@ class DeepgramFluxClient:
     ) -> str:
         """Transcribe audio buffer using Flux streaming.
 
-        This sends the audio to Flux and waits for end-of-turn detection.
+        This sends the audio to Flux via WebSocket and collects the transcript.
 
         Args:
             audio: Audio as float32 numpy array (16kHz mono)
@@ -91,79 +78,91 @@ class DeepgramFluxClient:
         Returns:
             Final transcript text
         """
-        if not self._is_connected or self._client is None:
-            await self.connect()
-
-        self._on_interim_transcript = on_interim
-        self._transcript = ""
-        self._end_of_turn_event.clear()
+        await self._ensure_client()
 
         try:
-            from deepgram import LiveTranscriptionEvents, LiveOptions
+            from deepgram.core.events import EventType
+            from deepgram.extensions.types.sockets import (
+                ListenV2SocketClientResponse,
+                ListenV2MediaMessage,
+                ListenV2ControlMessage,
+            )
 
             # Convert float32 to int16 bytes for Deepgram
             audio_int16 = (audio * 32767).astype(np.int16)
-            audio_bytes = audio_int16.tobytes()
-
-            # Use live transcription with Flux model
-            options = LiveOptions(
-                model="flux-general-en",
-                encoding="linear16",
-                sample_rate=self.sample_rate,
-                channels=1,
-                # Flux-specific options would go here but SDK may not expose them yet
-            )
-
-            # Create live connection
-            connection = self._client.listen.live.v("1")
 
             final_transcript = ""
+            transcript_complete = asyncio.Event()
 
-            def on_message(self_conn, result, **kwargs):
-                nonlocal final_transcript
+            async with self._client.listen.v2.connect(
+                model="flux-general-en",
+                encoding="linear16",
+                sample_rate=str(self.sample_rate),
+            ) as connection:
+
+                def on_message(message: ListenV2SocketClientResponse) -> None:
+                    nonlocal final_transcript
+                    try:
+                        msg_type = getattr(message, "type", "Unknown")
+                        logger.debug(f"[FLUX] Received {msg_type} event")
+
+                        if hasattr(message, "channel") and message.channel:
+                            transcript = message.channel.alternatives[0].transcript
+                            if transcript:
+                                # Check if this is a final result
+                                is_final = getattr(message, "is_final", True)
+                                if is_final:
+                                    final_transcript += transcript + " "
+                                    logger.debug(f"[FLUX] Final: {transcript}")
+                                else:
+                                    logger.debug(f"[FLUX] Interim: {transcript}")
+                                    if on_interim:
+                                        on_interim(transcript)
+
+                        # Check for end-of-turn events
+                        if msg_type in ("EndOfTurn", "UtteranceEnd"):
+                            logger.info(f"[FLUX] {msg_type} detected")
+
+                    except Exception as e:
+                        logger.error(f"Error processing Flux message: {e}")
+
+                def on_close(_) -> None:
+                    logger.debug("[FLUX] Connection closed")
+                    transcript_complete.set()
+
+                def on_error(error) -> None:
+                    logger.error(f"[FLUX] Error: {error}")
+                    transcript_complete.set()
+
+                # Register handlers
+                connection.on(EventType.OPEN, lambda _: logger.debug("[FLUX] Connected"))
+                connection.on(EventType.MESSAGE, on_message)
+                connection.on(EventType.CLOSE, on_close)
+                connection.on(EventType.ERROR, on_error)
+
+                # Start listening
+                await connection.start_listening()
+
+                # Send audio in chunks (80ms = 1280 samples at 16kHz)
+                chunk_samples = int(self.sample_rate * 0.08)  # 80ms chunks
+                for i in range(0, len(audio_int16), chunk_samples):
+                    chunk = audio_int16[i:i + chunk_samples]
+                    await connection.send_media(
+                        ListenV2MediaMessage(data=chunk.tobytes())
+                    )
+                    # Small delay to simulate real-time (optional)
+                    await asyncio.sleep(0.01)
+
+                # Signal end of audio
+                await connection.send_control(
+                    ListenV2ControlMessage(type="CloseStream")
+                )
+
+                # Wait for processing to complete (with timeout)
                 try:
-                    transcript = result.channel.alternatives[0].transcript
-                    if transcript:
-                        if result.is_final:
-                            final_transcript += transcript + " "
-                            logger.debug(f"[FLUX] Final: {transcript}")
-                        else:
-                            logger.debug(f"[FLUX] Interim: {transcript}")
-                            if self._on_interim_transcript:
-                                self._on_interim_transcript(transcript)
-                except Exception as e:
-                    logger.error(f"Error processing Flux message: {e}")
-
-            def on_error(self_conn, error, **kwargs):
-                logger.error(f"Deepgram error: {error}")
-
-            def on_close(self_conn, close, **kwargs):
-                logger.debug("Deepgram connection closed")
-                self._end_of_turn_event.set()
-
-            # Register handlers
-            connection.on(LiveTranscriptionEvents.Transcript, on_message)
-            connection.on(LiveTranscriptionEvents.Error, on_error)
-            connection.on(LiveTranscriptionEvents.Close, on_close)
-
-            # Start connection
-            if not await connection.start(options):
-                logger.error("Failed to start Deepgram connection")
-                return ""
-
-            # Send audio in chunks (80ms recommended for Flux)
-            chunk_samples = int(self.sample_rate * 0.08)  # 80ms chunks
-            for i in range(0, len(audio_int16), chunk_samples):
-                chunk = audio_int16[i:i + chunk_samples]
-                await connection.send(chunk.tobytes())
-                # Small delay to simulate real-time streaming
-                await asyncio.sleep(0.01)
-
-            # Signal end of audio
-            await connection.finish()
-
-            # Wait for processing to complete
-            await asyncio.sleep(0.5)
+                    await asyncio.wait_for(transcript_complete.wait(), timeout=5.0)
+                except asyncio.TimeoutError:
+                    logger.warning("[FLUX] Timeout waiting for transcript completion")
 
             return final_transcript.strip()
 
@@ -171,112 +170,94 @@ class DeepgramFluxClient:
             logger.error(f"Flux transcription error: {e}", exc_info=True)
             return ""
 
-    async def start_streaming_session(
-        self,
-        on_transcript: Callable[[str, bool], None],
-        on_end_of_turn: Callable[[str], None],
-    ) -> "FluxStreamingSession":
-        """Start a streaming transcription session.
-
-        This is for real-time audio streaming where audio chunks are fed
-        continuously and we get callbacks on transcripts and end-of-turn.
-
-        Args:
-            on_transcript: Callback(text, is_final) for transcript updates
-            on_end_of_turn: Callback(final_text) when speaker finished
-
-        Returns:
-            FluxStreamingSession for sending audio
-        """
-        if not self._is_connected or self._client is None:
-            await self.connect()
-
-        return FluxStreamingSession(
-            client=self._client,
-            sample_rate=self.sample_rate,
-            eot_threshold=self.eot_threshold,
-            eot_timeout_ms=self.eot_timeout_ms,
-            on_transcript=on_transcript,
-            on_end_of_turn=on_end_of_turn,
-        )
-
 
 class FluxStreamingSession:
-    """Active streaming session for continuous audio input."""
+    """Active streaming session for continuous audio input.
+
+    Use this for true real-time streaming where audio is fed continuously
+    and transcripts are returned as they're ready.
+    """
 
     def __init__(
         self,
         client,
-        sample_rate: int,
-        eot_threshold: float,
-        eot_timeout_ms: int,
-        on_transcript: Callable[[str, bool], None],
-        on_end_of_turn: Callable[[str], None],
+        sample_rate: int = 16000,
+        on_transcript: Optional[Callable[[str, bool], None]] = None,
+        on_end_of_turn: Optional[Callable[[str], None]] = None,
     ):
+        """Initialize streaming session.
+
+        Args:
+            client: AsyncDeepgramClient instance
+            sample_rate: Audio sample rate
+            on_transcript: Callback(text, is_final) for transcript updates
+            on_end_of_turn: Callback(final_text) when speaker finished
+        """
         self._client = client
         self._sample_rate = sample_rate
-        self._eot_threshold = eot_threshold
-        self._eot_timeout_ms = eot_timeout_ms
         self._on_transcript = on_transcript
         self._on_end_of_turn = on_end_of_turn
         self._connection = None
         self._is_active = False
         self._accumulated_transcript = ""
+        self._context_manager = None
 
     async def start(self) -> bool:
         """Start the streaming session."""
         try:
-            from deepgram import LiveTranscriptionEvents, LiveOptions
+            from deepgram.core.events import EventType
+            from deepgram.extensions.types.sockets import ListenV2SocketClientResponse
 
-            options = LiveOptions(
+            # Create connection context
+            self._context_manager = self._client.listen.v2.connect(
                 model="flux-general-en",
                 encoding="linear16",
-                sample_rate=self._sample_rate,
-                channels=1,
-                interim_results=True,
-                endpointing=self._eot_timeout_ms,
+                sample_rate=str(self._sample_rate),
             )
+            self._connection = await self._context_manager.__aenter__()
 
-            self._connection = self._client.listen.live.v("1")
-
-            def on_message(self_conn, result, **kwargs):
+            def on_message(message: ListenV2SocketClientResponse) -> None:
                 try:
-                    transcript = result.channel.alternatives[0].transcript
-                    if transcript:
-                        is_final = result.is_final
-                        self._on_transcript(transcript, is_final)
-                        if is_final:
-                            self._accumulated_transcript += transcript + " "
+                    msg_type = getattr(message, "type", "Unknown")
 
-                        # Check for speech_final (end of turn indicator)
-                        if hasattr(result, 'speech_final') and result.speech_final:
+                    if hasattr(message, "channel") and message.channel:
+                        transcript = message.channel.alternatives[0].transcript
+                        if transcript:
+                            is_final = getattr(message, "is_final", True)
+
+                            if self._on_transcript:
+                                self._on_transcript(transcript, is_final)
+
+                            if is_final:
+                                self._accumulated_transcript += transcript + " "
+
+                    # Check for end-of-turn
+                    if msg_type in ("EndOfTurn", "UtteranceEnd"):
+                        if self._on_end_of_turn and self._accumulated_transcript:
                             self._on_end_of_turn(self._accumulated_transcript.strip())
                             self._accumulated_transcript = ""
 
                 except Exception as e:
                     logger.error(f"Error in Flux message handler: {e}")
 
-            def on_error(self_conn, error, **kwargs):
-                logger.error(f"Flux streaming error: {error}")
-
-            def on_close(self_conn, close, **kwargs):
+            def on_close(_) -> None:
                 logger.debug("Flux streaming session closed")
                 self._is_active = False
-                # Deliver any remaining transcript
-                if self._accumulated_transcript:
+                if self._on_end_of_turn and self._accumulated_transcript:
                     self._on_end_of_turn(self._accumulated_transcript.strip())
 
-            self._connection.on(LiveTranscriptionEvents.Transcript, on_message)
-            self._connection.on(LiveTranscriptionEvents.Error, on_error)
-            self._connection.on(LiveTranscriptionEvents.Close, on_close)
+            def on_error(error) -> None:
+                logger.error(f"Flux streaming error: {error}")
+                self._is_active = False
 
-            if await self._connection.start(options):
-                self._is_active = True
-                logger.info("Flux streaming session started")
-                return True
-            else:
-                logger.error("Failed to start Flux streaming session")
-                return False
+            self._connection.on(EventType.MESSAGE, on_message)
+            self._connection.on(EventType.CLOSE, on_close)
+            self._connection.on(EventType.ERROR, on_error)
+
+            await self._connection.start_listening()
+            self._is_active = True
+            logger.info("Flux streaming session started")
+            return True
 
         except Exception as e:
             logger.error(f"Error starting Flux session: {e}", exc_info=True)
@@ -291,19 +272,46 @@ class FluxStreamingSession:
         if not self._is_active or self._connection is None:
             return
 
-        # Convert float32 to int16 bytes
-        audio_int16 = (audio * 32767).astype(np.int16)
-        await self._connection.send(audio_int16.tobytes())
+        try:
+            from deepgram.extensions.types.sockets import ListenV2MediaMessage
 
-    async def stop(self) -> None:
-        """Stop the streaming session."""
+            # Convert float32 to int16 bytes
+            audio_int16 = (audio * 32767).astype(np.int16)
+            await self._connection.send_media(
+                ListenV2MediaMessage(data=audio_int16.tobytes())
+            )
+        except Exception as e:
+            logger.error(f"Error sending audio to Flux: {e}")
+
+    async def stop(self) -> str:
+        """Stop the streaming session.
+
+        Returns:
+            Any remaining accumulated transcript
+        """
+        remaining = self._accumulated_transcript.strip()
+
         if self._connection:
             try:
-                await self._connection.finish()
+                from deepgram.extensions.types.sockets import ListenV2ControlMessage
+                await self._connection.send_control(
+                    ListenV2ControlMessage(type="CloseStream")
+                )
             except Exception as e:
-                logger.warning(f"Error finishing Flux connection: {e}")
+                logger.warning(f"Error closing Flux connection: {e}")
+
+        if self._context_manager:
+            try:
+                await self._context_manager.__aexit__(None, None, None)
+            except Exception as e:
+                logger.warning(f"Error exiting Flux context: {e}")
+
         self._is_active = False
+        self._connection = None
+        self._context_manager = None
         logger.info("Flux streaming session stopped")
+
+        return remaining
 
     @property
     def is_active(self) -> bool:
