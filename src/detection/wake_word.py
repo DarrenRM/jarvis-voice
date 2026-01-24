@@ -1,6 +1,7 @@
 """Wake word detection using OpenWakeWord."""
 
 import logging
+import time
 from pathlib import Path
 from typing import Callable, Optional
 import numpy as np
@@ -40,9 +41,10 @@ class WakeWordDetector:
         self._on_detected: Optional[Callable[[], None]] = None
 
         # Buffer for accumulating audio chunks
-        # OpenWakeWord works best with 80ms chunks (1280 samples at 16kHz)
+        # OpenWakeWord can handle variable chunk sizes, but prefers ~80ms
+        # Using smaller minimum to avoid stalls when audio stops mid-buffer
         self._buffer = np.array([], dtype=np.float32)
-        self._min_samples = int(sample_rate * 0.08)  # 80ms
+        self._min_samples = int(sample_rate * 0.02)  # 20ms minimum (was 80ms)
 
         self._load_model(model_path, model_name)
 
@@ -112,7 +114,9 @@ class WakeWordDetector:
 
         # Process audio
         try:
+            t0 = time.perf_counter()
             prediction = self._model.predict(audio_int16)
+            inference_ms = (time.perf_counter() - t0) * 1000
         except Exception as e:
             # Log but don't crash on ONNX errors (usually chunk size issues)
             logger.debug(f"OpenWakeWord prediction error: {e}")
@@ -126,7 +130,10 @@ class WakeWordDetector:
                 score = scores
 
             if score >= self.threshold:
-                logger.info(f"Wake word detected: {wakeword} (score: {score:.2f})")
+                logger.info(
+                    f"Wake word detected: {wakeword} (score: {score:.2f}, "
+                    f"inference: {inference_ms:.1f}ms, chunk: {len(audio_int16)} samples)"
+                )
                 if self._on_detected:
                     self._on_detected()
                 return True
@@ -138,6 +145,44 @@ class WakeWordDetector:
         self._buffer = np.array([], dtype=np.float32)
         if self._model is not None:
             self._model.reset()
+
+    def flush(self) -> bool:
+        """Process any buffered audio immediately.
+
+        Call this periodically to prevent buffer stalls when audio stops mid-buffer.
+
+        Returns:
+            True if wake word detected
+        """
+        if self._model is None or len(self._buffer) == 0:
+            return False
+
+        # Process whatever we have, even if it's small
+        audio_to_process = self._buffer
+        self._buffer = np.array([], dtype=np.float32)
+
+        # OpenWakeWord expects int16
+        audio_int16 = (audio_to_process * 32767).astype(np.int16)
+
+        try:
+            prediction = self._model.predict(audio_int16)
+        except Exception as e:
+            logger.debug(f"OpenWakeWord flush error: {e}")
+            return False
+
+        for wakeword, scores in prediction.items():
+            if isinstance(scores, (list, np.ndarray)):
+                score = scores[-1] if len(scores) > 0 else 0
+            else:
+                score = scores
+
+            if score >= self.threshold:
+                logger.info(f"Wake word detected (flush): {wakeword} (score: {score:.2f})")
+                if self._on_detected:
+                    self._on_detected()
+                return True
+
+        return False
 
 
 class WhisperWakeWordDetector:

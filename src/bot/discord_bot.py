@@ -96,11 +96,13 @@ class ClaudeBot(commands.Bot):
 
             try:
                 # Create session with pre-loaded components
+                # Note: LLM is NOT passed here - VoiceSession creates it with the
+                # image callback that needs access to voice_client
                 self._session = VoiceSession(
                     wake_detector=self._wake_detector,
                     vad=self._vad,
                     transcriber=self._transcriber,
-                    llm=self._llm,
+                    # llm created in _init_components with image callback
                     tts=self._tts,
                 )
 

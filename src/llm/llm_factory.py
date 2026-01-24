@@ -1,12 +1,13 @@
 """Factory for creating LLM clients based on configuration."""
 
 import logging
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 from .base import BaseLLMClient
 from .claude_client import ClaudeClient
 from .groq_client import GroqClient
 from ..search.search_service import SearchService
+from ..image import NanoBananaClient
 
 if TYPE_CHECKING:
     from ..config import Settings
@@ -21,7 +22,10 @@ GROQ_MODEL_MAP = {
 }
 
 
-def create_llm_client(settings: "Settings") -> BaseLLMClient:
+def create_llm_client(
+    settings: "Settings",
+    on_image_generated: Optional[Callable[[bytes, str], Awaitable[str]]] = None,
+) -> BaseLLMClient:
     """Factory function to create the appropriate LLM client.
 
     Creates either a Claude client or a Groq client based on LLM_PROVIDER:
@@ -32,6 +36,7 @@ def create_llm_client(settings: "Settings") -> BaseLLMClient:
 
     Args:
         settings: Application settings
+        on_image_generated: Callback for posting generated images (Groq only)
 
     Returns:
         LLM client instance based on LLM_PROVIDER setting
@@ -58,12 +63,21 @@ def create_llm_client(settings: "Settings") -> BaseLLMClient:
             max_results=settings.search_max_results,
         )
 
+        # Create image service if API key is configured
+        image_service = None
+        if settings.nanobanana_api_key:
+            logger.info("Image generation enabled (Nano Banana)")
+            image_service = NanoBananaClient(api_key=settings.nanobanana_api_key)
+
         logger.info(f"Creating Groq client (provider: {provider}, model: {model})")
+        logger.info(f"Image callback provided: {on_image_generated is not None}")
         return GroqClient(
             api_key=settings.groq_api_key,
             model=model,
             max_tokens=settings.groq_max_tokens,
             search_service=search_service,
+            image_service=image_service,
+            on_image_generated=on_image_generated,
         )
 
     elif provider == "claude":

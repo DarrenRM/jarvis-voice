@@ -5,6 +5,7 @@ for a single Discord voice channel.
 """
 
 import asyncio
+import io
 import logging
 import random
 import time
@@ -214,7 +215,10 @@ class VoiceSession:
 
         if self.llm is None:
             logger.info("Setting up LLM client...")
-            self.llm = create_llm_client(self.settings)
+            self.llm = create_llm_client(
+                self.settings,
+                on_image_generated=self._post_image_to_discord,
+            )
 
         if self.tts is None:
             logger.info("Loading TTS...")
@@ -233,6 +237,52 @@ class VoiceSession:
             self._loop.call_soon_threadsafe(self._wake_event.set)
         else:
             logger.warning(f"[CALLBACK] NOT setting event - state={self._state}, loop={self._loop is not None}")
+
+    async def _post_image_to_discord(self, image_bytes: bytes, prompt: str) -> str:
+        """Post a generated image to Discord.
+
+        Args:
+            image_bytes: The generated image as PNG bytes
+            prompt: The prompt used to generate the image
+
+        Returns:
+            Result message to send back to the LLM
+        """
+        logger.info(f"[IMAGE] _post_image_to_discord called with {len(image_bytes)} bytes")
+
+        if not self.voice_client or not self.voice_client.guild:
+            logger.warning("[IMAGE] Cannot post image - no voice client or guild")
+            return "Could not post image - not connected to a server"
+
+        channel_name = self.settings.image_channel_name
+        logger.info(f"[IMAGE] Looking for channel: #{channel_name}")
+
+        # List available channels for debugging
+        available_channels = [ch.name for ch in self.voice_client.guild.text_channels]
+        logger.info(f"[IMAGE] Available text channels: {available_channels}")
+
+        channel = discord.utils.get(
+            self.voice_client.guild.text_channels,
+            name=channel_name,
+        )
+
+        if not channel:
+            logger.warning(f"[IMAGE] Could not find channel #{channel_name}")
+            return f"Could not find channel #{channel_name} to post the image. Available channels: {available_channels}"
+
+        try:
+            # Truncate prompt for display
+            display_prompt = prompt[:100] + "..." if len(prompt) > 100 else prompt
+            logger.info(f"[IMAGE] Sending to #{channel_name}...")
+            await channel.send(
+                content=f"*Generated: {display_prompt}*",
+                file=discord.File(io.BytesIO(image_bytes), filename="generated.png"),
+            )
+            logger.info(f"[IMAGE] Posted generated image to #{channel_name}")
+            return f"Done! I've posted the image to #{channel_name}."
+        except Exception as e:
+            logger.error(f"[IMAGE] Failed to post image: {e}", exc_info=True)
+            return f"Failed to post image: {str(e)}"
 
     def _get_member_activity(self, member: discord.Member) -> Optional[str]:
         """Get the member's current activity (game, etc.)."""

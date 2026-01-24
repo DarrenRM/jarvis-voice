@@ -53,6 +53,10 @@ class Settings(BaseSettings):
     firecrawl_api_key: Optional[str] = Field(default=None, alias="FIRECRAWL_API_KEY")
     search_max_results: int = Field(default=3, alias="SEARCH_MAX_RESULTS")
 
+    # Image Generation (Nano Banana / Gemini)
+    nanobanana_api_key: Optional[str] = Field(default=None, alias="NANOBANANA_API_KEY")
+    image_channel_name: str = Field(default="general", alias="IMAGE_CHANNEL_NAME")
+
     # Latency Settings
     vad_sensitivity: float = Field(default=0.5, alias="VAD_SENSITIVITY")
     speech_pad_ms: int = Field(default=300, alias="SPEECH_PAD_MS")

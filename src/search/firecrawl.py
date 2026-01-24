@@ -7,6 +7,22 @@ import aiohttp
 
 logger = logging.getLogger(__name__)
 
+# Browser-like headers to avoid being blocked by websites
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+    "Accept-Language": "en-US,en;q=0.9",
+    "Accept-Encoding": "gzip, deflate, br",
+    "DNT": "1",
+    "Connection": "keep-alive",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Sec-Fetch-User": "?1",
+    "Cache-Control": "max-age=0",
+}
+
 
 class FirecrawlClient:
     """Client for self-hosted Firecrawl instance.
@@ -48,6 +64,8 @@ class FirecrawlClient:
         payload = {
             "url": url,
             "formats": ["markdown"],
+            # Pass browser-like headers to the target site
+            "headers": BROWSER_HEADERS,
         }
 
         try:
@@ -62,12 +80,15 @@ class FirecrawlClient:
                         data = await response.json()
                         # Firecrawl returns {success: true, data: {markdown: "..."}}
                         if data.get("success"):
-                            return data.get("data", {}).get("markdown", "")
+                            content = data.get("data", {}).get("markdown", "")
+                            logger.info(f"Firecrawl scraped {url}: {len(content)} chars")
+                            return content
                         else:
-                            logger.warning(f"Firecrawl returned success=false: {data}")
+                            error_msg = data.get("error", "unknown error")
+                            logger.warning(f"Firecrawl failed for {url}: {error_msg}")
                             return ""
 
-                    logger.warning(f"Firecrawl returned status {response.status}")
+                    logger.warning(f"Firecrawl returned status {response.status} for {url}")
                     return ""
 
         except aiohttp.ClientConnectorError:

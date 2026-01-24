@@ -14,7 +14,6 @@ from src.config import get_settings, Settings
 from src.bot import ClaudeBot
 from src.detection import VAD, WakeWordDetector
 from src.stt import Transcriber
-from src.llm import create_llm_client
 from src.tts import TTSSynthesizer
 
 logger = logging.getLogger(__name__)
@@ -61,9 +60,9 @@ def preload_components(settings: Settings) -> dict:
     else:
         logger.info(f"Using {settings.stt_provider} for STT - skipping local Whisper model")
 
-    # LLM client (Claude or Groq based on LLM_PROVIDER)
-    logger.info(f"Setting up LLM client (provider: {settings.llm_provider})...")
-    components["llm"] = create_llm_client(settings)
+    # LLM client - NOT pre-created here because it needs the image callback
+    # which requires access to voice_client (created in VoiceSession)
+    logger.info(f"LLM client ({settings.llm_provider}) will be created when joining voice")
 
     # TTS (Inworld)
     logger.info("Loading TTS (Inworld)...")

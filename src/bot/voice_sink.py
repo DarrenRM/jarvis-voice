@@ -216,7 +216,20 @@ class StreamingSink(discord.sinks.Sink):
             return
 
         # Track when we last received audio (for PTT detection)
-        self._last_audio_time = time.perf_counter()
+        now = time.perf_counter()
+        if self._last_audio_time is not None:
+            gap = now - self._last_audio_time
+            # Log if there was a significant gap in audio (Discord wasn't sending)
+            if gap > 0.2 and self._state == "idle":
+                logger.info(f"[SINK] Audio resumed after {gap:.1f}s gap")
+                # Flush wake word detector's buffer - it may have stale audio from before the gap
+                if self.wake_detector and hasattr(self.wake_detector, 'flush'):
+                    if self.wake_detector.flush():
+                        logger.info("[SINK] Wake word detected from flushed buffer!")
+                        if self._on_wake_word:
+                            self._on_wake_word()
+                            return  # Don't process current audio if wake word found
+        self._last_audio_time = now
 
         # Convert to 16kHz mono float32
         audio_16k = resample_48k_stereo_to_16k_mono(data)
@@ -229,7 +242,12 @@ class StreamingSink(discord.sinks.Sink):
             if self.wake_detector:
                 detected = self.wake_detector.process(audio_16k)
                 if detected and self._on_wake_word:
-                    logger.info("[SINK] Wake word detected!")
+                    # Log time since last audio packet (shows Discord transmission lag)
+                    if self._last_audio_time:
+                        lag = time.perf_counter() - self._last_audio_time
+                        logger.info(f"[SINK] Wake word detected! (packet lag: {lag*1000:.0f}ms)")
+                    else:
+                        logger.info("[SINK] Wake word detected!")
                     self._on_wake_word()
 
         elif self._state == "listening":

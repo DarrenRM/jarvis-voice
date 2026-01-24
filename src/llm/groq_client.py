@@ -8,10 +8,13 @@ Supports multiple models via Groq's API:
 import json
 import logging
 from datetime import datetime
-from typing import AsyncIterator, Optional
+from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Optional
 
 from .base import BaseLLMClient
 from ..search.search_service import SearchService
+
+if TYPE_CHECKING:
+    from ..image import NanoBananaClient
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +53,23 @@ TOOLS = [
                 "required": ["url"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "generate_image",
+            "description": "Generate an image from a text description. Use when user asks you to create, generate, draw, or make an image/picture/photo.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "description": "Detailed description of the image to generate"
+                    }
+                },
+                "required": ["prompt"]
+            }
+        }
     }
 ]
 
@@ -68,6 +88,8 @@ class GroqClient(BaseLLMClient):
         max_tokens: int = 1024,
         max_turns: int = 10,
         search_service: Optional[SearchService] = None,
+        image_service: Optional["NanoBananaClient"] = None,
+        on_image_generated: Optional[Callable[[bytes, str], Awaitable[str]]] = None,
     ):
         """Initialize Groq client.
 
@@ -77,6 +99,8 @@ class GroqClient(BaseLLMClient):
             max_tokens: Maximum response tokens
             max_turns: Maximum tool use turns before giving up
             search_service: Search service for tool execution
+            image_service: Image generation service (Nano Banana)
+            on_image_generated: Callback to post generated image (bytes, prompt) -> result
         """
         self.api_key = api_key
         self.model = model
@@ -85,6 +109,8 @@ class GroqClient(BaseLLMClient):
         self._context: str = ""
         self._conversation_history: list[dict] = []
         self._search_service = search_service
+        self._image_service = image_service
+        self._on_image_generated = on_image_generated
         self._client = None
 
     def _ensure_client(self) -> None:
@@ -145,11 +171,12 @@ class GroqClient(BaseLLMClient):
                 logger.debug(f"Groq turn {turn + 1}/{self.max_turns}")
 
                 # Request with tool support (non-streaming to detect tool calls)
+                has_tools = self._search_service or self._image_service
                 response = await self._client.chat.completions.create(
                     model=self.model,
                     messages=messages,
-                    tools=TOOLS if self._search_service else None,
-                    tool_choice="auto" if self._search_service else None,
+                    tools=TOOLS if has_tools else None,
+                    tool_choice="auto" if has_tools else None,
                     parallel_tool_calls=False,  # GPT-OSS doesn't support parallel
                     max_tokens=self.max_tokens,
                     stream=False,
@@ -205,8 +232,14 @@ class GroqClient(BaseLLMClient):
             logger.error("groq package not installed. Install with: pip install groq")
             yield "Groq client not available. Please install the groq package."
         except Exception as e:
-            logger.error(f"Groq API error: {e}")
-            yield "Sorry, I encountered an error processing your request."
+            error_str = str(e)
+            # Handle Groq's output parsing error (model outputs thinking text instead of proper tool call)
+            if "output_parse_failed" in error_str or "Parsing failed" in error_str:
+                logger.warning(f"Groq model output parsing failed - model may have output thinking text: {e}")
+                yield "I couldn't find specific information about that. Try asking in a different way."
+            else:
+                logger.error(f"Groq API error: {e}")
+                yield "Sorry, I encountered an error processing your request."
 
     async def _stream_response(self, messages: list) -> AsyncIterator[str]:
         """Stream the final response after tool calls are complete.
@@ -256,10 +289,25 @@ class GroqClient(BaseLLMClient):
 
         logger.info(f"Executing tool: {function_name} with args: {args}")
 
-        if not self._search_service:
-            return "Search service not available"
-
         try:
+            # Image generation tool
+            if function_name == "generate_image":
+                if not self._image_service:
+                    return "Image generation not available - NANOBANANA_API_KEY not configured"
+                prompt = args.get("prompt", "")
+                image_bytes = await self._image_service.generate(prompt)
+                logger.info(f"[IMAGE] Image generated, callback set: {self._on_image_generated is not None}")
+                if self._on_image_generated:
+                    logger.info("[IMAGE] Calling on_image_generated callback...")
+                    result = await self._on_image_generated(image_bytes, prompt)
+                    logger.info(f"[IMAGE] Callback returned: {result}")
+                    return result
+                return "Image generated but no channel to post to"
+
+            # Search tools
+            if not self._search_service:
+                return "Search service not available"
+
             if function_name == "web_search":
                 # Use search_and_fetch to get full content from top result via Firecrawl
                 return await self._search_service.search_and_fetch(
@@ -340,9 +388,13 @@ You have a web_search tool. You MUST use it for:
 - Current events, news, weather, prices, availability
 - Facts you're not 100% certain about
 
-CRITICAL: Do NOT say "I'll check" or "Let me search" - just USE the tool directly.
-Saying you will search is NOT the same as searching. You must actually call web_search.
-After getting results, give a brief 1-2 sentence answer.
+CRITICAL TOOL USE RULES:
+- Do NOT say "I'll check" or "Let me search" - just USE the tool directly
+- Do NOT output thinking or planning text like "We need to search" or "Need to find"
+- ONLY call the tool OR respond to the user - never output internal reasoning
+- If you want to search, call the tool immediately without any preamble
+- After getting results, give a brief 1-2 sentence answer
+- If search doesn't help after 2-3 tries, give your best answer with what you found
 
 GAME CONTEXT:
 - User messages include their current Discord activity (e.g., "Playing Dune: Awakening")
@@ -403,11 +455,12 @@ Examples (note: emotion tags, personality, brief answers):
             ]
 
             # For quick responses, try without tools first
+            has_tools = self._search_service or self._image_service
             stream = await self._client.chat.completions.create(
                 model=self.model,
                 messages=messages,
-                tools=TOOLS if self._search_service else None,
-                tool_choice="auto" if self._search_service else None,
+                tools=TOOLS if has_tools else None,
+                tool_choice="auto" if has_tools else None,
                 max_tokens=self.max_tokens,
                 stream=True,
             )
