@@ -170,13 +170,15 @@ class StreamingSink(discord.sinks.Sink):
         return False
 
     def check_idle_audio_gap(self) -> bool:
-        """Check if audio has stopped while idle and flush wake word detector.
+        """Check if audio has stopped while idle and complete wake word detection.
 
         This handles the case where user says wake word and stops talking
-        before more audio arrives to trigger detection.
+        before more audio arrives to trigger detection. OpenWakeWord is a
+        streaming model - it may have the wake word "loaded" in its internal
+        state but needs more audio to complete the detection.
 
         Returns:
-            True if wake word was detected from flush, False otherwise
+            True if wake word was detected, False otherwise
         """
         if self._state != "idle":
             return False
@@ -184,17 +186,30 @@ class StreamingSink(discord.sinks.Sink):
         if self._last_audio_time is None:
             return False
 
-        # Only flush once per gap (flag is reset when new audio arrives)
+        # Only try once per gap (flag is reset when new audio arrives)
         if self._idle_flush_done:
             return False
 
         gap = time.perf_counter() - self._last_audio_time
-        # Only flush if there's been a significant gap (similar to resume detection)
-        if gap >= 0.25 and self.wake_detector and hasattr(self.wake_detector, 'flush'):
-            self._idle_flush_done = True  # Mark as flushed for this gap
-            if self.wake_detector.flush():
-                logger.info(f"[SINK] Wake word detected from idle gap flush ({gap:.2f}s gap)")
+        # Only check if there's been a significant gap (250ms+)
+        if gap >= 0.25 and self.wake_detector:
+            self._idle_flush_done = True  # Mark as done for this gap
+
+            # Feed a small amount of silence to the wake detector.
+            # This "completes" any pending detection - OpenWakeWord's internal
+            # state may have the wake word loaded but needs more audio frames
+            # to trigger the final detection.
+            silence = np.zeros(1600, dtype=np.float32)  # 100ms of silence at 16kHz
+            detected = self.wake_detector.process(silence)
+            if detected:
+                logger.info(f"[SINK] Wake word detected from silence padding ({gap:.2f}s gap)")
                 return True
+
+            # Also try flush in case there's buffered audio
+            if hasattr(self.wake_detector, 'flush') and self.wake_detector.flush():
+                logger.info(f"[SINK] Wake word detected from flush ({gap:.2f}s gap)")
+                return True
+
         return False
 
     def init(self, vc) -> None:

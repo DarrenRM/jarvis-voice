@@ -62,36 +62,44 @@ class SearchService:
 
         return "\n\n".join(output_parts)
 
-    async def fetch_url(self, url: str) -> str:
-        """Fetch URL content via Firecrawl.
+    async def fetch_url(self, url: str, query: str = "") -> str:
+        """Fetch URL content via Firecrawl with smart extraction.
+
+        Tries structured extraction first, falls back to markdown.
 
         Args:
             url: URL to fetch content from
+            query: Optional query context for better extraction
 
         Returns:
-            Markdown content from the URL, or error message
+            Extracted JSON or markdown content, or error message
         """
+        if query:
+            # Use smart extraction with query context
+            return await self.firecrawl.smart_extract(
+                url, query, max_markdown_length=self.max_content_length
+            )
+
+        # No query - just get markdown
         content = await self.firecrawl.scrape(url)
 
         if not content:
-            # Firecrawl not available or failed - return helpful message
             return f"Could not fetch content from {url}. Firecrawl may not be running."
 
-        # Truncate if too long to avoid token limits
         if len(content) > self.max_content_length:
             content = content[:self.max_content_length] + "\n\n[Content truncated...]"
 
         return content
 
     async def search_and_fetch(self, query: str, fetch_top_n: int = 1) -> str:
-        """Search and optionally fetch content from top results.
+        """Search and fetch content from top results using smart extraction.
 
         Args:
             query: Search query string
             fetch_top_n: Number of top results to fetch full content for (0 to skip)
 
         Returns:
-            Combined search results and fetched content
+            Combined search results and fetched/extracted content
         """
         results = await self.ddg.search(query)
 
@@ -108,12 +116,14 @@ class SearchService:
                 f"Snippet: {result['snippet']}"
             )
 
-        # Optionally fetch content from top results
+        # Fetch content from top results using smart extraction
         if fetch_top_n > 0:
-            output_parts.append("\n--- Fetched Content ---")
+            output_parts.append("\n--- Extracted Content ---")
             for i, result in enumerate(results[:fetch_top_n], 1):
-                content = await self.fetch_url(result['url'])
+                content = await self.firecrawl.smart_extract(
+                    result['url'], query, max_markdown_length=self.max_content_length
+                )
                 if content and not content.startswith("Could not fetch"):
-                    output_parts.append(f"\n[{i}] Content from {result['url']}:\n{content}")
+                    output_parts.append(f"\n[{i}] From {result['url']}:\n{content}")
 
         return "\n\n".join(output_parts)

@@ -58,7 +58,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "generate_image",
-            "description": "Generate a NEW image from a text description. Use when user asks you to create, generate, draw, or make an image/picture/photo. For editing an existing image, use edit_image instead.",
+            "description": "Generate a NEW image from a text description. Use when user asks you to create, generate, draw, make, or wants an image/picture/photo/infographic. For editing or changing or adding details to an existing image, use edit_image instead.",
             "parameters": {
                 "type": "object",
                 "properties": {

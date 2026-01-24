@@ -1,11 +1,29 @@
 """Firecrawl client for self-hosted content extraction."""
 
+import asyncio
+import json
 import logging
-from typing import Optional
+from typing import Any, Optional
 
 import aiohttp
 
 logger = logging.getLogger(__name__)
+
+# Generic extraction schema - returns structured facts for any content type
+EXTRACT_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "facts": {
+            "type": "array",
+            "items": {"type": "string"},
+            "description": "Key facts as brief data points (e.g. 'Craft time: 20s', 'Temperature: 72F')"
+        },
+        "content_type": {
+            "type": "string",
+            "description": "Type of content: recipe, article, wiki, weather, news, etc"
+        }
+    }
+}
 
 # Browser-like headers to avoid being blocked by websites
 BROWSER_HEADERS = {
@@ -100,6 +118,94 @@ class FirecrawlClient:
         except Exception as e:
             logger.error(f"Firecrawl error for {url}: {e}")
             return ""
+
+    async def extract(self, url: str, query: str) -> Optional[dict[str, Any]]:
+        """Extract structured data from URL using LLM.
+
+        Args:
+            url: URL to extract from
+            query: What information to extract (e.g., "crafting recipe", "weather forecast")
+
+        Returns:
+            Extracted data dict with 'facts' and 'content_type', or None on error
+        """
+        headers = {"Content-Type": "application/json"}
+        if self.api_key:
+            headers["Authorization"] = f"Bearer {self.api_key}"
+
+        payload = {
+            "url": url,
+            "formats": ["extract"],
+            "extract": {
+                "prompt": f"Extract relevant information about: {query}",
+                "schema": EXTRACT_SCHEMA,
+            },
+            "headers": BROWSER_HEADERS,
+        }
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    f"{self.base_url}/v1/scrape",
+                    json=payload,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=self.timeout + 30),  # Extra time for LLM
+                ) as response:
+                    if response.status == 200:
+                        data = await response.json()
+                        if data.get("success"):
+                            extract = data.get("data", {}).get("extract")
+                            if extract and extract.get("facts"):
+                                logger.info(f"Firecrawl extracted {len(extract['facts'])} facts from {url}")
+                                return extract
+                            logger.warning(f"Firecrawl extraction returned no facts for {url}")
+                            return None
+                        else:
+                            error_msg = data.get("error", "unknown error")
+                            logger.warning(f"Firecrawl extract failed for {url}: {error_msg}")
+                            return None
+
+                    logger.warning(f"Firecrawl extract returned status {response.status} for {url}")
+                    return None
+
+        except aiohttp.ClientConnectorError:
+            logger.warning(f"Firecrawl not available at {self.base_url}")
+            return None
+        except asyncio.TimeoutError:
+            logger.warning(f"Firecrawl extract timeout for {url}")
+            return None
+        except Exception as e:
+            logger.error(f"Firecrawl extract error for {url}: {e}")
+            return None
+
+    async def smart_extract(
+        self, url: str, query: str, max_markdown_length: int = 4000
+    ) -> str:
+        """Extract structured data, falling back to markdown if extraction fails.
+
+        Args:
+            url: URL to extract from
+            query: What information to extract
+            max_markdown_length: Max chars for markdown fallback
+
+        Returns:
+            JSON string of extracted facts, or truncated markdown, or error message
+        """
+        # Try structured extraction first
+        extract_result = await self.extract(url, query)
+        if extract_result and extract_result.get("facts"):
+            logger.info(f"Smart extract succeeded with structured data for {url}")
+            return json.dumps(extract_result)
+
+        # Fall back to markdown
+        logger.info(f"Smart extract falling back to markdown for {url}")
+        markdown = await self.scrape(url)
+        if markdown:
+            if len(markdown) > max_markdown_length:
+                markdown = markdown[:max_markdown_length] + "\n\n[Content truncated...]"
+            return markdown
+
+        return f"Could not fetch content from {url}"
 
     async def is_available(self) -> bool:
         """Check if Firecrawl service is available.
