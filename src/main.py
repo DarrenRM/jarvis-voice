@@ -49,13 +49,16 @@ def preload_components(settings: Settings) -> dict:
         speech_pad_ms=settings.speech_pad_ms,
     )
 
-    # Transcriber (Whisper)
-    logger.info("Loading Whisper transcriber...")
-    components["transcriber"] = Transcriber(
-        model_size=settings.whisper_model,
-        device=settings.whisper_device,
-        compute_type=settings.whisper_compute_type,
-    )
+    # Transcriber (only load local Whisper if using it as STT provider)
+    if settings.stt_provider == "whisper":
+        logger.info("Loading local Whisper transcriber...")
+        components["transcriber"] = Transcriber(
+            model_size=settings.whisper_model,
+            device=settings.whisper_device,
+            compute_type=settings.whisper_compute_type,
+        )
+    else:
+        logger.info(f"Using {settings.stt_provider} for STT - skipping local Whisper model")
 
     # Claude client
     logger.info(f"Setting up Claude client (model: {settings.claude_model})...")

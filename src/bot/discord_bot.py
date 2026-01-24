@@ -95,8 +95,7 @@ class ClaudeBot(commands.Bot):
                 await ctx.voice_client.disconnect()
 
             try:
-                # Create session and initialize components FIRST (before joining)
-                await ctx.send("Loading voice assistant models...")
+                # Create session with pre-loaded components
                 self._session = VoiceSession(
                     wake_detector=self._wake_detector,
                     vad=self._vad,
@@ -105,8 +104,7 @@ class ClaudeBot(commands.Bot):
                     tts=self._tts,
                 )
 
-                # Initialize ML components before joining voice
-                # This ensures wake word detection is ready immediately
+                # Initialize any remaining components (STT clients)
                 loop = asyncio.get_running_loop()
                 await loop.run_in_executor(None, self._session._init_components)
 

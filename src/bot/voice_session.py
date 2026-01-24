@@ -49,7 +49,8 @@ class VoiceSession:
         "What's up?",
         "I'm listening...",
         "Go ahead...",
-        "I'm busy sorry..."
+        "I'm busy sorry...",
+        "Yea, no, yea. No.",
     ]
 
     # Thinking phrases (randomly selected)
