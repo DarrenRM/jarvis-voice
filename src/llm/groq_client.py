@@ -58,7 +58,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "generate_image",
-            "description": "Generate an image from a text description. Use when user asks you to create, generate, draw, or make an image/picture/photo.",
+            "description": "Generate a NEW image from a text description. Use when user asks you to create, generate, draw, or make an image/picture/photo. For editing an existing image, use edit_image instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -68,6 +68,23 @@ TOOLS = [
                     }
                 },
                 "required": ["prompt"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "edit_image",
+            "description": "Edit or modify the most recently generated image. Use when user says 'edit that', 'change the image', 'modify it', 'update that picture', 'give it X', 'make it Y', or references a previous image they want changed.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "instruction": {
+                        "type": "string",
+                        "description": "What to change about the image (e.g., 'add silly hats to everyone', 'make it more colorful', 'change the background to a beach')"
+                    }
+                },
+                "required": ["instruction"]
             }
         }
     }
@@ -301,8 +318,25 @@ class GroqClient(BaseLLMClient):
                     logger.info("[IMAGE] Calling on_image_generated callback...")
                     result = await self._on_image_generated(image_bytes, prompt)
                     logger.info(f"[IMAGE] Callback returned: {result}")
-                    return result
+                    # Inform the model that editing is now available
+                    return f"{result} You can now edit this image using the edit_image tool if the user wants changes."
                 return "Image generated but no channel to post to"
+
+            # Image editing tool
+            if function_name == "edit_image":
+                if not self._image_service:
+                    return "Image editing not available - NANOBANANA_API_KEY not configured"
+                if not self._image_service.has_chat():
+                    return "No previous image to edit. Ask the user what image they'd like you to generate first."
+                instruction = args.get("instruction", "")
+                image_bytes = await self._image_service.edit(instruction)
+                logger.info(f"[IMAGE] Image edited, callback set: {self._on_image_generated is not None}")
+                if self._on_image_generated:
+                    logger.info("[IMAGE] Calling on_image_generated callback for edited image...")
+                    result = await self._on_image_generated(image_bytes, f"Edited: {instruction}")
+                    logger.info(f"[IMAGE] Callback returned: {result}")
+                    return f"{result} The image has been edited. You can make more edits using edit_image."
+                return "Image edited but no channel to post to"
 
             # Search tools
             if not self._search_service:
@@ -367,6 +401,7 @@ CRITICAL RULES:
 4. NO SOURCES - Never include "Sources:" or URLs - this is voice output
 5. SKIP PLEASANTRIES - No "Hi", "Sure!", "Great question!"
 6. SPEAK TO THE QUESTION ASKER - Say "you can find", not the users name.
+7. DO NOT PRONOUNCE # AS HASHTAG - If the word is #general just say "general chat"
 
 VOICE EMOTION TAGS:
 You MUST include emotion tags to make speech expressive. Put ONE tag at the START of each sentence.
