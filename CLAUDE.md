@@ -1,6 +1,6 @@
 # Discord Voice Claude Bot
 
-Voice-activated AI assistant for Discord using Claude Code SDK or Groq Llama 3.3 70B.
+Voice-activated AI assistant for Discord using Claude, Llama 3.3 70B, or GPT-OSS 120B.
 
 ## Quick Start
 
@@ -26,17 +26,20 @@ DISCORD_TOKEN=your_bot_token_here
 
 ### LLM Provider Selection
 
-Switch between Claude and Groq with a single env var:
+Switch between providers with a single env var:
 
 ```bash
 # Claude (default) - uses Claude Code SDK, no API key needed
 LLM_PROVIDER=claude
 CLAUDE_MODEL=haiku  # haiku, sonnet, or opus
 
-# Groq Llama 3.3 70B - faster inference
-LLM_PROVIDER=groq
+# Llama 3.3 70B via Groq - fast inference
+LLM_PROVIDER=llama
 GROQ_API_KEY=your_groq_api_key_here
-GROQ_LLM_MODEL=llama-3.3-70b-versatile  # default
+
+# GPT-OSS 120B via Groq - larger context (131K), better reasoning
+LLM_PROVIDER=gpt-oss
+GROQ_API_KEY=your_groq_api_key_here
 ```
 
 ### STT (Speech-to-Text)
@@ -54,15 +57,15 @@ INWORLD_API_KEY=your_inworld_api_key
 TTS_VOICE=alex
 ```
 
-## Groq LLM with Web Search
+## Web Search (Llama/GPT-OSS)
 
-When using `LLM_PROVIDER=groq`, the bot has web search capabilities via:
+When using `LLM_PROVIDER=llama` or `LLM_PROVIDER=gpt-oss`, the bot has web search capabilities via:
 - **DuckDuckGo** - free web search (no API key needed)
 - **Firecrawl** - URL content extraction (optional, self-hosted)
 
 ### Basic Setup (DuckDuckGo only)
 
-Just set `LLM_PROVIDER=groq` - web search works out of the box using DuckDuckGo snippets.
+Just set `LLM_PROVIDER=llama` or `LLM_PROVIDER=gpt-oss` - web search works out of the box using DuckDuckGo snippets.
 
 ### Full Setup with Firecrawl (Optional)
 
@@ -95,10 +98,10 @@ SEARCH_MAX_RESULTS=3
 ### How Search Works
 
 1. User asks a question requiring current info
-2. Llama decides to call `web_search` tool
+2. Model decides to call `web_search` tool
 3. DuckDuckGo returns search results with snippets
-4. Optionally, Llama calls `fetch_url` to get full page content via Firecrawl
-5. Llama synthesizes answer from results
+4. Optionally, model calls `fetch_url` to get full page content via Firecrawl
+5. Model synthesizes answer from results
 
 Without Firecrawl running, `fetch_url` returns an error but search still works with snippets only.
 
@@ -128,8 +131,8 @@ User Speech
     |
 [STT] - Groq Whisper / Deepgram / local Whisper
     |
-[LLM] - Claude Code SDK or Groq Llama 3.3
-    |     (with web search tools for Groq)
+[LLM] - Claude / Llama 3.3 70B / GPT-OSS 120B
+    |     (with web search tools for Groq models)
     |
 [TTS] - Inworld
     |
@@ -143,12 +146,12 @@ src/
   bot/           # Discord bot and voice session
   config.py      # Pydantic settings
   detection/     # Wake word and VAD
-  llm/           # LLM clients (Claude, Groq)
+  llm/           # LLM clients
     base.py            # Abstract base class
     claude_client.py   # Claude Code SDK client
-    groq_llama_client.py  # Groq Llama with tool use
+    groq_client.py     # Groq client (Llama, GPT-OSS)
     llm_factory.py     # Factory for provider selection
-  search/        # Web search pipeline (for Groq)
+  search/        # Web search pipeline (for Groq models)
     duckduckgo.py      # DuckDuckGo search
     firecrawl.py       # Firecrawl scraper
     search_service.py  # Unified service
@@ -158,17 +161,20 @@ src/
 
 ## Comparing Providers
 
-| Feature | Claude | Groq Llama |
-|---------|--------|------------|
-| Speed | Moderate | Fast |
-| Tool use | Native (WebSearch, WebFetch) | Native (web_search, fetch_url) |
-| Search backend | Claude's built-in | DuckDuckGo + Firecrawl |
-| API key | None (uses Claude Code auth) | Required |
-| Quality | Excellent | Very good |
+| Feature | Claude | Llama 3.3 70B | GPT-OSS 120B |
+|---------|--------|---------------|--------------|
+| Provider | `claude` | `llama` | `gpt-oss` |
+| API | Claude Code SDK | Groq | Groq |
+| Context | 200K | ~8K | 131K |
+| Speed | Moderate | ~750 tok/s | ~500 tok/s |
+| Tool use | Native | Native | Native |
+| Search | Claude's built-in | DuckDuckGo + Firecrawl | DuckDuckGo + Firecrawl |
+| API key | None (Claude auth) | GROQ_API_KEY | GROQ_API_KEY |
+| Quality | Excellent | Good | Better |
 
 ## Troubleshooting
 
-### Groq: "GROQ_API_KEY required"
+### Llama/GPT-OSS: "GROQ_API_KEY required"
 Set `GROQ_API_KEY` in your `.env` file. Get one at https://console.groq.com
 
 ### Firecrawl: "Could not fetch content"

@@ -5,7 +5,7 @@ from typing import TYPE_CHECKING
 
 from .base import BaseLLMClient
 from .claude_client import ClaudeClient
-from .groq_llama_client import GroqLlamaClient
+from .groq_client import GroqClient
 from ..search.search_service import SearchService
 
 if TYPE_CHECKING:
@@ -13,12 +13,22 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# Map provider names to Groq model IDs
+GROQ_MODEL_MAP = {
+    "llama": "llama-3.3-70b-versatile",
+    "gpt-oss": "openai/gpt-oss-120b",
+    "groq": "llama-3.3-70b-versatile",  # backwards compat
+}
+
 
 def create_llm_client(settings: "Settings") -> BaseLLMClient:
     """Factory function to create the appropriate LLM client.
 
-    Creates either a Claude client (using Claude Code SDK) or a Groq Llama
-    client based on the LLM_PROVIDER setting.
+    Creates either a Claude client or a Groq client based on LLM_PROVIDER:
+    - claude: Claude via Claude Code SDK
+    - llama: Llama 3.3 70B via Groq
+    - gpt-oss: GPT-OSS 120B via Groq
+    - groq: (deprecated) alias for llama
 
     Args:
         settings: Application settings
@@ -31,12 +41,15 @@ def create_llm_client(settings: "Settings") -> BaseLLMClient:
     """
     provider = settings.llm_provider.lower()
 
-    if provider == "groq":
+    # Groq-based providers (llama, gpt-oss, groq)
+    if provider in GROQ_MODEL_MAP:
         if not settings.groq_api_key:
             raise ValueError(
-                "GROQ_API_KEY required for Groq LLM provider. "
+                f"GROQ_API_KEY required for {provider} provider. "
                 "Set it in your .env file."
             )
+
+        model = GROQ_MODEL_MAP[provider]
 
         # Create search service for tool use
         search_service = SearchService(
@@ -45,12 +58,10 @@ def create_llm_client(settings: "Settings") -> BaseLLMClient:
             max_results=settings.search_max_results,
         )
 
-        logger.info(
-            f"Creating Groq Llama client (model: {settings.groq_llm_model})"
-        )
-        return GroqLlamaClient(
+        logger.info(f"Creating Groq client (provider: {provider}, model: {model})")
+        return GroqClient(
             api_key=settings.groq_api_key,
-            model=settings.groq_llm_model,
+            model=model,
             max_tokens=settings.groq_max_tokens,
             search_service=search_service,
         )
@@ -62,5 +73,5 @@ def create_llm_client(settings: "Settings") -> BaseLLMClient:
     else:
         raise ValueError(
             f"Unknown LLM provider: {provider}. "
-            "Valid options are 'claude' or 'groq'."
+            "Valid options are 'claude', 'llama', or 'gpt-oss'."
         )

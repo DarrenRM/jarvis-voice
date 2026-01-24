@@ -40,13 +40,12 @@ class Settings(BaseSettings):
     tts_voice: str = Field(default="alex", alias="TTS_VOICE")
 
     # LLM Provider Selection
-    llm_provider: str = Field(default="claude", alias="LLM_PROVIDER")  # claude or groq
+    llm_provider: str = Field(default="claude", alias="LLM_PROVIDER")  # claude, llama, or gpt-oss
 
     # Claude LLM
     claude_model: str = Field(default="haiku", alias="CLAUDE_MODEL")  # haiku, sonnet, opus
 
-    # Groq LLM (reuses GROQ_API_KEY from STT section)
-    groq_llm_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_LLM_MODEL")
+    # Groq LLM settings (used by llama and gpt-oss providers, reuses GROQ_API_KEY from STT)
     groq_max_tokens: int = Field(default=1024, alias="GROQ_MAX_TOKENS")
 
     # Search Pipeline (for Groq tool use)

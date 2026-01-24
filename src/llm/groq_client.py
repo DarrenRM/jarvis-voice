@@ -1,8 +1,12 @@
-"""Groq Llama 3.3 70B client with tool use support."""
+"""Groq LLM client with tool use support.
+
+Supports multiple models via Groq's API:
+- llama-3.3-70b-versatile (Llama 3.3 70B)
+- openai/gpt-oss-120b (GPT-OSS 120B)
+"""
 
 import json
 import logging
-import re
 from datetime import datetime
 from typing import AsyncIterator, Optional
 
@@ -11,13 +15,7 @@ from ..search.search_service import SearchService
 
 logger = logging.getLogger(__name__)
 
-# Regex to parse Llama's native function call format: <function=name {...}>
-FUNCTION_CALL_PATTERN = re.compile(
-    r'<function=(\w+)\s*(\{[^}]*\})\s*(?:>|</function>)',
-    re.DOTALL
-)
-
-# Tool definitions for Llama 3.3 function calling
+# Tool definitions for Groq function calling
 TOOLS = [
     {
         "type": "function",
@@ -56,11 +54,11 @@ TOOLS = [
 ]
 
 
-class GroqLlamaClient(BaseLLMClient):
-    """Groq Llama 3.3 70B client with tool use support.
+class GroqClient(BaseLLMClient):
+    """Groq LLM client with tool use support.
 
     Uses Groq's OpenAI-compatible API for fast inference with
-    native function calling support.
+    native function calling support. Supports multiple models.
     """
 
     def __init__(
@@ -71,11 +69,11 @@ class GroqLlamaClient(BaseLLMClient):
         max_turns: int = 10,
         search_service: Optional[SearchService] = None,
     ):
-        """Initialize Groq Llama client.
+        """Initialize Groq client.
 
         Args:
             api_key: Groq API key
-            model: Model to use (llama-3.3-70b-versatile recommended)
+            model: Model ID (llama-3.3-70b-versatile or openai/gpt-oss-120b)
             max_tokens: Maximum response tokens
             max_turns: Maximum tool use turns before giving up
             search_service: Search service for tool execution
@@ -152,7 +150,7 @@ class GroqLlamaClient(BaseLLMClient):
                     messages=messages,
                     tools=TOOLS if self._search_service else None,
                     tool_choice="auto" if self._search_service else None,
-                    parallel_tool_calls=False,  # Helps prevent malformed tool calls
+                    parallel_tool_calls=False,  # GPT-OSS doesn't support parallel
                     max_tokens=self.max_tokens,
                     stream=False,
                 )
@@ -207,91 +205,7 @@ class GroqLlamaClient(BaseLLMClient):
             logger.error("groq package not installed. Install with: pip install groq")
             yield "Groq client not available. Please install the groq package."
         except Exception as e:
-            error_str = str(e)
-            # Check if this is a text-based function call that Groq rejected
-            if "tool_use_failed" in error_str and "failed_generation" in error_str:
-                logger.info("Detected text-based function call, parsing manually...")
-                async for chunk in self._handle_text_function_call(error_str, message):
-                    yield chunk
-            else:
-                logger.error(f"Groq API error: {e}")
-                yield "Sorry, I encountered an error processing your request."
-
-    async def _handle_text_function_call(self, error_str: str, original_message: str) -> AsyncIterator[str]:
-        """Handle text-based function calls that Groq rejected.
-
-        Parses <function=name {...}> format from the error and executes the tool.
-        """
-        try:
-            # Extract the failed_generation from the error
-            import ast
-            # Find the error dict in the string
-            start = error_str.find("{'error':")
-            if start == -1:
-                yield "Sorry, I encountered an error processing your request."
-                return
-
-            # Parse the function call from failed_generation
-            match = FUNCTION_CALL_PATTERN.search(error_str)
-            if not match:
-                logger.error(f"Could not parse function call from error: {error_str[:500]}")
-                yield "Sorry, I encountered an error processing your request."
-                return
-
-            function_name = match.group(1)
-            args_str = match.group(2)
-
-            try:
-                args = json.loads(args_str)
-            except json.JSONDecodeError:
-                logger.error(f"Could not parse function args: {args_str}")
-                yield "Sorry, I encountered an error processing your request."
-                return
-
-            logger.info(f"Parsed text function call: {function_name} with args: {args}")
-
-            # Execute the tool
-            if not self._search_service:
-                yield "Search service not available."
-                return
-
-            if function_name == "web_search":
-                result = await self._search_service.search_and_fetch(
-                    args.get("query", ""), fetch_top_n=1
-                )
-            elif function_name == "fetch_url":
-                result = await self._search_service.fetch_url(args.get("url", ""))
-            else:
-                yield f"Unknown function: {function_name}"
-                return
-
-            logger.info(f"Tool result: {result[:200]}...")
-
-            # Now get a response with the tool result
-            self._ensure_client()
-            messages = self._build_messages(original_message)
-            messages.append({
-                "role": "assistant",
-                "content": f"[Searched for: {args.get('query', args.get('url', ''))}]"
-            })
-            messages.append({
-                "role": "user",
-                "content": f"Search results:\n{result}\n\nBased on these results, answer the original question briefly."
-            })
-
-            stream = await self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=self.max_tokens,
-                stream=True,
-            )
-
-            async for chunk in stream:
-                if chunk.choices and chunk.choices[0].delta.content:
-                    yield chunk.choices[0].delta.content
-
-        except Exception as e:
-            logger.error(f"Error handling text function call: {e}")
+            logger.error(f"Groq API error: {e}")
             yield "Sorry, I encountered an error processing your request."
 
     async def _stream_response(self, messages: list) -> AsyncIterator[str]:
@@ -387,12 +301,8 @@ class GroqLlamaClient(BaseLLMClient):
         return messages
 
     def _build_system_prompt(self) -> str:
-        """Build system prompt optimized for Llama 3.3."""
-        # Calculate current ISO week for dynamic URLs
-        now = datetime.now()
-        current_week = f"{now.year}W{now.isocalendar()[1]:02d}"
-
-        base_prompt = f"""You are Jarvis, an AI voice assistant. You respond to voice commands.
+        """Build system prompt for voice assistant."""
+        base_prompt = """You are Jarvis, an AI voice assistant. You respond to voice commands.
 
 CRITICAL OUTPUT FORMAT:
 - Put EACH SENTENCE on its OWN LINE
@@ -408,8 +318,7 @@ CRITICAL RULES:
 3. NO MARKDOWN - No asterisks, headers, links, or formatting
 4. NO SOURCES - Never include "Sources:" or URLs - this is voice output
 5. SKIP PLEASANTRIES - No "Hi", "Sure!", "Great question!"
-6. ONE ANNOUNCEMENT - Say "I'll check that" once, then just give the answer
-7. SPEAK TO THE QUESTION ASKER - Say "you can find", not the users name.
+6. SPEAK TO THE QUESTION ASKER - Say "you can find", not the users name.
 
 VOICE EMOTION TAGS:
 You MUST include emotion tags to make speech expressive. Put ONE tag at the START of each sentence.

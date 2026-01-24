@@ -2,14 +2,14 @@
 
 from .base import BaseLLMClient
 from .claude_client import ClaudeClient
-from .groq_llama_client import GroqLlamaClient
+from .groq_client import GroqClient
 from .llm_factory import create_llm_client
 from .prompt_builder import PromptBuilder
 
 __all__ = [
     "BaseLLMClient",
     "ClaudeClient",
-    "GroqLlamaClient",
+    "GroqClient",
     "create_llm_client",
     "PromptBuilder",
 ]
