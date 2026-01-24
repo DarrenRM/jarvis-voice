@@ -34,6 +34,7 @@ class StreamingSink(discord.sinks.Sink):
         vad=None,
         on_wake_word: Optional[Callable[[], None]] = None,
         on_speech_end: Optional[Callable[[np.ndarray, Optional[int]], None]] = None,
+        max_speech_duration: float = 30.0,
         filters=None,
     ):
         """Initialize streaming sink.
@@ -43,6 +44,7 @@ class StreamingSink(discord.sinks.Sink):
             vad: VAD instance
             on_wake_word: Callback when wake word detected
             on_speech_end: Callback when speech ends, receives (audio buffer, user_id)
+            max_speech_duration: Max seconds of speech before forced end (default 30s)
             filters: Optional pycord audio filters
         """
         super().__init__(filters=filters)
@@ -56,7 +58,7 @@ class StreamingSink(discord.sinks.Sink):
         self._state = "idle"  # idle, listening
         self._audio_buffer: list[np.ndarray] = []
         self._speech_started = False
-        self._max_speech_duration = 8.0  # Force end after 8 seconds of speech
+        self._max_speech_duration = max_speech_duration
 
         # Track user for logging
         self._last_user_id = None

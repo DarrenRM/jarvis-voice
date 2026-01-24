@@ -272,11 +272,10 @@ class VoiceSession:
             return f"Could not find channel #{channel_name} to post the image. Available channels: {available_channels}"
 
         try:
-            # Truncate prompt for display
-            display_prompt = prompt[:100] + "..." if len(prompt) > 100 else prompt
+            requester = self._current_speaker_name or "Someone"
             logger.info(f"[IMAGE] Sending to #{channel_name}...")
             await channel.send(
-                content=f"*Generated: {display_prompt}*",
+                content=f"*{requester}'s requested image:*",
                 file=discord.File(io.BytesIO(image_bytes), filename="generated.png"),
             )
             logger.info(f"[IMAGE] Posted generated image to #{channel_name}")
@@ -432,6 +431,7 @@ class VoiceSession:
             vad=self.vad,
             on_wake_word=self._on_wake_word,
             on_speech_end=self._on_speech_end,
+            max_speech_duration=self.settings.max_question_duration,
         )
 
         # Start recording with the sink
