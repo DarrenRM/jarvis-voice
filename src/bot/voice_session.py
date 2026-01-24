@@ -15,7 +15,7 @@ import numpy as np
 
 from ..config import get_settings
 from ..detection import VAD, WakeWordDetector
-from ..stt import Transcriber
+from ..stt import Transcriber, DeepgramFluxClient
 from ..llm import ClaudeClient
 from ..tts import TTSSynthesizer
 from .voice_sink import StreamingSink
@@ -48,6 +48,7 @@ class VoiceSession:
         wake_detector: Optional[WakeWordDetector] = None,
         vad: Optional[VAD] = None,
         transcriber: Optional[Transcriber] = None,
+        deepgram_client: Optional[DeepgramFluxClient] = None,
         claude: Optional[ClaudeClient] = None,
         tts: Optional[TTSSynthesizer] = None,
     ):
@@ -58,7 +59,8 @@ class VoiceSession:
         Args:
             wake_detector: WakeWordDetector instance
             vad: VAD instance
-            transcriber: Transcriber instance
+            transcriber: Transcriber instance (Whisper, fallback)
+            deepgram_client: DeepgramFluxClient instance (primary STT)
             claude: ClaudeClient instance
             tts: TTSSynthesizer instance
         """
@@ -68,6 +70,7 @@ class VoiceSession:
         self.wake_detector = wake_detector
         self.vad = vad
         self.transcriber = transcriber
+        self.deepgram_client = deepgram_client
         self.claude = claude
         self.tts = tts
 
@@ -123,7 +126,21 @@ class VoiceSession:
                 speech_pad_ms=self.settings.speech_pad_ms,
             )
 
-        if self.transcriber is None:
+        # Initialize STT based on provider setting
+        stt_provider = self.settings.stt_provider.lower()
+
+        if stt_provider == "deepgram" and self.deepgram_client is None:
+            if not self.settings.deepgram_api_key:
+                logger.warning("DEEPGRAM_API_KEY not set, falling back to Whisper")
+                stt_provider = "whisper"
+            else:
+                logger.info("Initializing Deepgram Flux STT...")
+                self.deepgram_client = DeepgramFluxClient(
+                    api_key=self.settings.deepgram_api_key,
+                    sample_rate=16000,
+                )
+
+        if stt_provider == "whisper" and self.transcriber is None:
             logger.info("Loading Whisper...")
             self.transcriber = Transcriber(
                 model_size=self.settings.whisper_model,
@@ -381,15 +398,25 @@ class VoiceSession:
         audio_duration = len(audio) / 16000  # 16kHz sample rate
         logger.info(f"[TIMING] Audio captured: {audio_duration:.2f}s ({len(audio)} samples)")
 
-        # Transcribe
+        # Transcribe - use Deepgram Flux if available, otherwise Whisper
         t0 = time.perf_counter()
         logger.info("[TIMING] Starting transcription...")
-        loop = asyncio.get_running_loop()
-        text = await loop.run_in_executor(
-            None,
-            self.transcriber.transcribe,
-            audio,
-        )
+
+        if self.deepgram_client is not None:
+            logger.info("[STT] Using Deepgram Flux")
+            text = await self.deepgram_client.transcribe_audio(audio)
+        elif self.transcriber is not None:
+            logger.info("[STT] Using Whisper")
+            loop = asyncio.get_running_loop()
+            text = await loop.run_in_executor(
+                None,
+                self.transcriber.transcribe,
+                audio,
+            )
+        else:
+            logger.error("No STT provider available!")
+            return
+
         transcribe_time = time.perf_counter() - t0
         logger.info(f"[TIMING] Transcription: {transcribe_time:.2f}s")
 

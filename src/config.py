@@ -24,7 +24,10 @@ class Settings(BaseSettings):
     wake_word_model: str = Field(default="hey_jarvis", alias="WAKE_WORD_MODEL")
     wake_word_phrase: str = Field(default="hey claude", alias="WAKE_WORD_PHRASE")
 
-    # STT (Whisper)
+    # STT - Deepgram Flux (primary) or Whisper (fallback)
+    deepgram_api_key: Optional[str] = Field(default=None, alias="DEEPGRAM_API_KEY")
+    stt_provider: str = Field(default="deepgram", alias="STT_PROVIDER")  # deepgram or whisper
+    # Whisper settings (fallback)
     whisper_model: str = Field(default="medium", alias="WHISPER_MODEL")
     whisper_device: str = Field(default="cuda", alias="WHISPER_DEVICE")
     whisper_compute_type: str = Field(default="float16", alias="WHISPER_COMPUTE_TYPE")
