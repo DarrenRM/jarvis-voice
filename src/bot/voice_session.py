@@ -16,7 +16,7 @@ import numpy as np
 from ..config import get_settings
 from ..detection import VAD, WakeWordDetector
 from ..stt import Transcriber, DeepgramFluxClient, GroqWhisperClient
-from ..llm import ClaudeClient
+from ..llm import BaseLLMClient, create_llm_client
 from ..tts import TTSSynthesizer
 from .voice_sink import StreamingSink
 from .voice_source import TTSAudioSource
@@ -85,7 +85,7 @@ class VoiceSession:
         transcriber: Optional[Transcriber] = None,
         groq_client: Optional[GroqWhisperClient] = None,
         deepgram_client: Optional[DeepgramFluxClient] = None,
-        claude: Optional[ClaudeClient] = None,
+        llm: Optional[BaseLLMClient] = None,
         tts: Optional[TTSSynthesizer] = None,
     ):
         """Initialize voice session.
@@ -98,7 +98,7 @@ class VoiceSession:
             transcriber: Transcriber instance (Whisper, fallback)
             groq_client: GroqWhisperClient instance (primary STT)
             deepgram_client: DeepgramFluxClient instance (alternative STT)
-            claude: ClaudeClient instance
+            llm: LLM client instance (Claude or Groq)
             tts: TTSSynthesizer instance
         """
         self.settings = get_settings()
@@ -109,7 +109,7 @@ class VoiceSession:
         self.transcriber = transcriber
         self.groq_client = groq_client
         self.deepgram_client = deepgram_client
-        self.claude = claude
+        self.llm = llm
         self.tts = tts
 
         # Discord voice
@@ -173,6 +173,7 @@ class VoiceSession:
                 threshold=self.settings.vad_sensitivity,
                 sample_rate=16000,
                 speech_pad_ms=self.settings.speech_pad_ms,
+                min_silence_duration_ms=self.settings.min_silence_ms,
             )
 
         # Initialize STT based on provider setting
@@ -211,9 +212,9 @@ class VoiceSession:
                 compute_type=self.settings.whisper_compute_type,
             )
 
-        if self.claude is None:
-            logger.info("Setting up Claude client...")
-            self.claude = ClaudeClient()
+        if self.llm is None:
+            logger.info("Setting up LLM client...")
+            self.llm = create_llm_client(self.settings)
 
         if self.tts is None:
             logger.info("Loading TTS...")
@@ -641,10 +642,10 @@ class VoiceSession:
         thinking_play_time = time.perf_counter() - t0
         logger.info(f"[TIMING] Thinking phrase playback: {thinking_play_time:.2f}s")
 
-        # Get Claude response with PARALLEL sentence-level streaming TTS
+        # Get LLM response with PARALLEL sentence-level streaming TTS
         # TTS runs in parallel: synthesize next sentence while current plays
         t0 = time.perf_counter()
-        logger.info("[TIMING] Starting Claude request...")
+        logger.info("[TIMING] Starting LLM request...")
 
         buffer = ""
         first_chunk_time = None
@@ -662,10 +663,10 @@ class VoiceSession:
         # Start playback consumer (plays audio from queue back-to-back)
         self._playback_task = asyncio.create_task(self._playback_consumer())
 
-        async for chunk in self.claude.chat_stream(prompt_text):
+        async for chunk in self.llm.chat_stream(prompt_text):
             if first_chunk_time is None:
                 first_chunk_time = time.perf_counter() - t0
-                logger.info(f"[TIMING] Claude first chunk: {first_chunk_time:.2f}s")
+                logger.info(f"[TIMING] LLM first chunk: {first_chunk_time:.2f}s")
 
             buffer += chunk
             total_response += chunk
@@ -719,9 +720,9 @@ class VoiceSession:
             await self._playback_task
             self._playback_task = None
 
-        claude_total_time = time.perf_counter() - t0
-        logger.info(f"[TIMING] Claude total: {claude_total_time:.2f}s ({len(total_response)} chars, {sentences_queued} sentences streamed)")
-        logger.info(f"Claude: {total_response}")
+        llm_total_time = time.perf_counter() - t0
+        logger.info(f"[TIMING] LLM total: {llm_total_time:.2f}s ({len(total_response)} chars, {sentences_queued} sentences streamed)")
+        logger.info(f"LLM response: {total_response}")
 
         # Total summary
         total_time = time.perf_counter() - total_start
@@ -729,7 +730,7 @@ class VoiceSession:
             f"[TIMING] === TOTAL: {total_time:.2f}s === "
             f"(transcribe={transcribe_time:.1f}s, "
             f"think_tts={thinking_synth_time:.1f}s, "
-            f"claude+streaming_tts={claude_total_time:.1f}s)"
+            f"llm+streaming_tts={llm_total_time:.1f}s)"
         )
 
     async def _followup_loop(self):

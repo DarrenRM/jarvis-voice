@@ -1,0 +1,193 @@
+# Discord Voice Claude Bot
+
+Voice-activated AI assistant for Discord using Claude Code SDK or Groq Llama 3.3 70B.
+
+## Quick Start
+
+```bash
+# Install dependencies
+pip install -e .
+
+# Copy and configure environment
+cp .env.example .env
+# Edit .env with your tokens
+
+# Run the bot
+python -m src.main
+```
+
+## Configuration
+
+### Required
+
+```bash
+DISCORD_TOKEN=your_bot_token_here
+```
+
+### LLM Provider Selection
+
+Switch between Claude and Groq with a single env var:
+
+```bash
+# Claude (default) - uses Claude Code SDK, no API key needed
+LLM_PROVIDER=claude
+CLAUDE_MODEL=haiku  # haiku, sonnet, or opus
+
+# Groq Llama 3.3 70B - faster inference
+LLM_PROVIDER=groq
+GROQ_API_KEY=your_groq_api_key_here
+GROQ_LLM_MODEL=llama-3.3-70b-versatile  # default
+```
+
+### STT (Speech-to-Text)
+
+```bash
+STT_PROVIDER=groq      # groq (fast), deepgram, or whisper (offline)
+GROQ_API_KEY=...       # shared with LLM if using Groq for both
+DEEPGRAM_API_KEY=...   # if using Deepgram
+```
+
+### TTS (Text-to-Speech)
+
+```bash
+INWORLD_API_KEY=your_inworld_api_key
+TTS_VOICE=alex
+```
+
+## Groq LLM with Web Search
+
+When using `LLM_PROVIDER=groq`, the bot has web search capabilities via:
+- **DuckDuckGo** - free web search (no API key needed)
+- **Firecrawl** - URL content extraction (optional, self-hosted)
+
+### Basic Setup (DuckDuckGo only)
+
+Just set `LLM_PROVIDER=groq` - web search works out of the box using DuckDuckGo snippets.
+
+### Full Setup with Firecrawl (Optional)
+
+Firecrawl extracts full page content from URLs, giving the LLM more context. **This is optional** - search works fine without it using DuckDuckGo snippets.
+
+```bash
+# One-time setup: clone Firecrawl repo
+git clone https://github.com/mendableai/firecrawl.git firecrawl-repo
+
+# Build and start (first time takes a few minutes)
+docker compose -f docker-compose.firecrawl.yml up -d --build
+
+# Verify it's running
+curl http://localhost:3002/
+
+# Stop when done
+docker compose -f docker-compose.firecrawl.yml down
+
+# Subsequent starts (no rebuild needed)
+docker compose -f docker-compose.firecrawl.yml up -d
+```
+
+Configuration (all optional, have defaults):
+```bash
+FIRECRAWL_URL=http://localhost:3002
+FIRECRAWL_API_KEY=              # not needed for self-hosted
+SEARCH_MAX_RESULTS=3
+```
+
+### How Search Works
+
+1. User asks a question requiring current info
+2. Llama decides to call `web_search` tool
+3. DuckDuckGo returns search results with snippets
+4. Optionally, Llama calls `fetch_url` to get full page content via Firecrawl
+5. Llama synthesizes answer from results
+
+Without Firecrawl running, `fetch_url` returns an error but search still works with snippets only.
+
+## Discord Commands
+
+| Command | Description |
+|---------|-------------|
+| `!join` | Join your voice channel and start listening |
+| `!leave` | Leave voice channel |
+| `!status` | Show bot status |
+
+## Voice Interaction
+
+1. Say the wake word (default: "hey jarvis")
+2. Wait for acknowledgment
+3. Ask your question
+4. Bot responds with TTS
+
+## Architecture
+
+```
+User Speech
+    |
+[Wake Word Detection] - openwakeword
+    |
+[VAD] - silero-vad (voice activity detection)
+    |
+[STT] - Groq Whisper / Deepgram / local Whisper
+    |
+[LLM] - Claude Code SDK or Groq Llama 3.3
+    |     (with web search tools for Groq)
+    |
+[TTS] - Inworld
+    |
+Discord Voice Output
+```
+
+## File Structure
+
+```
+src/
+  bot/           # Discord bot and voice session
+  config.py      # Pydantic settings
+  detection/     # Wake word and VAD
+  llm/           # LLM clients (Claude, Groq)
+    base.py            # Abstract base class
+    claude_client.py   # Claude Code SDK client
+    groq_llama_client.py  # Groq Llama with tool use
+    llm_factory.py     # Factory for provider selection
+  search/        # Web search pipeline (for Groq)
+    duckduckgo.py      # DuckDuckGo search
+    firecrawl.py       # Firecrawl scraper
+    search_service.py  # Unified service
+  stt/           # Speech-to-text
+  tts/           # Text-to-speech
+```
+
+## Comparing Providers
+
+| Feature | Claude | Groq Llama |
+|---------|--------|------------|
+| Speed | Moderate | Fast |
+| Tool use | Native (WebSearch, WebFetch) | Native (web_search, fetch_url) |
+| Search backend | Claude's built-in | DuckDuckGo + Firecrawl |
+| API key | None (uses Claude Code auth) | Required |
+| Quality | Excellent | Very good |
+
+## Troubleshooting
+
+### Groq: "GROQ_API_KEY required"
+Set `GROQ_API_KEY` in your `.env` file. Get one at https://console.groq.com
+
+### Firecrawl: "Could not fetch content"
+Firecrawl isn't running. Either:
+- Start it: `docker compose -f docker-compose.firecrawl.yml up -d`
+- Or ignore it - search still works with snippets only
+
+### Claude: "Claude Code SDK not available"
+Run `claude auth login` to authenticate, or install the SDK: `pip install claude-code-sdk`
+
+## Development
+
+```bash
+# Install with dev dependencies
+pip install -e ".[dev]"
+
+# Run tests
+pytest
+
+# Lint
+ruff check src/
+```

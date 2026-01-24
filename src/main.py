@@ -14,7 +14,7 @@ from src.config import get_settings, Settings
 from src.bot import ClaudeBot
 from src.detection import VAD, WakeWordDetector
 from src.stt import Transcriber
-from src.llm import ClaudeClient
+from src.llm import create_llm_client
 from src.tts import TTSSynthesizer
 
 logger = logging.getLogger(__name__)
@@ -47,6 +47,7 @@ def preload_components(settings: Settings) -> dict:
         threshold=settings.vad_sensitivity,
         sample_rate=16000,
         speech_pad_ms=settings.speech_pad_ms,
+        min_silence_duration_ms=settings.min_silence_ms,
     )
 
     # Transcriber (only load local Whisper if using it as STT provider)
@@ -60,9 +61,9 @@ def preload_components(settings: Settings) -> dict:
     else:
         logger.info(f"Using {settings.stt_provider} for STT - skipping local Whisper model")
 
-    # Claude client
-    logger.info(f"Setting up Claude client (model: {settings.claude_model})...")
-    components["claude"] = ClaudeClient(model=settings.claude_model)
+    # LLM client (Claude or Groq based on LLM_PROVIDER)
+    logger.info(f"Setting up LLM client (provider: {settings.llm_provider})...")
+    components["llm"] = create_llm_client(settings)
 
     # TTS (Inworld)
     logger.info("Loading TTS (Inworld)...")
@@ -148,7 +149,7 @@ async def run_bot(settings: Settings, components: Optional[dict] = None) -> None
             wake_detector=components.get("wake_detector"),
             vad=components.get("vad"),
             transcriber=components.get("transcriber"),
-            claude=components.get("claude"),
+            llm=components.get("llm"),
             tts=components.get("tts"),
         )
     else:

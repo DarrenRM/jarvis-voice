@@ -39,12 +39,25 @@ class Settings(BaseSettings):
     tts_device: str = Field(default="cuda:0", alias="TTS_DEVICE")
     tts_voice: str = Field(default="alex", alias="TTS_VOICE")
 
+    # LLM Provider Selection
+    llm_provider: str = Field(default="claude", alias="LLM_PROVIDER")  # claude or groq
+
     # Claude LLM
     claude_model: str = Field(default="haiku", alias="CLAUDE_MODEL")  # haiku, sonnet, opus
+
+    # Groq LLM (reuses GROQ_API_KEY from STT section)
+    groq_llm_model: str = Field(default="llama-3.3-70b-versatile", alias="GROQ_LLM_MODEL")
+    groq_max_tokens: int = Field(default=1024, alias="GROQ_MAX_TOKENS")
+
+    # Search Pipeline (for Groq tool use)
+    firecrawl_url: str = Field(default="http://localhost:3002", alias="FIRECRAWL_URL")
+    firecrawl_api_key: Optional[str] = Field(default=None, alias="FIRECRAWL_API_KEY")
+    search_max_results: int = Field(default=3, alias="SEARCH_MAX_RESULTS")
 
     # Latency Settings
     vad_sensitivity: float = Field(default=0.5, alias="VAD_SENSITIVITY")
     speech_pad_ms: int = Field(default=300, alias="SPEECH_PAD_MS")
+    min_silence_ms: int = Field(default=500, alias="MIN_SILENCE_MS")  # Silence to trigger speech end
     max_question_duration: float = Field(default=30.0, alias="MAX_QUESTION_DURATION")
     claude_timeout: float = Field(default=30.0, alias="CLAUDE_TIMEOUT")
 

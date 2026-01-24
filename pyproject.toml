@@ -33,6 +33,9 @@ dependencies = [
     # Claude Code SDK (headless mode - no API key needed)
     "claude-code-sdk>=0.0.20",
 
+    # Search Pipeline (for Groq LLM tool use)
+    "ddgs>=7.0.0",
+
     # Configuration
     "pydantic-settings>=2.0.0",
     "python-dotenv>=1.0.0",

@@ -6,6 +6,8 @@ from datetime import datetime
 from pathlib import Path
 from typing import AsyncIterator
 
+from .base import BaseLLMClient
+
 # Project directory (for local settings that disable hooks)
 PROJECT_DIR = Path(__file__).parent.parent.parent
 SETTINGS_FILE = PROJECT_DIR / ".claude" / "settings.local.json"
@@ -13,7 +15,7 @@ SETTINGS_FILE = PROJECT_DIR / ".claude" / "settings.local.json"
 logger = logging.getLogger(__name__)
 
 
-class ClaudeClient:
+class ClaudeClient(BaseLLMClient):
     """Claude Code SDK client for voice assistant.
 
     Uses headless Claude Code instead of direct API access.
@@ -188,7 +190,7 @@ TOOLS:
 - Use it when questions need up-to-date facts
 
 NOTES:
-- Sam will only start a quest after sorting every chest.
+- Sam is known to rebuild the base every session.
 - Jordan picks up every item in sight and always needs more bag space.
 - Pat never reads the quest log.
 - Darren always says one more quest.
