@@ -124,7 +124,7 @@ class GroqClient(BaseLLMClient):
         api_key: str,
         model: str = "llama-3.3-70b-versatile",
         max_tokens: int = 1024,
-        max_turns: int = 10,
+        max_turns: int = 8,
         search_service: Optional[SearchService] = None,
         image_service: Optional["NanoBananaClient"] = None,
         on_image_generated: Optional[Callable[[bytes, str], Awaitable[str]]] = None,
@@ -146,6 +146,7 @@ class GroqClient(BaseLLMClient):
         self.model = model
         self.max_tokens = max_tokens
         self.max_turns = max_turns
+        self._tool_calls_this_request: list[str] = []  # Track tool calls for graceful failure
         self._context: str = ""
         self._conversation_history: list[dict] = []
         self._search_service = search_service
@@ -207,6 +208,9 @@ class GroqClient(BaseLLMClient):
                 "content": message,
             })
 
+            # Reset tool call tracking for this request
+            self._tool_calls_this_request = []
+
             # Tool use loop (up to max_turns)
             for turn in range(self.max_turns):
                 logger.debug(f"Groq turn {turn + 1}/{self.max_turns}")
@@ -253,6 +257,18 @@ class GroqClient(BaseLLMClient):
 
                     # Execute each tool and append results
                     for tool_call in response_message.tool_calls:
+                        # Track this tool call for graceful failure message
+                        try:
+                            args = json.loads(tool_call.function.arguments)
+                            if tool_call.function.name == "web_search":
+                                self._tool_calls_this_request.append(f"searched '{args.get('query', '')}'")
+                            elif tool_call.function.name == "fetch_url":
+                                self._tool_calls_this_request.append(f"fetched {args.get('url', '')}")
+                            else:
+                                self._tool_calls_this_request.append(tool_call.function.name)
+                        except json.JSONDecodeError:
+                            self._tool_calls_this_request.append(tool_call.function.name)
+
                         result = await self._execute_tool(tool_call)
                         messages.append({
                             "tool_call_id": tool_call.id,
@@ -268,6 +284,16 @@ class GroqClient(BaseLLMClient):
                     yield chunk
 
                 break  # Exit loop after streaming response
+            else:
+                # Loop completed without break = max_turns exhausted
+                # Provide graceful failure message
+                logger.warning(f"Max tool turns ({self.max_turns}) exhausted. Tool calls: {self._tool_calls_this_request}")
+                failure_msg = self._build_graceful_failure()
+                yield failure_msg
+                self._conversation_history.append({
+                    "role": "assistant",
+                    "content": failure_msg,
+                })
 
         except ImportError:
             logger.error("groq package not installed. Install with: pip install groq")
@@ -281,6 +307,34 @@ class GroqClient(BaseLLMClient):
             else:
                 logger.error(f"Groq API error: {e}")
                 yield "Sorry, I encountered an error processing your request."
+
+    def _build_graceful_failure(self) -> str:
+        """Build a graceful failure message when max tool turns is exhausted.
+
+        Returns:
+            User-friendly message explaining what was tried
+        """
+        if not self._tool_calls_this_request:
+            return "[surprised] I couldn't find an answer to that. Could you try rephrasing?"
+
+        # Get unique search queries (remove duplicates, keep order)
+        searches = []
+        seen = set()
+        for call in self._tool_calls_this_request:
+            if call.startswith("searched '") and call not in seen:
+                seen.add(call)
+                # Extract just the query part
+                query = call[10:-1]  # Remove "searched '" and trailing "'"
+                searches.append(query)
+
+        if searches:
+            # Show first few searches to indicate what we tried
+            tried = ", ".join(searches[:3])
+            if len(searches) > 3:
+                tried += f" and {len(searches) - 3} more"
+            return f"[surprised] I searched for {tried} but couldn't find what you're looking for. Could you spell that or try a different term?"
+
+        return "[surprised] I tried searching but couldn't find that. Could you rephrase or spell it out?"
 
     async def _stream_response(self, messages: list) -> AsyncIterator[str]:
         """Stream the final response after tool calls are complete.
@@ -458,6 +512,9 @@ You have a web_search tool. You MUST use it for:
 - ANY question about games, recipes, crafting, items, builds, guides
 - Current events, news, weather, prices, availability
 - Facts you're not 100% certain about
+
+SPEECH RECOGNITION NOTE:
+Input comes from speech-to-text which may mishear words. If searches return no results or results about unrelated topics, consider phonetically similar terms (the user may have said something that sounds like what was transcribed). Check if search results mention similar-sounding words.
 
 CRITICAL TOOL USE RULES:
 - Do NOT say "I'll check" or "Let me search" - just USE the tool directly
