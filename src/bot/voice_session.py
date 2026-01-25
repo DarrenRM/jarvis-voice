@@ -39,35 +39,38 @@ class VoiceSession:
 
     # Acknowledgment phrases (played when wake word detected)
     ACK_PHRASES = [
-        "Yes?",
-        "Hmm?",
+        "[happy] Yes?",
+        "[surprised] Hmm?",
         "What's up?",
-        "I'm listening...",
+        "[happy] I'm listening...",
         "Go ahead...",
-        "I'm busy sorry...",
-        "Yea, no, yea. No.",
+        "[breathe] I'm busy sorry...",
+        "Yea, no, yea. [clear_throat] No.",
+        "Yo?",
+        "Sup?",
+        "[happy] I'm here!"
     ]
 
     # Thinking phrases (randomly selected)
     # Generic phrases (used when speaker unknown)
     THINKING_PHRASES = [
-        "One second...",
+        "[happy] One second...",
         "One moment...",
         "Let me check...",
-        "Google it yourself... Nah, I'll do it...",
+        "Google it yourself... [breathe] Nah, I'll do it...",
         "Hmm, let me see...",
-        "Just a moment...",
+        "[happy] Just a moment...",
     ]
 
     # Personalized phrases with {name} placeholder (used when speaker is known)
     THINKING_PHRASES_PERSONAL = [
-        "One second, {name}...",
+        "[happy] One second, {name}...",
         "One moment, {name}...",
         "Let me check, {name}...",
-        "Sure {name}, I'll do all the work...",
-        "Google it yourself, {name}... Nah, I'll do it...",
+        "[laughing] Sure {name}, I'll do all the work...",
+        "Google it yourself, {name}... [breathe] Nah, I'll do it...",
         "Hmm, let me see, {name}...",
-        "Just a moment, {name}...",
+        "[happy] Just a moment, {name}...",
         "Hold on, {name}...",
         "Give me a sec, {name}...",
     ]
