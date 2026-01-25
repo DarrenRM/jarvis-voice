@@ -179,30 +179,25 @@ class FirecrawlClient:
             return None
 
     async def smart_extract(
-        self, url: str, query: str, max_markdown_length: int = 4000
+        self, url: str, query: str, max_markdown_length: int = 8000
     ) -> str:
-        """Extract structured data, falling back to markdown if extraction fails.
+        """Get page content as markdown for LLM processing.
 
         Args:
             url: URL to extract from
-            query: What information to extract
-            max_markdown_length: Max chars for markdown fallback
+            query: What information to extract (used for logging)
+            max_markdown_length: Max chars of markdown to return
 
         Returns:
-            JSON string of extracted facts, or truncated markdown, or error message
+            Markdown content truncated to max length, or error message
         """
-        # Try structured extraction first
-        extract_result = await self.extract(url, query)
-        if extract_result and extract_result.get("facts"):
-            logger.info(f"Smart extract succeeded with structured data for {url}")
-            return json.dumps(extract_result)
-
-        # Fall back to markdown
-        logger.info(f"Smart extract falling back to markdown for {url}")
+        # Skip LLM extraction - it returns useless generic facts
+        # Just get markdown and let the calling LLM find what it needs
         markdown = await self.scrape(url)
         if markdown:
             if len(markdown) > max_markdown_length:
                 markdown = markdown[:max_markdown_length] + "\n\n[Content truncated...]"
+            logger.info(f"Returning {len(markdown)} chars markdown for {url}")
             return markdown
 
         return f"Could not fetch content from {url}"

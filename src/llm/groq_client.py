@@ -124,7 +124,7 @@ class GroqClient(BaseLLMClient):
         api_key: str,
         model: str = "llama-3.3-70b-versatile",
         max_tokens: int = 1024,
-        max_turns: int = 8,
+        max_turns: int = 5,
         search_service: Optional[SearchService] = None,
         image_service: Optional["NanoBananaClient"] = None,
         on_image_generated: Optional[Callable[[bytes, str], Awaitable[str]]] = None,
@@ -212,20 +212,34 @@ class GroqClient(BaseLLMClient):
             self._tool_calls_this_request = []
 
             # Tool use loop (up to max_turns)
+            # After 3 tool calls, force the model to answer (no more tools)
+            MAX_TOOL_CALLS = 3
+
             for turn in range(self.max_turns):
                 logger.debug(f"Groq turn {turn + 1}/{self.max_turns}")
 
                 # Request with tool support (non-streaming to detect tool calls)
+                # Disable tools after MAX_TOOL_CALLS to force an answer
                 has_tools = self._search_service or self._image_service
-                response = await self._client.chat.completions.create(
-                    model=self.model,
-                    messages=messages,
-                    tools=TOOLS if has_tools else None,
-                    tool_choice="auto" if has_tools else None,
-                    parallel_tool_calls=False,  # GPT-OSS doesn't support parallel
-                    max_tokens=self.max_tokens,
-                    stream=False,
-                )
+                tool_calls_so_far = len(self._tool_calls_this_request)
+                allow_tools = has_tools and tool_calls_so_far < MAX_TOOL_CALLS
+
+                if tool_calls_so_far >= MAX_TOOL_CALLS:
+                    logger.info(f"Forcing answer after {tool_calls_so_far} tool calls")
+
+                # Build API call params - only include tools if allowed
+                api_params = {
+                    "model": self.model,
+                    "messages": messages,
+                    "max_tokens": self.max_tokens,
+                    "stream": False,
+                }
+                if allow_tools:
+                    api_params["tools"] = TOOLS
+                    api_params["tool_choice"] = "auto"
+                    api_params["parallel_tool_calls"] = False
+
+                response = await self._client.chat.completions.create(**api_params)
 
                 response_message = response.choices[0].message
 
@@ -312,29 +326,10 @@ class GroqClient(BaseLLMClient):
         """Build a graceful failure message when max tool turns is exhausted.
 
         Returns:
-            User-friendly message explaining what was tried
+            Short user-friendly message for voice output
         """
-        if not self._tool_calls_this_request:
-            return "[surprised] I couldn't find an answer to that. Could you try rephrasing?"
-
-        # Get unique search queries (remove duplicates, keep order)
-        searches = []
-        seen = set()
-        for call in self._tool_calls_this_request:
-            if call.startswith("searched '") and call not in seen:
-                seen.add(call)
-                # Extract just the query part
-                query = call[10:-1]  # Remove "searched '" and trailing "'"
-                searches.append(query)
-
-        if searches:
-            # Show first few searches to indicate what we tried
-            tried = ", ".join(searches[:3])
-            if len(searches) > 3:
-                tried += f" and {len(searches) - 3} more"
-            return f"[surprised] I searched for {tried} but couldn't find what you're looking for. Could you spell that or try a different term?"
-
-        return "[surprised] I tried searching but couldn't find that. Could you rephrase or spell it out?"
+        # Keep it SHORT for voice - don't list what we searched
+        return "[surprised] I searched but couldn't find a good answer. Could you try asking differently?"
 
     async def _stream_response(self, messages: list) -> AsyncIterator[str]:
         """Stream the final response after tool calls are complete.
@@ -522,7 +517,12 @@ CRITICAL TOOL USE RULES:
 - ONLY call the tool OR respond to the user - never output internal reasoning
 - If you want to search, call the tool immediately without any preamble
 - After getting results, give a brief 1-2 sentence answer
-- If search doesn't help after 2-3 tries, give your best answer with what you found
+
+STOP SEARCHING RULE (MANDATORY):
+- After 2 searches, you MUST answer with what you found - do NOT search again
+- Imperfect information is fine - summarize what you learned
+- If results mention related topics, that's good enough - answer based on that
+- NEVER do more than 3 tool calls total per question
 
 GAME CONTEXT:
 - User messages include their current Discord activity (e.g., "Playing Dune: Awakening")
