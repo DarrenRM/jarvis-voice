@@ -195,12 +195,14 @@ class SpeakingDetector:
         now = time.perf_counter()
         user = self._get_or_create_user_state(user_id)
 
-        # Update packet tracking
-        user.last_packet_time = now
-
         # Energy gate (fast rejection)
         energy = self._compute_rms(audio_16k)
         user.last_energy = energy
+
+        # Only update packet tracking for audio above energy threshold
+        # This ensures staleness check works even when Discord sends quiet noise
+        if energy >= self.energy_threshold:
+            user.last_packet_time = now
 
         # Per-user silence debounce (300ms) - don't clear is_speaking on brief pauses
         USER_SILENCE_DEBOUNCE_MS = 300
