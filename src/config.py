@@ -74,6 +74,9 @@ class Settings(BaseSettings):
     speaking_energy_threshold: float = Field(default=0.01, alias="SPEAKING_ENERGY_THRESHOLD")
     speaking_silence_debounce_ms: int = Field(default=3000, alias="SPEAKING_SILENCE_DEBOUNCE_MS")
 
+    # Speaker Isolation (filter audio from non-wake-word speakers)
+    speaker_isolation_enabled: bool = Field(default=True, alias="SPEAKER_ISOLATION_ENABLED")
+
     # Audio
     sample_rate: int = Field(default=16000, alias="SAMPLE_RATE")
     chunk_duration_ms: int = Field(default=30, alias="CHUNK_DURATION_MS")

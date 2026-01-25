@@ -471,6 +471,7 @@ class VoiceSession:
             on_wake_word=self._on_wake_word,
             on_speech_end=self._on_speech_end,
             max_speech_duration=self.settings.max_question_duration,
+            speaker_isolation_enabled=self.settings.speaker_isolation_enabled,
         )
 
         # Start recording with the sink

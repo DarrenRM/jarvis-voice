@@ -40,6 +40,7 @@ class StreamingSink(discord.sinks.Sink):
         on_speech_end: Optional[Callable[[np.ndarray, Optional[int]], None]] = None,
         on_speaking_change: Optional[Callable[["SpeakingState"], None]] = None,
         max_speech_duration: float = 30.0,
+        speaker_isolation_enabled: bool = True,
         filters=None,
     ):
         """Initialize streaming sink.
@@ -52,6 +53,7 @@ class StreamingSink(discord.sinks.Sink):
             on_speech_end: Callback when speech ends, receives (audio buffer, user_id)
             on_speaking_change: Callback when channel speaking state changes
             max_speech_duration: Max seconds of speech before forced end (default 30s)
+            speaker_isolation_enabled: Filter audio from non-wake-word speakers (default True)
             filters: Optional pycord audio filters
         """
         super().__init__(filters=filters)
@@ -63,6 +65,7 @@ class StreamingSink(discord.sinks.Sink):
         self._on_speech_end = on_speech_end
         self._on_speaking_change = on_speaking_change
         self._last_speaking_state: Optional["SpeakingState"] = None
+        self._speaker_isolation_enabled = speaker_isolation_enabled
 
         # State
         self._state = "idle"  # idle, listening
@@ -87,11 +90,15 @@ class StreamingSink(discord.sinks.Sink):
         self._idle_flush_done = False
         self._silence_attempts = 0
 
-        # Pre-buffer: capture audio before wake word for question context
+        # Per-user pre-buffers: capture audio before wake word for question context
         # This captures the start of questions like "what's the weather" when
         # user says "hey jarvis what's the weather" without pausing
-        self._pre_buffer: list[np.ndarray] = []
+        # Each user gets their own buffer so we only use the wake word speaker's audio
+        self._per_user_pre_buffers: dict[int, list[np.ndarray]] = {}
         self._pre_buffer_max_samples = int(16000 * 1.5)  # 1.5s at 16kHz
+
+        # Speaker isolation: track filtered users for logging
+        self._filtered_users: set[int] = set()
 
     @property
     def state(self) -> str:
@@ -127,15 +134,19 @@ class StreamingSink(discord.sinks.Sink):
         """Transition to listening state."""
         logger.info("[SINK] start_listening() called")
 
-        # Include pre-buffer (audio captured before wake word was detected)
+        # Include ONLY the wake word speaker's pre-buffer (speaker isolation)
         # This captures the start of questions when user speaks continuously
-        if self._pre_buffer:
-            pre_duration = sum(len(a) for a in self._pre_buffer) / 16000
-            logger.info(f"[SINK] Including {pre_duration:.2f}s pre-buffer")
-            self._audio_buffer = self._pre_buffer.copy()
-            self._pre_buffer = []
+        if self._last_user_id and self._last_user_id in self._per_user_pre_buffers:
+            pre_buffer = self._per_user_pre_buffers[self._last_user_id]
+            pre_duration = sum(len(a) for a in pre_buffer) / 16000
+            logger.info(f"[SINK] Including {pre_duration:.2f}s pre-buffer from user {self._last_user_id}")
+            self._audio_buffer = pre_buffer.copy()
         else:
             self._audio_buffer = []
+
+        # Clear all pre-buffers and reset filtered user tracking
+        self._per_user_pre_buffers.clear()
+        self._filtered_users.clear()
 
         self._speech_started = False
         self._last_audio_time = None  # Reset PTT tracking
@@ -151,6 +162,10 @@ class StreamingSink(discord.sinks.Sink):
     def stop_listening(self):
         """Transition to idle state."""
         logger.info("[SINK] stop_listening() called")
+        # Log speaker isolation stats if any users were filtered
+        if self._filtered_users:
+            logger.info(f"[SINK ISOLATION] Session filtered audio from {len(self._filtered_users)} other user(s): {self._filtered_users}")
+            self._filtered_users.clear()
         self.state = "idle"
 
     def get_audio_buffer(self) -> np.ndarray:
@@ -337,9 +352,9 @@ class StreamingSink(discord.sinks.Sink):
                 # Reset idle flush flag since new audio arrived
                 self._idle_flush_done = False
                 self._silence_attempts = 0
-                # Clear pre-buffer on large gaps (stale audio from before PTT)
+                # Clear all pre-buffers on large gaps (stale audio from before PTT)
                 if gap > 1.0:
-                    self._pre_buffer = []
+                    self._per_user_pre_buffers.clear()
                 # Flush wake word detector's buffer - it may have stale audio from before the gap
                 if self.wake_detector and hasattr(self.wake_detector, 'flush'):
                     if self.wake_detector.flush():
@@ -347,7 +362,15 @@ class StreamingSink(discord.sinks.Sink):
                         if self._on_wake_word:
                             self._on_wake_word()
                             return  # Don't process current audio if wake word found
-        self._last_audio_time = now
+        # Update last audio time:
+        # - In idle state: track all audio (for gap detection)
+        # - In listening state with isolation: only track locked user (for PTT timeout)
+        if self._state == "idle":
+            self._last_audio_time = now
+        elif not self._speaker_isolation_enabled or self._last_user_id is None or user_id == self._last_user_id:
+            self._last_audio_time = now
+        # else: listening with isolation and wrong user - don't update (will trigger PTT timeout)
+
         # Reset idle flush flag when audio arrives (allows periodic flush after next gap)
         self._idle_flush_done = False
         self._silence_attempts = 0
@@ -377,12 +400,18 @@ class StreamingSink(discord.sinks.Sink):
         # === END DIAGNOSTIC ===
 
         if self._state == "idle":
-            # Maintain rolling pre-buffer (captures question start before wake word)
-            self._pre_buffer.append(audio_16k.copy())
-            # Trim to max duration
-            total = sum(len(a) for a in self._pre_buffer)
-            while total > self._pre_buffer_max_samples and self._pre_buffer:
-                removed = self._pre_buffer.pop(0)
+            # Maintain per-user rolling pre-buffer (captures question start before wake word)
+            # Each user gets their own buffer so we only use the wake word speaker's audio
+            if user_id not in self._per_user_pre_buffers:
+                self._per_user_pre_buffers[user_id] = []
+
+            self._per_user_pre_buffers[user_id].append(audio_16k.copy())
+
+            # Trim this user's buffer to max duration
+            user_buffer = self._per_user_pre_buffers[user_id]
+            total = sum(len(a) for a in user_buffer)
+            while total > self._pre_buffer_max_samples and user_buffer:
+                removed = user_buffer.pop(0)
                 total -= len(removed)
 
             # Check for wake word
@@ -398,6 +427,16 @@ class StreamingSink(discord.sinks.Sink):
                     self._on_wake_word()
 
         elif self._state == "listening":
+            # SPEAKER ISOLATION: Only buffer audio from the wake word speaker
+            if self._speaker_isolation_enabled and self._last_user_id is not None and user_id != self._last_user_id:
+                # Track interference for debugging (log once per user per session)
+                if user_id not in self._filtered_users:
+                    logger.info(f"[SINK ISOLATION] Filtering audio from user {user_id} (locked to {self._last_user_id})")
+                    self._filtered_users.add(user_id)
+                # Don't buffer this audio - PTT timing already handled above
+                # Still process through speaking detector for awareness
+                return
+
             # Buffer audio and check VAD
             # NOTE: Skip logic removed - pre-buffer handles wake word audio
             self._audio_buffer.append(audio_16k.copy())
