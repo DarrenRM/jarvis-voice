@@ -138,6 +138,8 @@ class VoiceSession:
         self._audio_queue: asyncio.Queue[Optional[tuple[int, np.ndarray]]] = asyncio.Queue()
         self._playback_task: Optional[asyncio.Task] = None
         self._tts_tasks: list[asyncio.Task] = []
+        self._thinking_task: Optional[asyncio.Task] = None
+        self._thinking_synth_time: float = 0.0
 
         # Current speaker tracking
         self._current_speaker_id: Optional[int] = None
@@ -498,6 +500,32 @@ class VoiceSession:
         logger.info("Stopping voice session...")
         self._running = False
 
+        # Cancel thinking task
+        if self._thinking_task and not self._thinking_task.done():
+            self._thinking_task.cancel()
+            try:
+                await self._thinking_task
+            except asyncio.CancelledError:
+                pass
+            self._thinking_task = None
+
+        # Cancel playback consumer
+        if self._playback_task and not self._playback_task.done():
+            self._playback_task.cancel()
+            try:
+                await self._playback_task
+            except asyncio.CancelledError:
+                pass
+            self._playback_task = None
+
+        # Cancel TTS synthesis tasks
+        for task in self._tts_tasks:
+            if not task.done():
+                task.cancel()
+        if self._tts_tasks:
+            await asyncio.gather(*self._tts_tasks, return_exceptions=True)
+            self._tts_tasks.clear()
+
         if self.voice_client and self.voice_client.recording:
             self.voice_client.stop_recording()
 
@@ -749,6 +777,40 @@ class VoiceSession:
         except Exception as e:
             logger.warning(f"Failed to play acknowledgment: {e}")
 
+    async def _play_thinking_phrase(self, phrase: str) -> None:
+        """Play thinking phrase in background.
+
+        This runs as a task so LLM request can start in parallel.
+        Tracks timing for logging.
+
+        Args:
+            phrase: The thinking phrase to synthesize and play
+        """
+        try:
+            t0 = time.perf_counter()
+            logger.info(f"[TIMING] Synthesizing thinking phrase: '{phrase}'")
+            thinking_audio = await self.tts.synthesize(phrase)
+            thinking_synth_time = time.perf_counter() - t0
+            logger.info(f"[TIMING] Thinking phrase TTS: {thinking_synth_time:.2f}s")
+
+            # Store synthesis time for final timing log
+            self._thinking_synth_time = thinking_synth_time
+
+            if len(thinking_audio) > 0:
+                t0 = time.perf_counter()
+                await self._play_audio(thinking_audio)
+                thinking_play_time = time.perf_counter() - t0
+                logger.info(f"[TIMING] Thinking phrase playback: {thinking_play_time:.2f}s")
+        except asyncio.CancelledError:
+            logger.debug("[THINKING] Playback cancelled")
+            # Stop any ongoing playback when cancelled
+            if self.voice_client and self.voice_client.is_playing():
+                self.voice_client.stop()
+            raise  # Re-raise to propagate cancellation
+        except Exception as e:
+            logger.warning(f"[THINKING] Failed to play thinking phrase: {e}")
+            self._thinking_synth_time = 0.0  # Fallback for timing log
+
     async def _play_audio(self, audio: np.ndarray):
         """Play audio through Discord voice.
 
@@ -796,12 +858,14 @@ class VoiceSession:
         """Background task that plays audio from the queue seamlessly.
 
         Receives (sentence_num, audio) tuples and plays in order.
-        Waits for channel silence before playing the first sentence
-        (so we don't talk over ongoing conversations).
+        Waits for:
+        1. Thinking phrase to complete (if playing)
+        2. Channel silence before playing the first sentence
         """
         logger.debug("[PLAYBACK] Consumer started")
         next_to_play = 1
         pending: dict[int, np.ndarray] = {}
+        waited_for_thinking = False
         waited_for_silence = False
 
         while True:
@@ -827,6 +891,18 @@ class VoiceSession:
                 while next_to_play in pending:
                     audio = pending.pop(next_to_play)
                     if len(audio) > 0:
+                        # Wait for thinking phrase before FIRST sentence
+                        if not waited_for_thinking and self._thinking_task is not None:
+                            logger.info("[PLAYBACK] Waiting for thinking phrase to complete...")
+                            try:
+                                await self._thinking_task
+                            except asyncio.CancelledError:
+                                logger.debug("[PLAYBACK] Thinking task was cancelled")
+                            except Exception as e:
+                                logger.warning(f"[PLAYBACK] Thinking task error: {e}")
+                            waited_for_thinking = True
+                            self._thinking_task = None
+
                         # Wait for silence before FIRST sentence only
                         # This handles conversations while waiting for LLM response
                         if not waited_for_silence and self.settings.speaking_detection_enabled:
@@ -931,26 +1007,24 @@ class VoiceSession:
                 logger.info("[THINKING] Skipping thinking phrase - someone still speaking")
                 should_play_thinking = False
 
+        # Reset thinking timing
+        self._thinking_synth_time = 0.0
+
         if should_play_thinking:
-            t0 = time.perf_counter()
             if speaker:
                 phrase = random.choice(self.THINKING_PHRASES_PERSONAL).format(name=speaker)
             else:
                 phrase = random.choice(self.THINKING_PHRASES)
-            logger.info(f"[TIMING] Synthesizing thinking phrase: '{phrase}'")
-            thinking_audio = await self.tts.synthesize(phrase)
-            thinking_synth_time = time.perf_counter() - t0
-            logger.info(f"[TIMING] Thinking phrase TTS: {thinking_synth_time:.2f}s")
 
-            t0 = time.perf_counter()
-            await self._play_audio(thinking_audio)
-            thinking_play_time = time.perf_counter() - t0
-            logger.info(f"[TIMING] Thinking phrase playback: {thinking_play_time:.2f}s")
+            # Start thinking phrase in background (doesn't block LLM request)
+            self._thinking_task = asyncio.create_task(self._play_thinking_phrase(phrase))
+        else:
+            self._thinking_task = None
 
         # Get LLM response with PARALLEL sentence-level streaming TTS
-        # TTS runs in parallel: synthesize next sentence while current plays
+        # LLM starts immediately - runs in parallel with thinking phrase playback
         t0 = time.perf_counter()
-        logger.info("[TIMING] Starting LLM request...")
+        logger.info("[TIMING] Starting LLM request (parallel with thinking phrase)...")
 
         buffer = ""
         first_chunk_time = None
@@ -968,62 +1042,74 @@ class VoiceSession:
         # Start playback consumer (plays audio from queue back-to-back)
         self._playback_task = asyncio.create_task(self._playback_consumer())
 
-        async for chunk in self.llm.chat_stream(prompt_text):
-            if first_chunk_time is None:
-                first_chunk_time = time.perf_counter() - t0
-                logger.info(f"[TIMING] LLM first chunk: {first_chunk_time:.2f}s")
+        try:
+            async for chunk in self.llm.chat_stream(prompt_text):
+                if first_chunk_time is None:
+                    first_chunk_time = time.perf_counter() - t0
+                    logger.info(f"[TIMING] LLM first chunk: {first_chunk_time:.2f}s")
 
-            buffer += chunk
-            total_response += chunk
+                buffer += chunk
+                total_response += chunk
 
-            # Claude outputs one sentence per line - split on newlines for streaming
-            while '\n' in buffer:
-                line, buffer = buffer.split('\n', 1)
-                line = line.strip()
+                # Claude outputs one sentence per line - split on newlines for streaming
+                while '\n' in buffer:
+                    line, buffer = buffer.split('\n', 1)
+                    line = line.strip()
 
-                if line:
+                    if line:
+                        sentences_queued += 1
+                        logger.info(f"[STREAMING] Queuing line {sentences_queued}: {line[:50]}...")
+
+                        # Spawn TTS task (don't wait - runs in parallel)
+                        task = asyncio.create_task(
+                            self._synthesize_and_queue(line, sentences_queued)
+                        )
+                        self._tts_tasks.append(task)
+
+                # Also queue if buffer ends with punctuation (sentence complete, no newline yet)
+                # This handles "I'll look that up." before a long tool call
+                stripped = buffer.strip()
+                if stripped and stripped[-1] in '.!?':
                     sentences_queued += 1
-                    logger.info(f"[STREAMING] Queuing line {sentences_queued}: {line[:50]}...")
+                    logger.info(f"[STREAMING] Queuing sentence {sentences_queued}: {stripped[:50]}...")
 
-                    # Spawn TTS task (don't wait - runs in parallel)
                     task = asyncio.create_task(
-                        self._synthesize_and_queue(line, sentences_queued)
+                        self._synthesize_and_queue(stripped, sentences_queued)
                     )
                     self._tts_tasks.append(task)
+                    buffer = ""  # Clear the buffer since we queued it
 
-            # Also queue if buffer ends with punctuation (sentence complete, no newline yet)
-            # This handles "I'll look that up." before a long tool call
-            stripped = buffer.strip()
-            if stripped and stripped[-1] in '.!?':
+            # Queue any remaining text
+            remaining = buffer.strip()
+            if remaining:
                 sentences_queued += 1
-                logger.info(f"[STREAMING] Queuing sentence {sentences_queued}: {stripped[:50]}...")
-
+                logger.info(f"[STREAMING] Queuing remaining: {remaining[:50]}...")
                 task = asyncio.create_task(
-                    self._synthesize_and_queue(stripped, sentences_queued)
+                    self._synthesize_and_queue(remaining, sentences_queued)
                 )
                 self._tts_tasks.append(task)
-                buffer = ""  # Clear the buffer since we queued it
 
-        # Queue any remaining text
-        remaining = buffer.strip()
-        if remaining:
-            sentences_queued += 1
-            logger.info(f"[STREAMING] Queuing remaining: {remaining[:50]}...")
-            task = asyncio.create_task(
-                self._synthesize_and_queue(remaining, sentences_queued)
-            )
-            self._tts_tasks.append(task)
+        finally:
+            # Ensure cleanup even on errors
+            # Wait for all TTS tasks to complete (audio is now in queue)
+            if self._tts_tasks:
+                await asyncio.gather(*self._tts_tasks, return_exceptions=True)
+                self._tts_tasks.clear()
 
-        # Wait for all TTS tasks to complete (audio is now in queue)
-        if self._tts_tasks:
-            await asyncio.gather(*self._tts_tasks, return_exceptions=True)
-            self._tts_tasks.clear()
+            # Signal end of stream and wait for playback to finish
+            await self._audio_queue.put(None)
+            if self._playback_task:
+                await self._playback_task
+                self._playback_task = None
 
-        # Signal end of stream and wait for playback to finish
-        await self._audio_queue.put(None)
-        if self._playback_task:
-            await self._playback_task
-            self._playback_task = None
+            # Clean up thinking task if still running
+            if self._thinking_task and not self._thinking_task.done():
+                self._thinking_task.cancel()
+                try:
+                    await self._thinking_task
+                except asyncio.CancelledError:
+                    pass
+                self._thinking_task = None
 
         llm_total_time = time.perf_counter() - t0
         logger.info(f"[TIMING] LLM total: {llm_total_time:.2f}s ({len(total_response)} chars, {sentences_queued} sentences streamed)")
@@ -1034,7 +1120,7 @@ class VoiceSession:
         logger.info(
             f"[TIMING] === TOTAL: {total_time:.2f}s === "
             f"(transcribe={transcribe_time:.1f}s, "
-            f"think_tts={thinking_synth_time:.1f}s, "
+            f"think_tts={self._thinking_synth_time:.1f}s, "
             f"llm+streaming_tts={llm_total_time:.1f}s)"
         )
 
