@@ -1,6 +1,7 @@
 """Nano Banana (Gemini) image generation and editing client."""
 
 import asyncio
+import io
 import logging
 from typing import Optional
 
@@ -14,7 +15,7 @@ class NanoBananaClient:
     multi-turn editing (e.g., "edit that to add silly hats").
     """
 
-    MODEL = "gemini-2.0-flash-exp"
+    MODEL = "gemini-2.5-flash-image" # Claude never change this
 
     def __init__(self, api_key: str):
         """Initialize the Nano Banana client.
@@ -48,24 +49,41 @@ class NanoBananaClient:
         self._chat = None
         logger.debug("Image chat context reset")
 
-    def _extract_image(self, response) -> bytes:
-        """Extract image bytes from a Gemini response.
+    def _extract_image(self, response) -> tuple[bytes, str]:
+        """Extract image bytes from a Gemini response, converting to PNG.
+
+        Uses Gemini's as_image() helper for proper format handling,
+        then converts to PNG bytes for consistent Discord uploads.
 
         Args:
             response: Gemini chat response
 
         Returns:
-            Image bytes
+            Tuple of (PNG image bytes, mime_type "image/png")
 
         Raises:
             ValueError: If no image found in response
         """
         for part in response.candidates[0].content.parts:
             if hasattr(part, 'inline_data') and part.inline_data is not None:
-                return part.inline_data.data
+                original_mime = getattr(part.inline_data, 'mime_type', 'unknown')
+                logger.info(f"Gemini returned image with MIME type: {original_mime}")
+
+                # Use as_image() to get PIL Image, then convert to PNG bytes
+                try:
+                    pil_image = part.as_image()
+                    buffer = io.BytesIO()
+                    pil_image.save(buffer, format="PNG")
+                    png_bytes = buffer.getvalue()
+                    logger.info(f"Converted to PNG: {len(png_bytes)} bytes")
+                    return png_bytes, "image/png"
+                except Exception as e:
+                    logger.warning(f"as_image() failed ({e}), using raw bytes")
+                    return part.inline_data.data, original_mime
+
         raise ValueError("No image in response")
 
-    async def generate(self, prompt: str) -> bytes:
+    async def generate(self, prompt: str) -> tuple[bytes, str]:
         """Generate a NEW image from a text prompt.
 
         This starts a fresh chat session, discarding any previous image context.
@@ -75,7 +93,7 @@ class NanoBananaClient:
             prompt: Text description of the image to generate
 
         Returns:
-            PNG image as bytes
+            Tuple of (image bytes, mime_type)
 
         Raises:
             Exception: If image generation fails
@@ -101,9 +119,9 @@ class NanoBananaClient:
                 response = self._chat.send_message(prompt)
                 return self._extract_image(response)
 
-            image_bytes = await loop.run_in_executor(None, _generate)
-            logger.info(f"Image generated: {len(image_bytes)} bytes")
-            return image_bytes
+            image_bytes, mime_type = await loop.run_in_executor(None, _generate)
+            logger.info(f"Image generated: {len(image_bytes)} bytes, type: {mime_type}")
+            return image_bytes, mime_type
 
         except ImportError:
             logger.error("google-genai package not installed. Install with: pip install google-genai")
@@ -112,7 +130,7 @@ class NanoBananaClient:
             logger.error(f"Image generation failed: {e}")
             raise
 
-    async def edit(self, instruction: str) -> bytes:
+    async def edit(self, instruction: str) -> tuple[bytes, str]:
         """Edit the previously generated image.
 
         Uses the existing chat session to maintain context, allowing
@@ -122,7 +140,7 @@ class NanoBananaClient:
             instruction: What to change (e.g., "add silly hats to everyone")
 
         Returns:
-            Edited image as bytes
+            Tuple of (edited image bytes, mime_type)
 
         Raises:
             ValueError: If no previous image exists to edit
@@ -140,9 +158,9 @@ class NanoBananaClient:
                 response = self._chat.send_message(instruction)
                 return self._extract_image(response)
 
-            image_bytes = await loop.run_in_executor(None, _edit)
-            logger.info(f"Image edited: {len(image_bytes)} bytes")
-            return image_bytes
+            image_bytes, mime_type = await loop.run_in_executor(None, _edit)
+            logger.info(f"Image edited: {len(image_bytes)} bytes, type: {mime_type}")
+            return image_bytes, mime_type
 
         except Exception as e:
             logger.error(f"Image editing failed: {e}")

@@ -127,7 +127,7 @@ class GroqClient(BaseLLMClient):
         max_turns: int = 5,
         search_service: Optional[SearchService] = None,
         image_service: Optional["NanoBananaClient"] = None,
-        on_image_generated: Optional[Callable[[bytes, str], Awaitable[str]]] = None,
+        on_image_generated: Optional[Callable[[bytes, str, str], Awaitable[str]]] = None,
         on_user_tagged: Optional[Callable[[str, str], Awaitable[str]]] = None,
     ):
         """Initialize Groq client.
@@ -139,7 +139,7 @@ class GroqClient(BaseLLMClient):
             max_turns: Maximum tool use turns before giving up
             search_service: Search service for tool execution
             image_service: Image generation service (Nano Banana)
-            on_image_generated: Callback to post generated image (bytes, prompt) -> result
+            on_image_generated: Callback to post generated image (bytes, prompt, mime_type) -> result
             on_user_tagged: Callback to tag a user in Discord (target_name, message) -> result
         """
         self.api_key = api_key
@@ -147,6 +147,7 @@ class GroqClient(BaseLLMClient):
         self.max_tokens = max_tokens
         self.max_turns = max_turns
         self._tool_calls_this_request: list[str] = []  # Track tool calls for graceful failure
+        self._search_calls_this_request: int = 0  # Track search/fetch calls toward limit
         self._context: str = ""
         self._conversation_history: list[dict] = []
         self._search_service = search_service
@@ -210,40 +211,46 @@ class GroqClient(BaseLLMClient):
 
             # Reset tool call tracking for this request
             self._tool_calls_this_request = []
+            self._search_calls_this_request = 0  # Only count search/fetch toward limit
 
             # Tool use loop (up to max_turns)
-            # After 3 tool calls, force the model to answer (no more tools)
-            MAX_TOOL_CALLS = 3
+            # After 3 SEARCH tool calls, disable search but allow action tools
+            MAX_SEARCH_CALLS = 3
+            SEARCH_TOOLS = {"web_search", "fetch_url"}  # These get limited
+            ACTION_TOOLS = {"generate_image", "edit_image", "tag_user"}  # These don't
 
             for turn in range(self.max_turns):
                 logger.debug(f"Groq turn {turn + 1}/{self.max_turns}")
 
                 # Request with tool support (non-streaming to detect tool calls)
-                # Disable tools after MAX_TOOL_CALLS to force an answer
+                # After MAX_SEARCH_CALLS, disable search tools but keep action tools
                 has_tools = self._search_service or self._image_service
-                tool_calls_so_far = len(self._tool_calls_this_request)
-                allow_tools = has_tools and tool_calls_so_far < MAX_TOOL_CALLS
+                search_limit_reached = self._search_calls_this_request >= MAX_SEARCH_CALLS
 
-                # When tools are disabled, tell the model to answer NOW
-                force_answer_msg = "STOP. You have enough information from your searches. DO NOT search again. Answer the user's question NOW using the information you already gathered. Give a brief 1-2 sentence answer."
-                if tool_calls_so_far >= MAX_TOOL_CALLS:
-                    logger.info(f"Forcing answer after {tool_calls_so_far} tool calls")
-                    # Add explicit instruction only once (check if not already added)
+                # Build available tools based on search limit
+                available_tools = TOOLS.copy()
+                if search_limit_reached:
+                    # Remove search tools, keep action tools (generate_image, edit_image, tag_user)
+                    available_tools = [t for t in TOOLS if t["function"]["name"] in ACTION_TOOLS]
+                    logger.info(f"Search limit reached ({self._search_calls_this_request}), action tools only: {[t['function']['name'] for t in available_tools]}")
+
+                    # Add instruction to use gathered info or take action
+                    force_answer_msg = "You have gathered enough search information. DO NOT search again. Either: (1) Answer the user's question using the info you gathered, OR (2) If the user requested an image/infographic, call generate_image NOW with a detailed prompt based on what you learned. Give a brief 1-2 sentence voice response."
                     if not any(m.get("content") == force_answer_msg for m in messages):
                         messages.append({
                             "role": "system",
                             "content": force_answer_msg
                         })
 
-                # Build API call params - only include tools if allowed
+                # Build API call params
                 api_params = {
                     "model": self.model,
                     "messages": messages,
                     "max_tokens": self.max_tokens,
                     "stream": False,
                 }
-                if allow_tools:
-                    api_params["tools"] = TOOLS
+                if has_tools and available_tools:
+                    api_params["tools"] = available_tools
                     api_params["tool_choice"] = "auto"
                     api_params["parallel_tool_calls"] = False
 
@@ -251,9 +258,9 @@ class GroqClient(BaseLLMClient):
                     response = await self._client.chat.completions.create(**api_params)
                 except Exception as api_error:
                     error_str = str(api_error)
-                    # If model tried to call a tool when tools disabled, extract info and ask directly
-                    if not allow_tools and ("tool_use_failed" in error_str or "model called a tool" in error_str):
-                        logger.warning(f"Model tried to call tool, retrying with summary request")
+                    # If model tried to call a search tool when search is disabled, extract info and ask directly
+                    if search_limit_reached and ("tool_use_failed" in error_str or "model called a tool" in error_str):
+                        logger.warning(f"Model tried to call search tool after limit, retrying with summary request")
                         # Extract tool results from messages
                         tool_results = [m["content"] for m in messages if m.get("role") == "tool"]
                         summary_context = "\n\n".join(tool_results[-3:])  # Last 3 tool results
@@ -302,17 +309,23 @@ class GroqClient(BaseLLMClient):
 
                     # Execute each tool and append results
                     for tool_call in response_message.tool_calls:
+                        tool_name = tool_call.function.name
+
+                        # Track search tools toward limit
+                        if tool_name in SEARCH_TOOLS:
+                            self._search_calls_this_request += 1
+
                         # Track this tool call for graceful failure message
                         try:
                             args = json.loads(tool_call.function.arguments)
-                            if tool_call.function.name == "web_search":
+                            if tool_name == "web_search":
                                 self._tool_calls_this_request.append(f"searched '{args.get('query', '')}'")
-                            elif tool_call.function.name == "fetch_url":
+                            elif tool_name == "fetch_url":
                                 self._tool_calls_this_request.append(f"fetched {args.get('url', '')}")
                             else:
-                                self._tool_calls_this_request.append(tool_call.function.name)
+                                self._tool_calls_this_request.append(tool_name)
                         except json.JSONDecodeError:
-                            self._tool_calls_this_request.append(tool_call.function.name)
+                            self._tool_calls_this_request.append(tool_name)
 
                         result = await self._execute_tool(tool_call)
                         messages.append({
@@ -423,11 +436,11 @@ class GroqClient(BaseLLMClient):
                 if not self._image_service:
                     return "Image generation not available - NANOBANANA_API_KEY not configured"
                 prompt = args.get("prompt", "")
-                image_bytes = await self._image_service.generate(prompt)
+                image_bytes, mime_type = await self._image_service.generate(prompt)
                 logger.info(f"[IMAGE] Image generated, callback set: {self._on_image_generated is not None}")
                 if self._on_image_generated:
                     logger.info("[IMAGE] Calling on_image_generated callback...")
-                    result = await self._on_image_generated(image_bytes, prompt)
+                    result = await self._on_image_generated(image_bytes, prompt, mime_type)
                     logger.info(f"[IMAGE] Callback returned: {result}")
                     # Inform the model that editing is now available
                     return f"{result} You can now edit this image using the edit_image tool if the user wants changes."
@@ -440,11 +453,11 @@ class GroqClient(BaseLLMClient):
                 if not self._image_service.has_chat():
                     return "No previous image to edit. Ask the user what image they'd like you to generate first."
                 instruction = args.get("instruction", "")
-                image_bytes = await self._image_service.edit(instruction)
+                image_bytes, mime_type = await self._image_service.edit(instruction)
                 logger.info(f"[IMAGE] Image edited, callback set: {self._on_image_generated is not None}")
                 if self._on_image_generated:
                     logger.info("[IMAGE] Calling on_image_generated callback for edited image...")
-                    result = await self._on_image_generated(image_bytes, f"Edited: {instruction}")
+                    result = await self._on_image_generated(image_bytes, f"Edited: {instruction}", mime_type)
                     logger.info(f"[IMAGE] Callback returned: {result}")
                     return f"{result} The image has been edited. You can make more edits using edit_image."
                 return "Image edited but no channel to post to"

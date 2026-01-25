@@ -239,17 +239,28 @@ class VoiceSession:
         else:
             logger.warning(f"[CALLBACK] NOT setting event - state={self._state}, loop={self._loop is not None}")
 
-    async def _post_image_to_discord(self, image_bytes: bytes, prompt: str) -> str:
+    async def _post_image_to_discord(self, image_bytes: bytes, prompt: str, mime_type: str = "image/png") -> str:
         """Post a generated image to Discord.
 
         Args:
-            image_bytes: The generated image as PNG bytes
+            image_bytes: The generated image bytes
             prompt: The prompt used to generate the image
+            mime_type: MIME type of the image (e.g., image/png, image/webp)
 
         Returns:
             Result message to send back to the LLM
         """
-        logger.info(f"[IMAGE] _post_image_to_discord called with {len(image_bytes)} bytes")
+        # Map MIME type to file extension
+        mime_to_ext = {
+            "image/png": "png",
+            "image/jpeg": "jpg",
+            "image/webp": "webp",
+            "image/gif": "gif",
+        }
+        extension = mime_to_ext.get(mime_type, "png")
+        filename = f"generated.{extension}"
+
+        logger.info(f"[IMAGE] _post_image_to_discord called with {len(image_bytes)} bytes, mime_type={mime_type}, filename={filename}")
 
         if not self.voice_client or not self.voice_client.guild:
             logger.warning("[IMAGE] Cannot post image - no voice client or guild")
@@ -271,15 +282,26 @@ class VoiceSession:
             logger.warning(f"[IMAGE] Could not find channel #{channel_name}")
             return f"Could not find channel #{channel_name} to post the image. Available channels: {available_channels}"
 
+        # Check bot permissions
+        bot_member = channel.guild.me
+        perms = channel.permissions_for(bot_member)
+        logger.info(f"[IMAGE] Bot permissions in #{channel_name}: send_messages={perms.send_messages}, attach_files={perms.attach_files}")
+        if not perms.attach_files:
+            return f"Bot lacks 'Attach Files' permission in #{channel_name}"
+
+        requester = self._current_speaker_name or "Someone"
+
         try:
-            requester = self._current_speaker_name or "Someone"
             logger.info(f"[IMAGE] Sending to #{channel_name}...")
             await channel.send(
                 content=f"*{requester}'s requested image:*",
-                file=discord.File(io.BytesIO(image_bytes), filename="generated.png"),
+                file=discord.File(io.BytesIO(image_bytes), filename=filename),
             )
             logger.info(f"[IMAGE] Posted generated image to #{channel_name}")
             return f"Done! I've posted the image to #{channel_name}."
+        except discord.errors.DiscordServerError as e:
+            logger.warning(f"[IMAGE] Discord server error: {e}")
+            return "Discord is blocking image uploads at the moment."
         except Exception as e:
             logger.error(f"[IMAGE] Failed to post image: {e}", exc_info=True)
             return f"Failed to post image: {str(e)}"
