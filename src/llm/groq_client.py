@@ -224,8 +224,16 @@ class GroqClient(BaseLLMClient):
                 tool_calls_so_far = len(self._tool_calls_this_request)
                 allow_tools = has_tools and tool_calls_so_far < MAX_TOOL_CALLS
 
+                # When tools are disabled, tell the model to answer NOW
+                force_answer_msg = "STOP. You have enough information from your searches. DO NOT search again. Answer the user's question NOW using the information you already gathered. Give a brief 1-2 sentence answer."
                 if tool_calls_so_far >= MAX_TOOL_CALLS:
                     logger.info(f"Forcing answer after {tool_calls_so_far} tool calls")
+                    # Add explicit instruction only once (check if not already added)
+                    if not any(m.get("content") == force_answer_msg for m in messages):
+                        messages.append({
+                            "role": "system",
+                            "content": force_answer_msg
+                        })
 
                 # Build API call params - only include tools if allowed
                 api_params = {
@@ -239,7 +247,30 @@ class GroqClient(BaseLLMClient):
                     api_params["tool_choice"] = "auto"
                     api_params["parallel_tool_calls"] = False
 
-                response = await self._client.chat.completions.create(**api_params)
+                try:
+                    response = await self._client.chat.completions.create(**api_params)
+                except Exception as api_error:
+                    error_str = str(api_error)
+                    # If model tried to call a tool when tools disabled, extract info and ask directly
+                    if not allow_tools and ("tool_use_failed" in error_str or "model called a tool" in error_str):
+                        logger.warning(f"Model tried to call tool, retrying with summary request")
+                        # Extract tool results from messages
+                        tool_results = [m["content"] for m in messages if m.get("role") == "tool"]
+                        summary_context = "\n\n".join(tool_results[-3:])  # Last 3 tool results
+
+                        # Ask model directly to summarize without any tool history
+                        summary_messages = [
+                            {"role": "system", "content": "You are a helpful voice assistant. Answer briefly in 1-2 sentences."},
+                            {"role": "user", "content": f"Based on this information, answer the user's question:\n\n{summary_context[:6000]}\n\nQuestion: {message}"}
+                        ]
+                        response = await self._client.chat.completions.create(
+                            model=self.model,
+                            messages=summary_messages,
+                            max_tokens=self.max_tokens,
+                            stream=False,
+                        )
+                    else:
+                        raise  # Re-raise other errors
 
                 response_message = response.choices[0].message
 
@@ -318,6 +349,10 @@ class GroqClient(BaseLLMClient):
             if "output_parse_failed" in error_str or "Parsing failed" in error_str:
                 logger.warning(f"Groq model output parsing failed - model may have output thinking text: {e}")
                 yield "I couldn't find specific information about that. Try asking in a different way."
+            # Handle model trying to call tools when tools are disabled
+            elif "tool_use_failed" in error_str or "model called a tool" in error_str:
+                logger.warning(f"Model tried to call tool after tools disabled: {e}")
+                yield self._build_graceful_failure()
             else:
                 logger.error(f"Groq API error: {e}")
                 yield "Sorry, I encountered an error processing your request."
@@ -557,6 +592,10 @@ Examples (note: emotion tags, personality, brief answers):
 - "Can you do my homework?" ->
   [laughing] Oh sure, let me just add that to my list of things I definitely want to do.
   What do you need?"""
+
+        # Add current date/time so model knows when "now" is
+        now = datetime.now()
+        base_prompt += f"\n\nCURRENT DATE/TIME: {now.strftime('%A, %B %d, %Y at %I:%M %p')}"
 
         if self._context:
             base_prompt += f"\n\nContext:\n{self._context}"
