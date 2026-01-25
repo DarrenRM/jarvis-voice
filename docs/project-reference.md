@@ -34,7 +34,8 @@ The bot listens for a wake word ("hey jarvis"), captures user speech, transcribe
 2. **Parallel TTS streaming**: LLM generates while TTS synthesizes previous sentences
 3. **PTT staleness detection**: Responds 500ms after push-to-talk release (not 3.5s)
 4. **Speaker isolation**: Filters non-wake-word speakers in multi-user channels
-5. **Personalization**: "One second, Darren..." with Discord activity awareness
+5. **Per-user wake detection**: Each user gets their own wake word detector for accurate speaker attribution
+6. **Personalization**: "One second, Darren..." with Discord activity awareness
 
 ---
 
@@ -48,7 +49,7 @@ User Speech (Discord 48kHz stereo)
        v
 [StreamingSink] -----> per-user pre-buffers (1.5s rolling)
        |
-[Wake Word] ---------> "hey jarvis" detection (OpenWakeWord)
+[Wake Word] ---------> per-user "hey jarvis" detection (OpenWakeWord)
        |
 [VAD] ---------------> speech endpoint detection (Silero)
        |
@@ -196,14 +197,15 @@ if self._last_user_id and self._last_user_id in self._per_user_pre_buffers:
 **Key Responsibilities**:
 - Real-time audio processing
 - Per-user pre-buffer management
-- Wake word detection coordination
+- Per-user wake word detection (each user gets their own detector)
 - Speaker isolation filtering
 
 **Critical Methods**:
-- `write()`: Main audio processing entry point (line 307)
-- `check_audio_timeout()`: PTT release detection (line 183)
-- `check_idle_audio_gap()`: Idle wake word completion (line 241)
-- `start_listening()`: Transition with pre-buffer handling (line 135)
+- `write()`: Main audio processing entry point (line ~480)
+- `_get_or_create_detector()`: Lazy per-user detector factory (line ~152)
+- `check_idle_audio_gap()`: Per-user silence padding for wake word completion (line ~313)
+- `start_listening()`: Transition with pre-buffer handling (line ~200)
+- `remove_user()`: Cleanup when user leaves voice channel (line ~181)
 
 ### SpeakingDetector (src/detection/speaking_detector.py)
 
@@ -537,6 +539,20 @@ AUTO_JOIN_CHANNEL=channel_name     # Channel to auto-join
 - `is_anyone_speaking()`: 3s debounce for waiting on responses
 - `is_anyone_actively_speaking()`: Immediate check for ack timing
 
+### Why Per-User Wake Detection?
+
+**Problem**: Single shared wake word detector processes all users' audio interleaved. When two users talk simultaneously, the detector sees mixed audio and can't accurately attribute who said the wake word. Edge cases like silence padding used `_last_user_id` fallback which could be wrong.
+
+**Solution**: Each user gets their own `WakeWordDetector` instance, created lazily on first audio. When a detector fires, we know exactly who spoke. This makes speaker attribution 100% accurate.
+
+**Trade-off**: Memory usage (~10MB per detector × N users, capped at 10 users = ~100MB max).
+
+**Implementation Details**:
+- Per-user detectors stored in `_per_user_detectors: dict[int, WakeWordDetector]`
+- Factory method `_get_or_create_detector(user_id)` handles lazy creation
+- `on_voice_state_update` event cleans up detectors when users leave
+- Silence padding iterates all recent users instead of feeding shared detector
+
 ### Why AudioPipeline Not Integrated?
 
 **Problem**: Created clean STT->LLM->TTS pipeline abstraction but couldn't integrate.
@@ -555,6 +571,9 @@ AUTO_JOIN_CHANNEL=channel_name     # Channel to auto-join
 
 | Change | Impact |
 |--------|--------|
+| **Per-user wake detection** | 100% accurate speaker attribution, no cross-talk |
+| User lifecycle management | `on_voice_state_update` cleans up when users leave |
+| Removed shared wake_detector | Config values passed to StreamingSink instead |
 | Extracted SpeakerManager | Cleaner speaker identification |
 | Extracted DiscordService | Separated Discord operations |
 | Created AudioPipeline | Standalone utility for future use |
@@ -588,4 +607,4 @@ AUTO_JOIN_CHANNEL=channel_name     # Channel to auto-join
 
 ---
 
-*Generated 2026-01-25. See [architecture-audit.md](./architecture-audit.md) for refactoring history.*
+*Updated 2026-01-25. See [architecture-audit.md](./architecture-audit.md) for refactoring history.*

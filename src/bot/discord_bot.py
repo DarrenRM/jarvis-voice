@@ -11,7 +11,7 @@ import discord
 from discord.ext import commands
 
 from ..config import Settings
-from ..detection import VAD, WakeWordDetector
+from ..detection import VAD
 from ..llm import BaseLLMClient
 from ..tts import TTSSynthesizer
 from .voice_session import VoiceSession
@@ -32,7 +32,6 @@ class ClaudeBot(commands.Bot):
         self,
         settings: Settings,
         *,
-        wake_detector: Optional[WakeWordDetector] = None,
         vad: Optional[VAD] = None,
         llm: Optional[BaseLLMClient] = None,
         tts: Optional[TTSSynthesizer] = None,
@@ -41,7 +40,6 @@ class ClaudeBot(commands.Bot):
 
         Args:
             settings: Application settings
-            wake_detector: Shared WakeWordDetector (optional)
             vad: Shared VAD (optional)
             llm: Shared LLM client (Claude or Groq) (optional)
             tts: Shared TTSSynthesizer (optional)
@@ -58,7 +56,7 @@ class ClaudeBot(commands.Bot):
         self.settings = settings
 
         # Shared components (can be None, session will create if needed)
-        self._wake_detector = wake_detector
+        # Note: Wake word detectors are now created per-user in StreamingSink
         self._vad = vad
         self._llm = llm
         self._tts = tts
@@ -195,8 +193,8 @@ class ClaudeBot(commands.Bot):
 
         try:
             # Create session with pre-loaded components
+            # Note: Wake word detectors are now created per-user in StreamingSink
             self._session = VoiceSession(
-                wake_detector=self._wake_detector,
                 vad=self._vad,
                 tts=self._tts,
             )
@@ -252,6 +250,36 @@ class ClaudeBot(commands.Bot):
         # Auto-join voice channel if enabled
         if self.settings.auto_join_voice:
             await self._auto_join()
+
+    async def on_voice_state_update(
+        self,
+        member: discord.Member,
+        before: discord.VoiceState,
+        after: discord.VoiceState,
+    ) -> None:
+        """Handle voice state changes for user lifecycle management.
+
+        Cleans up per-user wake detectors when users leave the voice channel.
+        """
+        # Skip if no active session or sink
+        if not self._session or not self._session.sink:
+            return
+
+        # Skip bot's own voice state changes
+        if member.id == self.user.id:
+            return
+
+        # User left voice channel entirely
+        if before.channel and not after.channel:
+            self._session.sink.remove_user(member.id)
+            logger.debug(f"User {member.display_name} left voice, cleaned up")
+
+        # User switched to a different channel (left our channel)
+        elif before.channel != after.channel:
+            # Check if they left the channel we're in
+            if self._session.voice_client and before.channel == self._session.voice_client.channel:
+                self._session.sink.remove_user(member.id)
+                logger.debug(f"User {member.display_name} switched channels, cleaned up")
 
     async def close(self) -> None:
         """Clean up on shutdown."""

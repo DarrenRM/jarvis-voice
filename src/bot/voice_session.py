@@ -16,7 +16,7 @@ import numpy as np
 
 from ..audio import SAMPLE_RATE_PROCESSING, SAMPLE_RATE_TTS
 from ..config import get_settings
-from ..detection import VAD, WakeWordDetector, SpeakingDetector
+from ..detection import VAD, SpeakingDetector
 from ..stt import GroqWhisperClient
 from ..llm import BaseLLMClient, create_llm_client
 from ..tts import TTSSynthesizer
@@ -75,7 +75,6 @@ class VoiceSession:
     def __init__(
         self,
         *,
-        wake_detector: Optional[WakeWordDetector] = None,
         vad: Optional[VAD] = None,
         speaking_detector: Optional[SpeakingDetector] = None,
         groq_client: Optional[GroqWhisperClient] = None,
@@ -87,7 +86,6 @@ class VoiceSession:
         Components can be passed in (shared) or will be created.
 
         Args:
-            wake_detector: WakeWordDetector instance
             vad: VAD instance
             speaking_detector: SpeakingDetector instance for multi-user awareness
             groq_client: GroqWhisperClient instance (STT)
@@ -107,7 +105,7 @@ class VoiceSession:
         )
 
         # Components (will be initialized if not provided)
-        self.wake_detector = wake_detector
+        # Note: Wake word detection is now per-user, created lazily in StreamingSink
         self.vad = vad
         self.speaking_detector = speaking_detector
         self.groq_client = groq_client
@@ -139,6 +137,7 @@ class VoiceSession:
         self._thinking_task: Optional[asyncio.Task] = None
         self._thinking_synth_time: float = 0.0
         self._ack_played: bool = False  # Track if ack played this session
+        self._listen_start: float = 0.0  # Track when listening started
 
         # Current speaker tracking
         self._current_speaker_id: Optional[int] = None
@@ -163,15 +162,10 @@ class VoiceSession:
             logger.info(f"Session state: {old_state} -> {value}")
 
     def _init_components(self):
-        """Initialize ML components if not provided."""
-        if self.wake_detector is None:
-            logger.info("Loading wake word detector...")
-            self.wake_detector = WakeWordDetector(
-                model_name=self.settings.wake_word_model,
-                threshold=self.settings.wake_word_confidence,
-                sample_rate=SAMPLE_RATE_PROCESSING,  # We resample to 16kHz
-            )
+        """Initialize ML components if not provided.
 
+        Note: Wake word detectors are now created per-user in StreamingSink.
+        """
         if self.vad is None:
             logger.info("Loading VAD...")
             self.vad = VAD(
@@ -298,9 +292,11 @@ class VoiceSession:
         # Initialize components
         self._init_components()
 
-        # Create the streaming sink
+        # Create the streaming sink with per-user wake detection config
         self.sink = StreamingSink(
-            wake_detector=self.wake_detector,
+            wake_model_name=self.settings.wake_word_model,
+            wake_threshold=self.settings.wake_word_confidence,
+            wake_sample_rate=SAMPLE_RATE_PROCESSING,
             vad=self.vad,
             speaking_detector=self.speaking_detector,
             on_wake_word=self._on_wake_word,
@@ -403,7 +399,7 @@ class VoiceSession:
                     break
 
                 # Transition to listening
-                listen_start = time.perf_counter()
+                self._listen_start = time.perf_counter()
                 self.state = "listening"
                 self._speech_started = False
                 self._ack_played = False  # Reset for new session
@@ -459,7 +455,7 @@ class VoiceSession:
                             break
                     else:
                         # Timeout - but still process any captured audio (don't abandon)
-                        listen_time = time.perf_counter() - listen_start
+                        listen_time = time.perf_counter() - self._listen_start
                         buffer = self.sink.get_audio_buffer()
                         buffer_duration = len(buffer) / SAMPLE_RATE_PROCESSING if len(buffer) > 0 else 0
                         logger.warning(
@@ -473,7 +469,7 @@ class VoiceSession:
                         self._resolve_current_speaker(self.sink._last_user_id)
                         # DON'T continue - fall through to process the audio
 
-                    listen_time = time.perf_counter() - listen_start
+                    listen_time = time.perf_counter() - self._listen_start
                     # Stop the sink from buffering more audio
                     self.sink.stop_listening()
                     logger.info(f"[TIMING] Speech captured in {listen_time:.2f}s")
@@ -556,6 +552,7 @@ class VoiceSession:
 
             t0 = time.perf_counter()
             ack_phrase = random.choice(self.ACK_PHRASES)
+            self._ack_played = True  # Mark early - prevents race with fast transcription
             ack_audio = await self.tts.synthesize(ack_phrase)
             synth_time = time.perf_counter() - t0
             logger.info(f"[TIMING] Ack TTS '{ack_phrase}': {synth_time:.2f}s")
@@ -565,7 +562,6 @@ class VoiceSession:
                 await self._play_audio(ack_audio)
                 play_time = time.perf_counter() - t0
                 logger.info(f"[TIMING] Ack playback: {play_time:.2f}s")
-                self._ack_played = True  # Mark that ack was played
         except asyncio.CancelledError:
             logger.debug("Ack playback cancelled")
             # Stop any ongoing playback when cancelled
@@ -581,21 +577,25 @@ class VoiceSession:
         If user asks something, processes it. If silence, returns to idle.
         """
         try:
-            # If ack already played during the initial listening period,
-            # user already had 8+ seconds to respond - just return to idle
-            if self._ack_played:
-                logger.info("[WAKE-ONLY] Ack already played during listening, returning to idle")
+            # Check how long we were listening - if ack played and user had time to respond, skip follow-up
+            listen_duration = time.perf_counter() - self._listen_start
+            if self._ack_played and listen_duration > 5.0:
+                logger.info(f"[WAKE-ONLY] Ack played and listened for {listen_duration:.1f}s - user had time, returning to idle")
                 self.state = "idle"
                 return
 
-            # Ack didn't play (e.g., PTT timeout was faster) - play it now
-            ack_phrase = random.choice(self.ACK_PHRASES)
-            logger.info(f"[WAKE-ONLY] Playing ack: '{ack_phrase}'")
-            ack_audio = await self.tts.synthesize(ack_phrase)
-            if len(ack_audio) > 0:
-                await self._play_audio(ack_audio)
+            # Only play ack if one isn't already in progress
+            # (_ack_played is set early in _play_ack to prevent race conditions)
+            if not self._ack_played:
+                ack_phrase = random.choice(self.ACK_PHRASES)
+                logger.info(f"[WAKE-ONLY] Playing ack: '{ack_phrase}'")
+                ack_audio = await self.tts.synthesize(ack_phrase)
+                if len(ack_audio) > 0:
+                    await self._play_audio(ack_audio)
+            else:
+                logger.info("[WAKE-ONLY] Ack already in progress, skipping duplicate")
 
-            # Re-enter listening for follow-up question
+            # Listen for follow-up question (user said wake word quickly, may be waiting for ack)
             logger.info("[WAKE-ONLY] Listening for follow-up question...")
             self.state = "listening"
             self.sink.start_listening()

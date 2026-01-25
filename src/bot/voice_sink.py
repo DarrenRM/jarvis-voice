@@ -14,7 +14,7 @@ import numpy as np
 from ..audio import resample_48k_stereo_to_16k_mono, SAMPLE_RATE_PROCESSING
 
 if TYPE_CHECKING:
-    from ..detection import SpeakingDetector, SpeakingState
+    from ..detection import SpeakingDetector, SpeakingState, WakeWordDetector
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +33,9 @@ class StreamingSink(discord.sinks.Sink):
     def __init__(
         self,
         *,
-        wake_detector=None,
+        wake_model_name: str = "hey_jarvis",
+        wake_threshold: float = 0.5,
+        wake_sample_rate: int = 16000,
         vad=None,
         speaking_detector: Optional["SpeakingDetector"] = None,
         on_wake_word: Optional[Callable[[], None]] = None,
@@ -46,7 +48,9 @@ class StreamingSink(discord.sinks.Sink):
         """Initialize streaming sink.
 
         Args:
-            wake_detector: WakeWordDetector instance
+            wake_model_name: Wake word model name (e.g., "hey_jarvis")
+            wake_threshold: Detection confidence threshold
+            wake_sample_rate: Audio sample rate for wake detection
             vad: VAD instance
             speaking_detector: Optional SpeakingDetector for multi-user speech detection
             on_wake_word: Callback when wake word detected
@@ -58,7 +62,13 @@ class StreamingSink(discord.sinks.Sink):
         """
         super().__init__(filters=filters)
 
-        self.wake_detector = wake_detector
+        # Per-user wake detection config (lazy initialization)
+        self._wake_model_name = wake_model_name
+        self._wake_threshold = wake_threshold
+        self._wake_sample_rate = wake_sample_rate
+        self._per_user_detectors: dict[int, "WakeWordDetector"] = {}
+        self._max_detectors = 10
+
         self.vad = vad
         self.speaking_detector = speaking_detector
         self._on_wake_word = on_wake_word
@@ -90,7 +100,7 @@ class StreamingSink(discord.sinks.Sink):
 
         # Track if we've already flushed wake detector for current gap
         self._idle_flush_done = False
-        self._silence_attempts = 0
+        self._per_user_silence_attempts: dict[int, int] = {}
 
         # Per-user pre-buffers: capture audio before wake word for question context
         # This captures the start of questions like "what's the weather" when
@@ -101,6 +111,9 @@ class StreamingSink(discord.sinks.Sink):
 
         # Speaker isolation: track filtered users for logging
         self._filtered_users: set[int] = set()
+
+        # Track who triggered the wake word (captured at detection time, not start_listening time)
+        self._wake_word_user_id: Optional[int] = None
 
     @property
     def state(self) -> str:
@@ -127,24 +140,85 @@ class StreamingSink(discord.sinks.Sink):
                     self.vad.reset()
 
             elif value == "idle":
-                # Clear buffer when going idle
+                # Clear buffer and wake word user when going idle
                 self._audio_buffer = []
-                if self.wake_detector:
-                    self.wake_detector.reset()
+                self._wake_word_user_id = None
+                # Reset all per-user wake detectors
+                for detector in self._per_user_detectors.values():
+                    detector.reset()
+                # Clear per-user silence attempt counters
+                self._per_user_silence_attempts.clear()
+
+    def _get_or_create_detector(self, user_id: int) -> Optional["WakeWordDetector"]:
+        """Get existing detector or create new one for user.
+
+        Each user gets their own wake word detector to prevent cross-talk
+        interference and ensure accurate user attribution.
+
+        Args:
+            user_id: Discord user ID
+
+        Returns:
+            WakeWordDetector instance, or None if max detectors reached
+        """
+        if user_id not in self._per_user_detectors:
+            if len(self._per_user_detectors) >= self._max_detectors:
+                logger.warning(
+                    f"[WAKE] Max detectors ({self._max_detectors}) reached, "
+                    f"skipping user {user_id}"
+                )
+                return None
+            # Lazy import to avoid circular dependency
+            from ..detection import WakeWordDetector
+            logger.debug(f"[WAKE] Creating detector for user {user_id}")
+            self._per_user_detectors[user_id] = WakeWordDetector(
+                model_name=self._wake_model_name,
+                threshold=self._wake_threshold,
+                sample_rate=self._wake_sample_rate,
+            )
+        return self._per_user_detectors[user_id]
+
+    def remove_user(self, user_id: int) -> None:
+        """Clean up when user leaves voice channel.
+
+        Args:
+            user_id: Discord user ID
+        """
+        removed = []
+        if user_id in self._per_user_detectors:
+            del self._per_user_detectors[user_id]
+            removed.append("detector")
+        if user_id in self._per_user_last_seen:
+            del self._per_user_last_seen[user_id]
+            removed.append("last_seen")
+        if user_id in self._per_user_pre_buffers:
+            del self._per_user_pre_buffers[user_id]
+            removed.append("pre_buffer")
+        if user_id in self._per_user_silence_attempts:
+            del self._per_user_silence_attempts[user_id]
+        if removed:
+            logger.debug(f"[WAKE] Removed user {user_id}: {', '.join(removed)}")
 
     def start_listening(self):
         """Transition to listening state."""
         logger.info("[SINK] start_listening() called")
 
+        # Use the user who triggered wake word (captured at detection time, not now)
+        # This prevents race conditions where another user's packet arrives between detection and start_listening
+        wake_user = self._wake_word_user_id or self._last_user_id
+
         # Include ONLY the wake word speaker's pre-buffer (speaker isolation)
         # This captures the start of questions when user speaks continuously
-        if self._last_user_id and self._last_user_id in self._per_user_pre_buffers:
-            pre_buffer = self._per_user_pre_buffers[self._last_user_id]
+        if wake_user and wake_user in self._per_user_pre_buffers:
+            pre_buffer = self._per_user_pre_buffers[wake_user]
             pre_duration = sum(len(a) for a in pre_buffer) / SAMPLE_RATE_PROCESSING
-            logger.info(f"[SINK] Including {pre_duration:.2f}s pre-buffer from user {self._last_user_id}")
+            logger.info(f"[SINK] Including {pre_duration:.2f}s pre-buffer from user {wake_user}")
             self._audio_buffer = pre_buffer.copy()
         else:
             self._audio_buffer = []
+
+        # Lock speaker isolation to the wake word speaker
+        self._last_user_id = wake_user
 
         # Clear all pre-buffers and reset filtered user tracking
         self._per_user_pre_buffers.clear()
@@ -266,28 +340,41 @@ class StreamingSink(discord.sinks.Sink):
                 if self._on_speaking_change:
                     self._on_speaking_change(state)
 
-        # Only check if there's been a significant gap (250ms+)
-        # Allow up to 5 attempts (2.5s of silence total) before giving up
-        if gap >= 0.25 and self.wake_detector:
-            if self._silence_attempts >= 5:
-                return False  # Give up after 5 attempts
+        # Check each user who recently sent audio for pending wake word detection
+        # Only check users with 250ms-2.5s gap (recent enough to have pending audio)
+        now = time.perf_counter()
+        silence = np.zeros(8000, dtype=np.float32)  # 500ms of silence at 16kHz
 
-            self._silence_attempts += 1
-            logger.debug(f"[SINK] Feeding silence attempt {self._silence_attempts}/5 (gap={gap:.2f}s)")
+        for user_id, last_seen in list(self._per_user_last_seen.items()):
+            user_gap = now - last_seen
 
-            # Feed silence to the wake detector to complete any pending detection.
-            # OpenWakeWord's internal state may have the wake word loaded but needs
-            # more audio frames to trigger the final detection.
-            # Use 500ms of silence (increased from 100ms) to ensure detection completes.
-            silence = np.zeros(8000, dtype=np.float32)  # 500ms of silence at 16kHz
-            detected = self.wake_detector.process(silence)
-            if detected:
-                logger.info(f"[SINK] Wake word detected from silence padding ({gap:.2f}s gap)")
+            # Only check users with recent audio (250ms - 2.5s gap)
+            if not (0.25 <= user_gap <= 2.5):
+                continue
+
+            detector = self._per_user_detectors.get(user_id)
+            if not detector:
+                continue
+
+            # Limit attempts per user
+            attempts = self._per_user_silence_attempts.get(user_id, 0)
+            if attempts >= 5:
+                continue  # Give up after 5 attempts for this user
+
+            self._per_user_silence_attempts[user_id] = attempts + 1
+            logger.debug(f"[SINK] Feeding silence to user {user_id} attempt {attempts + 1}/5 (gap={user_gap:.2f}s)")
+
+            # Feed silence to complete any pending detection
+            if detector.process(silence):
+                # User attribution is 100% accurate - we know which detector fired
+                self._wake_word_user_id = user_id
+                logger.info(f"[SINK] Wake word detected from silence padding (gap={user_gap:.2f}s, user: {user_id})")
                 return True
 
             # Also try flush in case there's buffered audio
-            if hasattr(self.wake_detector, 'flush') and self.wake_detector.flush():
-                logger.info(f"[SINK] Wake word detected from flush ({gap:.2f}s gap)")
+            if hasattr(detector, 'flush') and detector.flush():
+                self._wake_word_user_id = user_id
+                logger.info(f"[SINK] Wake word detected from flush (gap={user_gap:.2f}s, user: {user_id})")
                 return True
 
         return False
@@ -335,6 +422,9 @@ class StreamingSink(discord.sinks.Sink):
         # Only update user ID when idle - this locks in the wake word speaker
         # and prevents someone else's noise from stealing attribution
         user_id = user if isinstance(user, int) else getattr(user, "id", user)
+        # Save the pre-gap user before updating (needed for wake word attribution from flush)
+        pre_gap_user_id = self._last_user_id
+
         if self._state == "idle":
             # Only log if we haven't heard from this user recently (prevents spam with multiple users)
             last_seen = self._per_user_last_seen.get(user_id, 0)
@@ -357,14 +447,19 @@ class StreamingSink(discord.sinks.Sink):
                 logger.info(f"[SINK] Audio resumed after {gap:.1f}s gap")
                 # Reset idle flush flag since new audio arrived
                 self._idle_flush_done = False
-                self._silence_attempts = 0
+                if hasattr(self, '_per_user_silence_attempts'):
+                    self._per_user_silence_attempts.clear()
                 # Clear all pre-buffers on large gaps (stale audio from before PTT)
                 if gap > 1.0:
                     self._per_user_pre_buffers.clear()
-                # Flush wake word detector's buffer - it may have stale audio from before the gap
-                if self.wake_detector and hasattr(self.wake_detector, 'flush'):
-                    if self.wake_detector.flush():
-                        logger.info("[SINK] Wake word detected from flushed buffer!")
+                # Flush all per-user wake detectors - they may have stale audio from before the gap
+                for detector_user_id, detector in self._per_user_detectors.items():
+                    if hasattr(detector, 'flush') and detector.flush():
+                        # Wake word was in pre-gap audio - attribute to that detector's user
+                        # Use pre_gap_user_id if it matches, otherwise detector_user_id
+                        attributed_user = pre_gap_user_id if detector_user_id == pre_gap_user_id else detector_user_id
+                        self._wake_word_user_id = attributed_user
+                        logger.info(f"[SINK] Wake word detected from flushed buffer! (user: {attributed_user})")
                         if self._on_wake_word:
                             self._on_wake_word()
                             return  # Don't process current audio if wake word found
@@ -379,7 +474,9 @@ class StreamingSink(discord.sinks.Sink):
 
         # Reset idle flush flag when audio arrives (allows periodic flush after next gap)
         self._idle_flush_done = False
-        self._silence_attempts = 0
+        # Reset silence attempts for this user since they sent audio
+        if user_id in self._per_user_silence_attempts:
+            del self._per_user_silence_attempts[user_id]
 
         # Convert to 16kHz mono float32
         audio_16k = resample_48k_stereo_to_16k_mono(data)
@@ -420,16 +517,19 @@ class StreamingSink(discord.sinks.Sink):
                 removed = user_buffer.pop(0)
                 total -= len(removed)
 
-            # Check for wake word
-            if self.wake_detector:
-                detected = self.wake_detector.process(audio_16k)
+            # Check for wake word using per-user detector
+            detector = self._get_or_create_detector(user_id)
+            if detector:
+                detected = detector.process(audio_16k)
                 if detected and self._on_wake_word:
+                    # User attribution is 100% accurate - detector that fired = that user
+                    self._wake_word_user_id = user_id
                     # Log time since last audio packet (shows Discord transmission lag)
                     if self._last_audio_time:
                         lag = time.perf_counter() - self._last_audio_time
-                        logger.info(f"[SINK] Wake word detected! (packet lag: {lag*1000:.0f}ms)")
+                        logger.info(f"[SINK] Wake word detected! (packet lag: {lag*1000:.0f}ms, user: {user_id})")
                     else:
-                        logger.info("[SINK] Wake word detected!")
+                        logger.info(f"[SINK] Wake word detected! (user: {user_id})")
                     self._on_wake_word()
 
         elif self._state == "listening":

@@ -14,7 +14,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.config import get_settings, Settings
 from src.bot import ClaudeBot
-from src.detection import VAD, WakeWordDetector
+from src.detection import VAD
 from src.tts import TTSSynthesizer
 from src.audio import SAMPLE_RATE_PROCESSING
 
@@ -34,13 +34,8 @@ def preload_components(settings: Settings) -> dict:
 
     logger.info("Pre-loading ML components...")
 
-    # Wake word detector
-    logger.info("Loading wake word detector...")
-    components["wake_detector"] = WakeWordDetector(
-        model_name=settings.wake_word_model,
-        threshold=settings.wake_word_confidence,
-        sample_rate=SAMPLE_RATE_PROCESSING,
-    )
+    # Note: Wake word detectors are now created per-user in StreamingSink
+    # for accurate speaker attribution
 
     # VAD
     logger.info("Loading VAD...")
@@ -155,10 +150,10 @@ async def run_bot(settings: Settings, components: Optional[dict] = None) -> None
         components: Pre-loaded ML components (optional)
     """
     # Create bot with pre-loaded components
+    # Note: Wake word detectors are now created per-user in StreamingSink
     if components:
         bot = ClaudeBot(
             settings,
-            wake_detector=components.get("wake_detector"),
             vad=components.get("vad"),
             llm=components.get("llm"),
             tts=components.get("tts"),
