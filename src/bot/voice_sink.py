@@ -83,14 +83,15 @@ class StreamingSink(discord.sinks.Sink):
         self._silence_timeout = 0.5  # Seconds of no audio = speech end (for PTT)
         self._audio_timeout_detected = False  # Once detected, commit to it
 
-        # Skip initial audio after wake word to avoid capturing "jarvis" tail
-        self._listen_start_time: Optional[float] = None
-        self._skip_initial_audio = False
-        self._initial_skip_duration = 0.3  # Skip first 300ms
-
         # Track if we've already flushed wake detector for current gap
         self._idle_flush_done = False
         self._silence_attempts = 0
+
+        # Pre-buffer: capture audio before wake word for question context
+        # This captures the start of questions like "what's the weather" when
+        # user says "hey jarvis what's the weather" without pausing
+        self._pre_buffer: list[np.ndarray] = []
+        self._pre_buffer_max_samples = int(16000 * 1.5)  # 1.5s at 16kHz
 
     @property
     def state(self) -> str:
@@ -125,14 +126,24 @@ class StreamingSink(discord.sinks.Sink):
     def start_listening(self):
         """Transition to listening state."""
         logger.info("[SINK] start_listening() called")
-        # Reset all listening state for fresh start
-        self._audio_buffer = []
+
+        # Include pre-buffer (audio captured before wake word was detected)
+        # This captures the start of questions when user speaks continuously
+        if self._pre_buffer:
+            pre_duration = sum(len(a) for a in self._pre_buffer) / 16000
+            logger.info(f"[SINK] Including {pre_duration:.2f}s pre-buffer")
+            self._audio_buffer = self._pre_buffer.copy()
+            self._pre_buffer = []
+        else:
+            self._audio_buffer = []
+
         self._speech_started = False
         self._last_audio_time = None  # Reset PTT tracking
         self._audio_timeout_detected = False  # Reset timeout flag
-        # Skip first ~300ms of audio to avoid capturing wake word tail
-        self._listen_start_time = time.perf_counter()
-        self._skip_initial_audio = True
+
+        # NOTE: Removed skip logic - pre-buffer replaces it
+        # The wake word audio is in the pre-buffer but LLM handles it gracefully
+
         if self.vad:
             self.vad.reset()
         self._state = "listening"
@@ -316,6 +327,9 @@ class StreamingSink(discord.sinks.Sink):
                 # Reset idle flush flag since new audio arrived
                 self._idle_flush_done = False
                 self._silence_attempts = 0
+                # Clear pre-buffer on large gaps (stale audio from before PTT)
+                if gap > 1.0:
+                    self._pre_buffer = []
                 # Flush wake word detector's buffer - it may have stale audio from before the gap
                 if self.wake_detector and hasattr(self.wake_detector, 'flush'):
                     if self.wake_detector.flush():
@@ -353,6 +367,14 @@ class StreamingSink(discord.sinks.Sink):
         # === END DIAGNOSTIC ===
 
         if self._state == "idle":
+            # Maintain rolling pre-buffer (captures question start before wake word)
+            self._pre_buffer.append(audio_16k.copy())
+            # Trim to max duration
+            total = sum(len(a) for a in self._pre_buffer)
+            while total > self._pre_buffer_max_samples and self._pre_buffer:
+                removed = self._pre_buffer.pop(0)
+                total -= len(removed)
+
             # Check for wake word
             if self.wake_detector:
                 detected = self.wake_detector.process(audio_16k)
@@ -366,16 +388,8 @@ class StreamingSink(discord.sinks.Sink):
                     self._on_wake_word()
 
         elif self._state == "listening":
-            # Skip initial audio to avoid capturing wake word tail
-            if self._skip_initial_audio:
-                elapsed = time.perf_counter() - self._listen_start_time
-                if elapsed < self._initial_skip_duration:
-                    return  # Don't buffer this audio
-                else:
-                    self._skip_initial_audio = False
-                    logger.debug(f"[SINK] Finished skipping initial {elapsed:.2f}s of audio")
-
             # Buffer audio and check VAD
+            # NOTE: Skip logic removed - pre-buffer handles wake word audio
             self._audio_buffer.append(audio_16k.copy())
             buffer_samples = sum(len(a) for a in self._audio_buffer)
 

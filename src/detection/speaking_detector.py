@@ -60,6 +60,10 @@ class SpeakingDetector:
     # Silero VAD requires exactly 512 samples at 16kHz
     VAD_CHUNK_SIZE = 512
 
+    # Staleness threshold: if no audio from user for this long, consider them not speaking
+    # This handles PTT release where audio stops abruptly
+    STALE_THRESHOLD_S = 0.5  # 500ms
+
     def __init__(
         self,
         *,
@@ -132,6 +136,17 @@ class SpeakingDetector:
             self._user_states[user_id] = UserAudioState(user_id=user_id)
             logger.debug(f"SpeakingDetector: Created state for user {user_id}")
         return self._user_states[user_id]
+
+    def _is_user_stale(self, user: UserAudioState, now: float) -> bool:
+        """Check if user's audio data is stale (PTT released, no recent audio).
+
+        If no audio has arrived from a user for STALE_THRESHOLD_S, we consider
+        them not speaking even if is_speaking is True. This handles PTT release
+        where audio stops abruptly without a proper silence period.
+        """
+        if user.last_packet_time is None:
+            return True
+        return (now - user.last_packet_time) >= self.STALE_THRESHOLD_S
 
     def _compute_rms(self, audio: np.ndarray) -> float:
         """Compute RMS energy of audio chunk."""
@@ -233,7 +248,12 @@ class SpeakingDetector:
 
     def _compute_aggregate_state(self, now: float) -> SpeakingState:
         """Compute aggregate speaking state across all users."""
-        any_speaking = any(user.is_speaking for user in self._user_states.values())
+        # Only count users as speaking if NOT stale (audio arrived recently)
+        # This handles PTT release where audio stops abruptly
+        any_speaking = any(
+            user.is_speaking and not self._is_user_stale(user, now)
+            for user in self._user_states.values()
+        )
 
         if any_speaking:
             self._last_speech_time = now
@@ -269,8 +289,13 @@ class SpeakingDetector:
         return self._compute_aggregate_state(now)
 
     def get_speaking_users(self) -> list[int]:
-        """Get list of user IDs currently speaking."""
-        return [user.user_id for user in self._user_states.values() if user.is_speaking]
+        """Get list of user IDs currently speaking (with staleness check)."""
+        now = time.perf_counter()
+        return [
+            user.user_id
+            for user in self._user_states.values()
+            if user.is_speaking and not self._is_user_stale(user, now)
+        ]
 
     def is_anyone_actively_speaking(self) -> bool:
         """Check if anyone is actively speaking RIGHT NOW (no debounce).
@@ -281,8 +306,15 @@ class SpeakingDetector:
         - Checking if someone is mid-sentence
 
         For "wait until conversation ends", use get_state() which applies debounce.
+
+        Includes staleness check: if no audio from user for 500ms,
+        they are considered not speaking (handles PTT release).
         """
-        return any(user.is_speaking for user in self._user_states.values())
+        now = time.perf_counter()
+        return any(
+            user.is_speaking and not self._is_user_stale(user, now)
+            for user in self._user_states.values()
+        )
 
     def get_user_state(self, user_id: int) -> Optional[UserAudioState]:
         """Get state for a specific user."""

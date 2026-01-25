@@ -649,6 +649,8 @@ class VoiceSession:
                         # DON'T continue - fall through to process the audio
 
                     listen_time = time.perf_counter() - listen_start
+                    # Stop the sink from buffering more audio
+                    self.sink.stop_listening()
                     logger.info(f"[TIMING] Speech captured in {listen_time:.2f}s")
                 except asyncio.CancelledError:
                     raise
