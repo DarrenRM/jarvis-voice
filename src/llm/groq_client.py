@@ -111,6 +111,12 @@ TOOLS = [
     }
 ]
 
+# Model sometimes hallucinates tool names - map them to real ones
+TOOL_ALIASES = {
+    "web_fetch_url": "fetch_url",
+    "web_fetch": "fetch_url",
+}
+
 
 class GroqClient(BaseLLMClient):
     """Groq LLM client with tool use support.
@@ -216,7 +222,7 @@ class GroqClient(BaseLLMClient):
             # Tool use loop (up to max_turns)
             # After 3 SEARCH tool calls, disable search but allow action tools
             MAX_SEARCH_CALLS = 3
-            SEARCH_TOOLS = {"web_search", "fetch_url"}  # These get limited
+            SEARCH_TOOLS = {"web_search", "fetch_url"} | set(TOOL_ALIASES.keys())  # These get limited
             ACTION_TOOLS = {"generate_image", "edit_image", "tag_user"}  # These don't
 
             for turn in range(self.max_turns):
@@ -310,6 +316,8 @@ class GroqClient(BaseLLMClient):
                     # Execute each tool and append results
                     for tool_call in response_message.tool_calls:
                         tool_name = tool_call.function.name
+                        # Normalize hallucinated tool names to real ones
+                        tool_name = TOOL_ALIASES.get(tool_name, tool_name)
 
                         # Track search tools toward limit
                         if tool_name in SEARCH_TOOLS:
@@ -447,6 +455,8 @@ class GroqClient(BaseLLMClient):
             Tool execution result as string
         """
         function_name = tool_call.function.name
+        # Normalize hallucinated tool names to real ones
+        function_name = TOOL_ALIASES.get(function_name, function_name)
 
         try:
             args = json.loads(tool_call.function.arguments)

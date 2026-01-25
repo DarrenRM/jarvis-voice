@@ -36,11 +36,12 @@ def resample_48k_stereo_to_16k_mono(audio_bytes: bytes) -> np.ndarray:
     mono = mono / 32768.0
 
     # Resample from 48kHz to 16kHz (factor of 3)
-    num_samples_out = len(mono) // 3
-    if num_samples_out == 0:
+    # Use resample_poly for integer ratios - 10-50x faster than FFT-based resample()
+    # This reduces GIL contention that causes audio pops when user talks during playback
+    if len(mono) < 3:
         return np.array([], dtype=np.float32)
 
-    resampled = signal.resample(mono, num_samples_out)
+    resampled = signal.resample_poly(mono, 1, 3)
 
     return resampled.astype(np.float32)
 
