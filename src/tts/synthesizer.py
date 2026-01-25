@@ -5,7 +5,7 @@ import base64
 import logging
 import os
 import time
-from typing import Optional
+from typing import AsyncIterator, Optional
 import numpy as np
 
 from ..audio import SAMPLE_RATE_TTS
@@ -187,6 +187,135 @@ class TTSSynthesizer:
             import traceback
             logger.debug(traceback.format_exc())
             return np.array([], dtype=np.float32)
+
+    async def synthesize_stream(self, text: str) -> AsyncIterator[np.ndarray]:
+        """Stream audio chunks as they arrive from Inworld.
+
+        Args:
+            text: Text to synthesize
+
+        Yields:
+            Audio chunks as float32 numpy arrays (24kHz mono)
+        """
+        if not text.strip():
+            return
+
+        if self._tts_type != "inworld":
+            logger.error("TTS not available - check INWORLD_API_KEY")
+            return
+
+        import aiohttp
+        import json
+
+        start_time = time.perf_counter()
+        first_chunk_time = None
+        total_chars = len(text)
+        chunks_yielded = 0
+
+        url = "https://api.inworld.ai/tts/v1/voice:stream"
+
+        auth_header = f"Basic {self.api_key}"
+        headers = {
+            "Authorization": auth_header,
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "text": text,
+            "voiceId": self.voice.capitalize(),
+            "modelId": self.model_name,
+            "audioConfig": {
+                "encoding": "LINEAR16",
+                "sampleRateHertz": self.sample_rate,
+                "speakingRate": 1.0,
+            },
+        }
+
+        logger.info(f"[TTS-STREAM] Starting: {text[:80]}...")
+
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(url, json=payload, headers=headers) as response:
+                    if response.status != 200:
+                        error_text = await response.text()
+                        logger.error(f"Inworld API error {response.status}: {error_text}")
+                        return
+
+                    # Stream line by line as chunks arrive
+                    buffer = ""
+                    async for chunk in response.content.iter_any():
+                        buffer += chunk.decode('utf-8', errors='ignore')
+
+                        # Process complete lines
+                        while '\n' in buffer:
+                            line, buffer = buffer.split('\n', 1)
+                            line = line.strip()
+                            if not line:
+                                continue
+
+                            try:
+                                chunk_data = json.loads(line)
+                                result = chunk_data.get("result", chunk_data)
+                                audio_base64 = result.get("audioContent", "") or result.get("audio", "")
+
+                                if audio_base64:
+                                    if first_chunk_time is None:
+                                        first_chunk_time = time.perf_counter()
+                                        ttfb = (first_chunk_time - start_time) * 1000
+                                        logger.info(f"[TTS-STREAM] First chunk in {ttfb:.0f}ms")
+
+                                    audio_bytes = base64.b64decode(audio_base64)
+                                    audio_chunk = self._decode_audio_bytes(audio_bytes)
+
+                                    if len(audio_chunk) > 0:
+                                        chunks_yielded += 1
+                                        yield audio_chunk
+
+                            except json.JSONDecodeError:
+                                continue
+
+                    # Process any remaining data in buffer
+                    if buffer.strip():
+                        try:
+                            chunk_data = json.loads(buffer.strip())
+                            result = chunk_data.get("result", chunk_data)
+                            audio_base64 = result.get("audioContent", "") or result.get("audio", "")
+                            if audio_base64:
+                                audio_bytes = base64.b64decode(audio_base64)
+                                audio_chunk = self._decode_audio_bytes(audio_bytes)
+                                if len(audio_chunk) > 0:
+                                    chunks_yielded += 1
+                                    yield audio_chunk
+                        except json.JSONDecodeError:
+                            pass
+
+            elapsed = time.perf_counter() - start_time
+            logger.info(f"[TTS-STREAM] Done: {total_chars} chars, {chunks_yielded} chunks in {elapsed:.2f}s")
+
+        except Exception as e:
+            logger.error(f"Inworld TTS stream error: {e}")
+            import traceback
+            logger.debug(traceback.format_exc())
+
+    def _decode_audio_bytes(self, audio_bytes: bytes) -> np.ndarray:
+        """Decode audio bytes to float32 numpy array."""
+        if audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
+            # MP3 audio - decode with pydub
+            from pydub import AudioSegment
+            import io
+            audio_seg = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
+            audio_seg = audio_seg.set_frame_rate(self.sample_rate).set_channels(1)
+            samples = np.array(audio_seg.get_array_of_samples(), dtype=np.int16)
+            return samples.astype(np.float32) / 32768.0
+        elif audio_bytes[:4] == b'RIFF':
+            # WAV audio - skip header
+            audio_bytes = audio_bytes[44:]
+            audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+            return audio_int16.astype(np.float32) / 32768.0
+        else:
+            # Assume raw PCM
+            audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
+            return audio_int16.astype(np.float32) / 32768.0
 
     def synthesize_sync(self, text: str) -> np.ndarray:
         """Synchronous synthesis.

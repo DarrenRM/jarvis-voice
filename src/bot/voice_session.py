@@ -806,12 +806,27 @@ class VoiceSession:
         logger.debug("[PLAYBACK] Consumer stopped")
 
     async def _synthesize_and_queue(self, text: str, sentence_num: int):
-        """Synthesize text and add to audio queue with ordering info."""
+        """Synthesize text using streaming and add to audio queue with ordering info."""
         try:
             t0 = time.perf_counter()
-            audio = await self.tts.synthesize(text)
+            chunks = []
+            first_chunk_time = None
+
+            # Use streaming synthesis - yields chunks as they arrive
+            async for chunk in self.tts.synthesize_stream(text):
+                if first_chunk_time is None:
+                    first_chunk_time = time.perf_counter()
+                    ttfb = (first_chunk_time - t0) * 1000
+                    logger.debug(f"[TTS] Sentence {sentence_num} first chunk in {ttfb:.0f}ms")
+                chunks.append(chunk)
+
             elapsed = time.perf_counter() - t0
-            logger.debug(f"[TTS] Sentence {sentence_num} synthesized in {elapsed:.2f}s")
+            if chunks:
+                audio = np.concatenate(chunks)
+                logger.debug(f"[TTS] Sentence {sentence_num}: {len(chunks)} chunks in {elapsed:.2f}s")
+            else:
+                audio = np.array([], dtype=np.float32)
+                logger.debug(f"[TTS] Sentence {sentence_num}: no audio in {elapsed:.2f}s")
 
             # Queue with sentence number for ordered playback
             await self._audio_queue.put((sentence_num, audio))
