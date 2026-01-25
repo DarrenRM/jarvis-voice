@@ -8,6 +8,7 @@ import asyncio
 import io
 import logging
 import random
+import re
 import time
 from typing import Optional
 
@@ -140,6 +141,7 @@ class VoiceSession:
         self._tts_tasks: list[asyncio.Task] = []
         self._thinking_task: Optional[asyncio.Task] = None
         self._thinking_synth_time: float = 0.0
+        self._ack_played: bool = False  # Track if ack played this session
 
         # Current speaker tracking
         self._current_speaker_id: Optional[int] = None
@@ -573,10 +575,12 @@ class VoiceSession:
                 listen_start = time.perf_counter()
                 self.state = "listening"
                 self._speech_started = False
+                self._ack_played = False  # Reset for new session
                 self.sink.start_listening()
                 logger.info("[STATE] Now LISTENING for user speech (extends while speaking, 30s max)")
 
-                # Play acknowledgment in background
+                # Play acknowledgment in background - waits for silence then plays
+                # _ack_played flag tracks if it played, so _handle_wake_word_only() can skip
                 ack_task = asyncio.create_task(self._play_ack())
 
                 # Wait for speech to end (with timeout)
@@ -618,13 +622,12 @@ class VoiceSession:
                             buffer_duration = len(self._pending_audio) / 16000 if self._pending_audio is not None else 0
                             speech_end_reason = f"PTT released / no audio packets (buffer={buffer_duration:.2f}s)"
                             logger.info(f"[SPEECH_END] {speech_end_reason}")
-                            # Capture speaker info (same logic as _on_speech_end)
+                            # Capture speaker info below
                             user_id = self.sink._last_user_id
                             self._current_speaker_id = user_id
                             self._current_speaker_activity = None
                             if user_id and user_id in self.USER_NAMES:
                                 self._current_speaker_name = self.USER_NAMES[user_id]
-                                # Still get activity even for mapped users
                                 if self.voice_client:
                                     try:
                                         member = self.voice_client.guild.get_member(user_id)
@@ -684,7 +687,7 @@ class VoiceSession:
                 except asyncio.CancelledError:
                     raise
 
-                # Cancel ack if still running
+                # Cancel ack if still running (may have already played, that's fine)
                 ack_task.cancel()
 
                 # Get the audio buffer
@@ -769,6 +772,7 @@ class VoiceSession:
                 await self._play_audio(ack_audio)
                 play_time = time.perf_counter() - t0
                 logger.info(f"[TIMING] Ack playback: {play_time:.2f}s")
+                self._ack_played = True  # Mark that ack was played
         except asyncio.CancelledError:
             logger.debug("Ack playback cancelled")
             # Stop any ongoing playback when cancelled
@@ -776,6 +780,84 @@ class VoiceSession:
                 self.voice_client.stop()
         except Exception as e:
             logger.warning(f"Failed to play acknowledgment: {e}")
+
+    async def _handle_wake_word_only(self):
+        """Handle case where user only said the wake word.
+
+        Plays acknowledgment (if not already played) and listens for follow-up question.
+        If user asks something, processes it. If silence, returns to idle.
+        """
+        try:
+            # If ack already played during the initial listening period,
+            # user already had 8+ seconds to respond - just return to idle
+            if self._ack_played:
+                logger.info("[WAKE-ONLY] Ack already played during listening, returning to idle")
+                self.state = "idle"
+                return
+
+            # Ack didn't play (e.g., PTT timeout was faster) - play it now
+            ack_phrase = random.choice(self.ACK_PHRASES)
+            logger.info(f"[WAKE-ONLY] Playing ack: '{ack_phrase}'")
+            ack_audio = await self.tts.synthesize(ack_phrase)
+            if len(ack_audio) > 0:
+                await self._play_audio(ack_audio)
+
+            # Re-enter listening for follow-up question
+            logger.info("[WAKE-ONLY] Listening for follow-up question...")
+            self.state = "listening"
+            self.sink.start_listening()
+            self._speech_end_event.clear()
+
+            # Wait for speech with shorter timeout (user already has our attention)
+            follow_up_timeout = 8.0  # 8 seconds to ask follow-up
+            deadline = time.perf_counter() + follow_up_timeout
+
+            while time.perf_counter() < deadline:
+                try:
+                    await asyncio.wait_for(
+                        self._speech_end_event.wait(),
+                        timeout=0.2
+                    )
+                    # VAD detected speech end
+                    break
+                except asyncio.TimeoutError:
+                    pass
+
+                # Extend deadline while speech is active
+                if self.sink.is_speech_active():
+                    new_deadline = time.perf_counter() + follow_up_timeout
+                    max_deadline = time.perf_counter() + 30.0
+                    if new_deadline > deadline and new_deadline <= max_deadline:
+                        deadline = new_deadline
+
+                # Check PTT timeout
+                if self.sink.check_audio_timeout():
+                    self._pending_audio = self.sink.get_audio_buffer()
+                    break
+            else:
+                # Timeout with no speech - return to idle
+                logger.info("[WAKE-ONLY] No follow-up question, returning to idle")
+                self.sink.stop_listening()
+                self.state = "idle"
+                return
+
+            # Got follow-up speech - process it
+            self.sink.stop_listening()
+            audio = self._pending_audio if self._pending_audio is not None else self.sink.get_audio_buffer()
+            self._pending_audio = None
+
+            if len(audio) < 1600:  # Less than 0.1s
+                logger.info("[WAKE-ONLY] Follow-up audio too short, returning to idle")
+                self.state = "idle"
+                return
+
+            # Process the follow-up (this will call _process_speech recursively)
+            self.state = "processing"
+            await self._process_speech(audio)
+
+        except Exception as e:
+            logger.error(f"[WAKE-ONLY] Error handling wake-word-only: {e}")
+            self.state = "idle"
 
     async def _play_thinking_phrase(self, phrase: str) -> None:
         """Play thinking phrase in background.
@@ -983,6 +1065,37 @@ class VoiceSession:
         if not text.strip():
             logger.info("No speech detected")
             return
+
+        # Strip wake word from transcription and check if that's all they said
+        # This handles users who say "Hey Jarvis" and wait for the ack before asking
+        # Pattern matches: "hey jarvis", "hey, jarvis", "a jarvis", "hey jarvis!" etc.
+        wake_pattern = re.compile(
+            r'^(hey[,\s]*jarvis|a[,\s]*jarvis)[,.\s!?]*',
+            re.IGNORECASE
+        )
+
+        text_stripped = text.strip()
+        match = wake_pattern.match(text_stripped)
+
+        if match:
+            # Remove the wake word from the beginning
+            text_stripped = text_stripped[match.end():].strip()
+            if text_stripped:
+                logger.info(f"[WAKE-STRIP] Stripped wake word, remaining: '{text_stripped}'")
+            else:
+                # User only said the wake word - play ack and wait for follow-up question
+                logger.info(f"[WAKE-ONLY] Transcript was just wake word: '{text.strip()}' - playing ack and listening for follow-up")
+                await self._handle_wake_word_only()
+                return
+
+        # If stripping left us with nothing meaningful, same as wake-word-only
+        if not text_stripped or len(text_stripped) < 3:
+            logger.info(f"[WAKE-ONLY] After stripping, no meaningful text remains: '{text_stripped}' - playing ack and listening for follow-up")
+            await self._handle_wake_word_only()
+            return
+
+        # Use the stripped text for the prompt
+        text = text_stripped
 
         # Include speaker name if known
         speaker = self._current_speaker_name
