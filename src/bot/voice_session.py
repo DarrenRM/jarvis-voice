@@ -147,6 +147,9 @@ class VoiceSession:
         self._current_speaker_name: Optional[str] = None
         self._current_speaker_activity: Optional[str] = None
 
+        # Greeting cooldowns (user_id -> last_greeting_timestamp)
+        self._greeting_cooldowns: dict[int, float] = {}
+
     @property
     def state(self) -> str:
         """Current session state."""
@@ -688,6 +691,95 @@ class VoiceSession:
         except Exception as e:
             logger.warning(f"[THINKING] Failed to play thinking phrase: {e}")
             self._thinking_synth_time = 0.0  # Fallback for timing log
+
+    async def greet_user(self, member: discord.Member) -> None:
+        """Greet a user who just joined the voice channel.
+
+        Only greets if:
+        - Greeting is enabled in settings
+        - Bot is idle (not listening/processing)
+        - User hasn't been greeted within cooldown period
+        - Silence is detected within timeout period
+
+        Args:
+            member: Discord member who joined
+        """
+        if not self.settings.greeting_enabled:
+            return
+
+        # Skip if bot is busy
+        if self.state != "idle":
+            logger.info(f"[GREETING] Skipping - bot is busy ({self.state})")
+            return
+
+        # Check cooldown (5-minute window by default)
+        now = time.time()
+        last_greeting = self._greeting_cooldowns.get(member.id, 0)
+        if now - last_greeting < self.settings.greeting_cooldown_seconds:
+            logger.info(f"[GREETING] Skipping {member.display_name} - cooldown active")
+            return
+
+        # Wait for silence (max 10 seconds by default, no debounce)
+        found_silence = await self._wait_for_silence(
+            max_wait=self.settings.greeting_timeout_seconds,
+            use_debounce=False,
+            poll_interval=0.1
+        )
+
+        if not found_silence:
+            logger.info(
+                f"[GREETING] Skipping {member.display_name} - "
+                f"no silence in {self.settings.greeting_timeout_seconds}s"
+            )
+            return
+
+        # Re-check state (might have changed during wait)
+        if self.state != "idle":
+            logger.info("[GREETING] Skipping - bot became busy during wait")
+            return
+
+        # Generate greeting via LLM
+        greeting = await self._generate_greeting(member.display_name)
+        if not greeting:
+            return
+
+        # Update cooldown
+        self._greeting_cooldowns[member.id] = now
+
+        # Synthesize and play
+        logger.info(f"[GREETING] Greeting {member.display_name}: {greeting}")
+        audio = await self.tts.synthesize(greeting)
+        if len(audio) > 0:
+            await self._play_audio(audio)
+
+    async def _generate_greeting(self, name: str) -> Optional[str]:
+        """Ask LLM to generate a short greeting for the user.
+
+        Uses chat() not quick_response() because quick_response() has a simplified
+        system prompt without the personality/roasts. chat() uses the full
+        _build_system_prompt() which includes roast info for known users.
+
+        Args:
+            name: Display name of user to greet
+
+        Returns:
+            Greeting text or None if generation failed
+        """
+        prompt = (
+            f"Generate a very short greeting (20 words max) for {name} "
+            f"who just joined the voice channel."
+        )
+
+        try:
+            # Use chat() to get full personality (roasts are in system prompt)
+            response = await self.llm.chat(prompt)
+            # Ensure it's short for TTS
+            if len(response) > 100:
+                response = response[:100].rsplit(' ', 1)[0]
+            return response.strip()
+        except Exception as e:
+            logger.error(f"[GREETING] LLM error: {e}")
+            return None
 
     async def _play_audio(self, audio: np.ndarray):
         """Play audio through Discord voice.

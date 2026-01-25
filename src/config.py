@@ -71,6 +71,11 @@ class Settings(BaseSettings):
     # Speaker Isolation (filter audio from non-wake-word speakers)
     speaker_isolation_enabled: bool = Field(default=True, alias="SPEAKER_ISOLATION_ENABLED")
 
+    # Voice Channel Greetings
+    greeting_enabled: bool = Field(default=True, alias="GREETING_ENABLED")
+    greeting_timeout_seconds: float = Field(default=10.0, alias="GREETING_TIMEOUT_SECONDS")
+    greeting_cooldown_seconds: float = Field(default=300.0, alias="GREETING_COOLDOWN_SECONDS")  # 5 minutes
+
     # User name mappings (Discord user ID -> friendly name)
     # Can be set via USER_NAMES env var as JSON: '{"123456": "Name"}'
     user_names: Dict[int, str] = Field(

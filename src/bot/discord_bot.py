@@ -281,6 +281,12 @@ class ClaudeBot(commands.Bot):
                 self._session.sink.remove_user(member.id)
                 logger.debug(f"User {member.display_name} switched channels, cleaned up")
 
+        # User joined our channel - trigger greeting
+        if self._session.voice_client and after.channel == self._session.voice_client.channel:
+            # They just arrived (weren't in our channel before)
+            if before.channel != after.channel:
+                asyncio.create_task(self._session.greet_user(member))
+
     async def close(self) -> None:
         """Clean up on shutdown."""
         logger.info("Bot closing...")
