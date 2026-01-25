@@ -2,8 +2,10 @@
 
 import asyncio
 import logging
+import queue
 import signal
 import sys
+from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
 from typing import Optional
 
@@ -77,11 +79,17 @@ def preload_components(settings: Settings) -> dict:
     return components
 
 
-def setup_logging(level: str = "INFO") -> None:
-    """Configure logging to both console and file.
+def setup_logging(level: str = "INFO") -> QueueListener:
+    """Configure async logging to prevent event loop blocking.
+
+    Uses QueueHandler + QueueListener so log calls are non-blocking.
+    Actual I/O happens in a background thread.
 
     Args:
         level: Log level string
+
+    Returns:
+        QueueListener that must be stopped on shutdown
     """
     log_level = getattr(logging, level.upper())
     log_format = "%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
@@ -96,28 +104,41 @@ def setup_logging(level: str = "INFO") -> None:
     if log_file.exists():
         log_file.unlink()
 
-    # Create root logger
-    root_logger = logging.getLogger()
-    root_logger.setLevel(log_level)
-
-    # Console handler
+    # Create actual handlers (will run in background thread)
     console_handler = logging.StreamHandler()
     console_handler.setLevel(log_level)
     console_handler.setFormatter(logging.Formatter(log_format, date_format))
-    root_logger.addHandler(console_handler)
 
-    # File handler
     file_handler = logging.FileHandler(log_file, encoding="utf-8")
     file_handler.setLevel(log_level)
     file_handler.setFormatter(logging.Formatter(log_format, date_format))
-    root_logger.addHandler(file_handler)
+
+    # Queue-based handler (non-blocking - writes to memory queue)
+    log_queue: queue.Queue = queue.Queue(-1)  # Unbounded
+    queue_handler = QueueHandler(log_queue)
+
+    # Root logger only gets the non-blocking queue handler
+    root_logger = logging.getLogger()
+    root_logger.setLevel(log_level)
+    root_logger.addHandler(queue_handler)
+
+    # Background thread processes queue and writes to console/file
+    listener = QueueListener(
+        log_queue,
+        console_handler,
+        file_handler,
+        respect_handler_level=True,
+    )
+    listener.start()
 
     # Reduce noise from libraries
     logging.getLogger("discord").setLevel(logging.WARNING)
     logging.getLogger("urllib3").setLevel(logging.WARNING)
     logging.getLogger("httpx").setLevel(logging.WARNING)
 
-    logging.info(f"Logging to file: {log_file}")
+    logging.info(f"Logging to file: {log_file} (async queue-based)")
+
+    return listener
 
 
 def check_assets() -> None:
@@ -219,8 +240,8 @@ def main() -> None:
         print("Make sure .env file exists with DISCORD_TOKEN")
         sys.exit(1)
 
-    # Setup
-    setup_logging(settings.log_level)
+    # Setup async logging (returns listener for cleanup)
+    log_listener = setup_logging(settings.log_level)
     check_assets()
 
     logger.info("Starting Discord Voice Claude Bot")
@@ -245,6 +266,9 @@ def main() -> None:
     except Exception as e:
         logger.error(f"Bot error: {e}")
         sys.exit(1)
+    finally:
+        # Stop log listener to flush remaining messages
+        log_listener.stop()
 
 
 if __name__ == "__main__":
