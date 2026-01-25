@@ -63,6 +63,7 @@ def create_llm_client(
             firecrawl_url=settings.firecrawl_url,
             firecrawl_api_key=settings.firecrawl_api_key,
             max_results=settings.search_max_results,
+            max_content_length=settings.search_max_content_length,
         )
 
         # Create image service if API key is configured

@@ -365,6 +365,32 @@ class GroqClient(BaseLLMClient):
             # Handle model trying to call tools when tools are disabled
             elif "tool_use_failed" in error_str or "model called a tool" in error_str:
                 logger.warning(f"Model tried to call tool after tools disabled: {e}")
+                # Try to summarize gathered tool results instead of giving up
+                try:
+                    if messages:  # messages is always defined before exceptions can reach here
+                        tool_results = [m["content"] for m in messages if m.get("role") == "tool"]
+                        if tool_results:
+                            logger.info(f"Attempting summary of {len(tool_results)} tool results")
+                            summary_context = "\n\n".join(tool_results[-3:])  # Last 3 results
+                            summary_messages = [
+                                {"role": "system", "content": "You are a helpful voice assistant. Extract and answer the question from the search results. Be brief (1-2 sentences). Use emotion tags like [happy], [surprised]."},
+                                {"role": "user", "content": f"Based on this search data, answer: {message}\n\nSearch results:\n{summary_context[:6000]}"}
+                            ]
+                            response = await self._client.chat.completions.create(
+                                model=self.model,
+                                messages=summary_messages,
+                                max_tokens=self.max_tokens,
+                                stream=False,
+                            )
+                            summary = response.choices[0].message.content
+                            if summary:
+                                logger.info(f"Summary retry succeeded: {summary[:100]}...")
+                                yield summary
+                                self._conversation_history.append({"role": "assistant", "content": summary})
+                                return
+                except Exception as summary_error:
+                    logger.warning(f"Summary retry failed: {summary_error}")
+                # Fall back to graceful failure
                 yield self._build_graceful_failure()
             else:
                 logger.error(f"Groq API error: {e}")

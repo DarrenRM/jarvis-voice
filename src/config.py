@@ -56,6 +56,7 @@ class Settings(BaseSettings):
     firecrawl_url: str = Field(default="http://localhost:3002", alias="FIRECRAWL_URL")
     firecrawl_api_key: Optional[str] = Field(default=None, alias="FIRECRAWL_API_KEY")
     search_max_results: int = Field(default=3, alias="SEARCH_MAX_RESULTS")
+    search_max_content_length: int = Field(default=6000, alias="SEARCH_MAX_CONTENT_LENGTH")
 
     # Image Generation (Nano Banana / Gemini)
     nanobanana_api_key: Optional[str] = Field(default=None, alias="NANOBANANA_API_KEY")
