@@ -8,6 +8,8 @@ import time
 from typing import Optional
 import numpy as np
 
+from ..audio import SAMPLE_RATE_TTS
+
 logger = logging.getLogger(__name__)
 
 
@@ -45,7 +47,7 @@ class TTSSynthesizer:
         self.model_name = model
         self.device = device
         self.voice = voice.lower()
-        self.sample_rate = 24000  # Inworld output rate
+        self.sample_rate = SAMPLE_RATE_TTS  # Inworld output rate
 
         # Get API key
         self.api_key = api_key or os.environ.get("INWORLD_API_KEY")

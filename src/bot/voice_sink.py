@@ -11,7 +11,7 @@ from typing import TYPE_CHECKING, Callable, Optional
 import discord
 import numpy as np
 
-from ..audio import resample_48k_stereo_to_16k_mono
+from ..audio import resample_48k_stereo_to_16k_mono, SAMPLE_RATE_PROCESSING
 
 if TYPE_CHECKING:
     from ..detection import SpeakingDetector, SpeakingState
@@ -97,7 +97,7 @@ class StreamingSink(discord.sinks.Sink):
         # user says "hey jarvis what's the weather" without pausing
         # Each user gets their own buffer so we only use the wake word speaker's audio
         self._per_user_pre_buffers: dict[int, list[np.ndarray]] = {}
-        self._pre_buffer_max_samples = int(16000 * 1.5)  # 1.5s at 16kHz
+        self._pre_buffer_max_samples = int(SAMPLE_RATE_PROCESSING * 1.5)  # 1.5s at 16kHz
 
         # Speaker isolation: track filtered users for logging
         self._filtered_users: set[int] = set()
@@ -140,7 +140,7 @@ class StreamingSink(discord.sinks.Sink):
         # This captures the start of questions when user speaks continuously
         if self._last_user_id and self._last_user_id in self._per_user_pre_buffers:
             pre_buffer = self._per_user_pre_buffers[self._last_user_id]
-            pre_duration = sum(len(a) for a in pre_buffer) / 16000
+            pre_duration = sum(len(a) for a in pre_buffer) / SAMPLE_RATE_PROCESSING
             logger.info(f"[SINK] Including {pre_duration:.2f}s pre-buffer from user {self._last_user_id}")
             self._audio_buffer = pre_buffer.copy()
         else:
@@ -199,7 +199,7 @@ class StreamingSink(discord.sinks.Sink):
         silence_duration = time.perf_counter() - self._last_audio_time
         if silence_duration >= self._silence_timeout:
             buffer_samples = sum(len(a) for a in self._audio_buffer)
-            buffer_duration = buffer_samples / 16000
+            buffer_duration = buffer_samples / SAMPLE_RATE_PROCESSING
             logger.info(
                 f"[SINK] Audio stopped for {silence_duration:.2f}s "
                 f"(PTT released?), buffer={buffer_duration:.1f}s"
@@ -452,8 +452,8 @@ class StreamingSink(discord.sinks.Sink):
                 endpoint = self.vad.detect_endpoint(audio_16k)
 
                 # Log VAD state periodically (every ~1 second of audio = 16000 samples)
-                if buffer_samples % 16000 < len(audio_16k):
-                    buffer_sec = buffer_samples / 16000
+                if buffer_samples % SAMPLE_RATE_PROCESSING < len(audio_16k):
+                    buffer_sec = buffer_samples / SAMPLE_RATE_PROCESSING
                     logger.info(
                         f"[SINK VAD] buffer={buffer_sec:.1f}s, "
                         f"speech_started={self._speech_started}, "
@@ -465,7 +465,7 @@ class StreamingSink(discord.sinks.Sink):
                     logger.info("[SINK] VAD detected speech START")
 
                 elif endpoint == "end" and self._speech_started:
-                    buffer_duration = buffer_samples / 16000
+                    buffer_duration = buffer_samples / SAMPLE_RATE_PROCESSING
                     logger.info(f"[SPEECH_END] VAD silence threshold reached, buffer={buffer_duration:.2f}s")
                     # Reset state before callback
                     self._speech_started = False
@@ -479,7 +479,7 @@ class StreamingSink(discord.sinks.Sink):
 
                 # Force end if speech has been going too long (background noise protection)
                 elif self._speech_started:
-                    speech_duration = buffer_samples / 16000
+                    speech_duration = buffer_samples / SAMPLE_RATE_PROCESSING
                     if speech_duration >= self._max_speech_duration:
                         logger.warning(
                             f"[SPEECH_END] Max duration ({self._max_speech_duration}s) reached, "

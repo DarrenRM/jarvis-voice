@@ -12,7 +12,6 @@ from discord.ext import commands
 
 from ..config import Settings
 from ..detection import VAD, WakeWordDetector
-from ..stt import Transcriber
 from ..llm import BaseLLMClient
 from ..tts import TTSSynthesizer
 from .voice_session import VoiceSession
@@ -35,7 +34,6 @@ class ClaudeBot(commands.Bot):
         *,
         wake_detector: Optional[WakeWordDetector] = None,
         vad: Optional[VAD] = None,
-        transcriber: Optional[Transcriber] = None,
         llm: Optional[BaseLLMClient] = None,
         tts: Optional[TTSSynthesizer] = None,
     ):
@@ -45,7 +43,6 @@ class ClaudeBot(commands.Bot):
             settings: Application settings
             wake_detector: Shared WakeWordDetector (optional)
             vad: Shared VAD (optional)
-            transcriber: Shared Transcriber (optional)
             llm: Shared LLM client (Claude or Groq) (optional)
             tts: Shared TTSSynthesizer (optional)
         """
@@ -63,7 +60,6 @@ class ClaudeBot(commands.Bot):
         # Shared components (can be None, session will create if needed)
         self._wake_detector = wake_detector
         self._vad = vad
-        self._transcriber = transcriber
         self._llm = llm
         self._tts = tts
 
@@ -202,7 +198,6 @@ class ClaudeBot(commands.Bot):
             self._session = VoiceSession(
                 wake_detector=self._wake_detector,
                 vad=self._vad,
-                transcriber=self._transcriber,
                 tts=self._tts,
             )
 

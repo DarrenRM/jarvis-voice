@@ -44,10 +44,10 @@ GROQ_API_KEY=your_groq_api_key_here
 
 ### STT (Speech-to-Text)
 
+Uses Groq Whisper for fast, accurate transcription.
+
 ```bash
-STT_PROVIDER=groq      # groq (fast), deepgram, or whisper (offline)
-GROQ_API_KEY=...       # shared with LLM if using Groq for both
-DEEPGRAM_API_KEY=...   # if using Deepgram
+GROQ_API_KEY=your_groq_api_key_here  # Required for STT (shared with LLM if using Groq)
 ```
 
 ### TTS (Text-to-Speech)
@@ -152,7 +152,7 @@ User Speech
     |
 [VAD] - silero-vad (voice activity detection)
     |
-[STT] - Groq Whisper / Deepgram / local Whisper
+[STT] - Groq Whisper
     |
 [LLM] - Claude / Llama 3.3 70B / GPT-OSS 120B
     |     (with tools for Groq: web search, image generation)

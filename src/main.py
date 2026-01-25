@@ -15,8 +15,8 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.config import get_settings, Settings
 from src.bot import ClaudeBot
 from src.detection import VAD, WakeWordDetector
-from src.stt import Transcriber
 from src.tts import TTSSynthesizer
+from src.audio import SAMPLE_RATE_PROCESSING
 
 logger = logging.getLogger(__name__)
 
@@ -39,28 +39,20 @@ def preload_components(settings: Settings) -> dict:
     components["wake_detector"] = WakeWordDetector(
         model_name=settings.wake_word_model,
         threshold=settings.wake_word_confidence,
-        sample_rate=16000,
+        sample_rate=SAMPLE_RATE_PROCESSING,
     )
 
     # VAD
     logger.info("Loading VAD...")
     components["vad"] = VAD(
         threshold=settings.vad_sensitivity,
-        sample_rate=16000,
+        sample_rate=SAMPLE_RATE_PROCESSING,
         speech_pad_ms=settings.speech_pad_ms,
         min_silence_duration_ms=settings.min_silence_ms,
     )
 
-    # Transcriber (only load local Whisper if using it as STT provider)
-    if settings.stt_provider == "whisper":
-        logger.info("Loading local Whisper transcriber...")
-        components["transcriber"] = Transcriber(
-            model_size=settings.whisper_model,
-            device=settings.whisper_device,
-            compute_type=settings.whisper_compute_type,
-        )
-    else:
-        logger.info(f"Using {settings.stt_provider} for STT - skipping local Whisper model")
+    # STT uses Groq Whisper (initialized in VoiceSession when API key is available)
+    logger.info("STT will use Groq Whisper (initialized when joining voice)")
 
     # LLM client - NOT pre-created here because it needs the image callback
     # which requires access to voice_client (created in VoiceSession)
@@ -168,7 +160,6 @@ async def run_bot(settings: Settings, components: Optional[dict] = None) -> None
             settings,
             wake_detector=components.get("wake_detector"),
             vad=components.get("vad"),
-            transcriber=components.get("transcriber"),
             llm=components.get("llm"),
             tts=components.get("tts"),
         )
@@ -246,7 +237,7 @@ def main() -> None:
 
     logger.info("Starting Discord Voice Claude Bot")
     logger.info(f"Wake word: {settings.wake_word_model.replace('_', ' ')}")
-    logger.info(f"Whisper model: {settings.whisper_model}")
+    logger.info(f"STT: Groq Whisper")
     logger.info(f"TTS voice: {settings.tts_voice}")
 
     # Pre-load ML components for faster voice session startup

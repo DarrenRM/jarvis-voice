@@ -5,7 +5,6 @@ for a single Discord voice channel.
 """
 
 import asyncio
-import io
 import logging
 import random
 import re
@@ -15,11 +14,14 @@ from typing import Optional
 import discord
 import numpy as np
 
+from ..audio import SAMPLE_RATE_PROCESSING, SAMPLE_RATE_TTS
 from ..config import get_settings
 from ..detection import VAD, WakeWordDetector, SpeakingDetector
-from ..stt import Transcriber, DeepgramFluxClient, GroqWhisperClient
+from ..stt import GroqWhisperClient
 from ..llm import BaseLLMClient, create_llm_client
 from ..tts import TTSSynthesizer
+from .discord_service import DiscordService
+from .speaker_manager import SpeakerManager, SpeakerInfo
 from .voice_sink import StreamingSink
 from .voice_source import TTSAudioSource
 
@@ -34,15 +36,6 @@ class VoiceSession:
     - listening: Recording user speech
     - processing: Transcribing and generating response
     """
-
-    # Discord user ID -> real name mapping (for personalized responses)
-    USER_NAMES = {
-        100000000000000001: "Darren",
-        100000000000000003: "Pat",
-        100000000000000002: "Sam",
-        100000000000000004: "Jordan",
-        # Add more user IDs here
-    }
 
     # Acknowledgment phrases (played when wake word detected)
     ACK_PHRASES = [
@@ -85,9 +78,7 @@ class VoiceSession:
         wake_detector: Optional[WakeWordDetector] = None,
         vad: Optional[VAD] = None,
         speaking_detector: Optional[SpeakingDetector] = None,
-        transcriber: Optional[Transcriber] = None,
         groq_client: Optional[GroqWhisperClient] = None,
-        deepgram_client: Optional[DeepgramFluxClient] = None,
         llm: Optional[BaseLLMClient] = None,
         tts: Optional[TTSSynthesizer] = None,
     ):
@@ -99,21 +90,27 @@ class VoiceSession:
             wake_detector: WakeWordDetector instance
             vad: VAD instance
             speaking_detector: SpeakingDetector instance for multi-user awareness
-            transcriber: Transcriber instance (Whisper, fallback)
-            groq_client: GroqWhisperClient instance (primary STT)
-            deepgram_client: DeepgramFluxClient instance (alternative STT)
+            groq_client: GroqWhisperClient instance (STT)
             llm: LLM client instance (Claude or Groq)
             tts: TTSSynthesizer instance
         """
         self.settings = get_settings()
 
+        # Speaker identification
+        self.speaker_manager = SpeakerManager(self.settings.user_names)
+
+        # Discord operations (image posting, user tagging)
+        self.discord_service = DiscordService(
+            channel_name=self.settings.image_channel_name,
+            find_user_fn=self._find_user_by_name,
+            get_known_users_fn=lambda: list(self.settings.user_names.values()),
+        )
+
         # Components (will be initialized if not provided)
         self.wake_detector = wake_detector
         self.vad = vad
         self.speaking_detector = speaking_detector
-        self.transcriber = transcriber
         self.groq_client = groq_client
-        self.deepgram_client = deepgram_client
         self.llm = llm
         self.tts = tts
 
@@ -172,14 +169,14 @@ class VoiceSession:
             self.wake_detector = WakeWordDetector(
                 model_name=self.settings.wake_word_model,
                 threshold=self.settings.wake_word_confidence,
-                sample_rate=16000,  # We resample to 16kHz
+                sample_rate=SAMPLE_RATE_PROCESSING,  # We resample to 16kHz
             )
 
         if self.vad is None:
             logger.info("Loading VAD...")
             self.vad = VAD(
                 threshold=self.settings.vad_sensitivity,
-                sample_rate=16000,
+                sample_rate=SAMPLE_RATE_PROCESSING,
                 speech_pad_ms=self.settings.speech_pad_ms,
                 min_silence_duration_ms=self.settings.min_silence_ms,
             )
@@ -197,40 +194,15 @@ class VoiceSession:
                 excluded_user_ids=excluded_ids,
             )
 
-        # Initialize STT based on provider setting
-        stt_provider = self.settings.stt_provider.lower()
-
-        if stt_provider == "groq" and self.groq_client is None:
+        # Initialize Groq Whisper STT
+        if self.groq_client is None:
             if not self.settings.groq_api_key:
-                logger.warning("GROQ_API_KEY not set, falling back to Deepgram")
-                stt_provider = "deepgram"
-            else:
-                logger.info("Initializing Groq Whisper STT...")
-                self.groq_client = GroqWhisperClient(
-                    api_key=self.settings.groq_api_key,
-                    model="whisper-large-v3-turbo",
-                    language="en",
-                )
-
-        if stt_provider == "deepgram" and self.deepgram_client is None:
-            if not self.settings.deepgram_api_key:
-                logger.warning("DEEPGRAM_API_KEY not set, falling back to Whisper")
-                stt_provider = "whisper"
-            else:
-                logger.info("Initializing Deepgram Flux STT...")
-                self.deepgram_client = DeepgramFluxClient(
-                    api_key=self.settings.deepgram_api_key,
-                    sample_rate=16000,
-                    eot_threshold=0.7,  # End-of-turn confidence (0.5-0.9)
-                    eot_timeout_ms=2000,  # Max silence before forcing EOT
-                )
-
-        if stt_provider == "whisper" and self.transcriber is None:
-            logger.info("Loading Whisper...")
-            self.transcriber = Transcriber(
-                model_size=self.settings.whisper_model,
-                device=self.settings.whisper_device,
-                compute_type=self.settings.whisper_compute_type,
+                raise ValueError("GROQ_API_KEY is required for STT")
+            logger.info("Initializing Groq Whisper STT...")
+            self.groq_client = GroqWhisperClient(
+                api_key=self.settings.groq_api_key,
+                model="whisper-large-v3-turbo",
+                language="en",
             )
 
         if self.llm is None:
@@ -260,133 +232,18 @@ class VoiceSession:
             logger.warning(f"[CALLBACK] NOT setting event - state={self._state}, loop={self._loop is not None}")
 
     async def _post_image_to_discord(self, image_bytes: bytes, prompt: str, mime_type: str = "image/png") -> str:
-        """Post a generated image to Discord.
-
-        Args:
-            image_bytes: The generated image bytes
-            prompt: The prompt used to generate the image
-            mime_type: MIME type of the image (e.g., image/png, image/webp)
-
-        Returns:
-            Result message to send back to the LLM
-        """
-        # Map MIME type to file extension
-        mime_to_ext = {
-            "image/png": "png",
-            "image/jpeg": "jpg",
-            "image/webp": "webp",
-            "image/gif": "gif",
-        }
-        extension = mime_to_ext.get(mime_type, "png")
-        filename = f"generated.{extension}"
-
-        logger.info(f"[IMAGE] _post_image_to_discord called with {len(image_bytes)} bytes, mime_type={mime_type}, filename={filename}")
-
-        if not self.voice_client or not self.voice_client.guild:
-            logger.warning("[IMAGE] Cannot post image - no voice client or guild")
-            return "Could not post image - not connected to a server"
-
-        channel_name = self.settings.image_channel_name
-        logger.info(f"[IMAGE] Looking for channel: #{channel_name}")
-
-        # List available channels for debugging
-        available_channels = [ch.name for ch in self.voice_client.guild.text_channels]
-        logger.info(f"[IMAGE] Available text channels: {available_channels}")
-
-        channel = discord.utils.get(
-            self.voice_client.guild.text_channels,
-            name=channel_name,
-        )
-
-        if not channel:
-            logger.warning(f"[IMAGE] Could not find channel #{channel_name}")
-            return f"Could not find channel #{channel_name} to post the image. Available channels: {available_channels}"
-
-        # Check bot permissions
-        bot_member = channel.guild.me
-        perms = channel.permissions_for(bot_member)
-        logger.info(f"[IMAGE] Bot permissions in #{channel_name}: send_messages={perms.send_messages}, attach_files={perms.attach_files}")
-        if not perms.attach_files:
-            return f"Bot lacks 'Attach Files' permission in #{channel_name}"
-
+        """Post a generated image to Discord. Delegates to DiscordService."""
         requester = self._current_speaker_name or "Someone"
-
-        try:
-            logger.info(f"[IMAGE] Sending to #{channel_name}...")
-            await channel.send(
-                content=f"*{requester}'s requested image:*",
-                file=discord.File(io.BytesIO(image_bytes), filename=filename),
-            )
-            logger.info(f"[IMAGE] Posted generated image to #{channel_name}")
-            return f"Done! I've posted the image to #{channel_name}."
-        except discord.errors.DiscordServerError as e:
-            logger.warning(f"[IMAGE] Discord server error: {e}")
-            return "Discord is blocking image uploads at the moment."
-        except Exception as e:
-            logger.error(f"[IMAGE] Failed to post image: {e}", exc_info=True)
-            return f"Failed to post image: {str(e)}"
+        return await self.discord_service.post_image(
+            self.voice_client, image_bytes, requester, mime_type
+        )
 
     async def _post_tag_to_discord(self, target_name: str, message: str) -> str:
-        """Post a tagged message to Discord.
-
-        Args:
-            target_name: Name of user to tag (fuzzy matched)
-            message: Message content
-
-        Returns:
-            Result message to send back to the LLM
-        """
-        logger.info(f"[TAG] _post_tag_to_discord called: target={target_name}, message={message[:50]}...")
-
-        if not self.voice_client or not self.voice_client.guild:
-            logger.warning("[TAG] Cannot tag user - no voice client or guild")
-            return "Could not tag user - not connected to a server"
-
-        result = self._find_user_by_name(target_name)
-        if not result:
-            known = list(self.USER_NAMES.values())
-            logger.warning(f"[TAG] Could not find user '{target_name}'. Known: {known}")
-            return f"Could not find user '{target_name}'. Known users: {', '.join(known)}"
-
-        target_id, target_display_name = result
-        logger.info(f"[TAG] Found user: {target_display_name} (ID: {target_id})")
-
-        channel_name = self.settings.image_channel_name
-        logger.info(f"[TAG] Looking for channel: #{channel_name}")
-
-        channel = discord.utils.get(
-            self.voice_client.guild.text_channels,
-            name=channel_name,
-        )
-
-        if not channel:
-            available = [ch.name for ch in self.voice_client.guild.text_channels]
-            logger.warning(f"[TAG] Could not find channel #{channel_name}. Available: {available}")
-            return f"Could not find channel #{channel_name}"
-
+        """Post a tagged message to Discord. Delegates to DiscordService."""
         requester = self._current_speaker_name or "Someone"
-        # Use <@user_id> format for mention - works even if user is offline/uncached
-        formatted = f"<@{target_id}> - {requester} says: {message}"
-
-        try:
-            await channel.send(formatted)
-            logger.info(f"[TAG] Posted tag message to #{channel_name}")
-            return f"Done! I've tagged {target_display_name} in {channel_name} chat."
-        except Exception as e:
-            logger.error(f"[TAG] Failed to post tag: {e}", exc_info=True)
-            return f"Failed to send message: {str(e)}"
-
-    def _get_member_activity(self, member: discord.Member) -> Optional[str]:
-        """Get the member's current activity (game, etc.)."""
-        if not member or not member.activities:
-            return None
-        for activity in member.activities:
-            if isinstance(activity, discord.Game):
-                return f"Playing {activity.name}"
-            elif isinstance(activity, discord.Activity):
-                # activity.type is an enum (playing, streaming, listening, watching, etc.)
-                return f"{activity.type.name.title()} {activity.name}"
-        return None
+        return await self.discord_service.tag_user(
+            self.voice_client, target_name, message, requester
+        )
 
     def _find_user_by_name(self, name: str) -> Optional[tuple[int, str]]:
         """Find Discord user by fuzzy name match.
@@ -397,57 +254,31 @@ class VoiceSession:
         Returns:
             Tuple of (user_id, display_name) if found, None otherwise
         """
-        if not self.voice_client or not self.voice_client.guild:
-            return None
+        guild = self.voice_client.guild if self.voice_client else None
+        return self.speaker_manager.find_user_by_name(name, guild)
 
-        guild = self.voice_client.guild
-        name_lower = name.lower().strip()
+    def _resolve_current_speaker(self, user_id: Optional[int]) -> None:
+        """Resolve speaker info from user ID using SpeakerManager.
 
-        # Exact match in USER_NAMES (works even if user is offline)
-        for user_id, friendly_name in self.USER_NAMES.items():
-            if friendly_name.lower() == name_lower:
-                return (user_id, friendly_name)
-
-        # Partial match (e.g., "sa" matches "Sam")
-        for user_id, friendly_name in self.USER_NAMES.items():
-            if name_lower in friendly_name.lower():
-                return (user_id, friendly_name)
-
-        # Fallback: search cached guild members by display name
-        for member in guild.members:
-            if name_lower in member.display_name.lower():
-                return (member.id, member.display_name)
-
-        return None
+        Sets:
+            self._current_speaker_id
+            self._current_speaker_name
+            self._current_speaker_activity
+        """
+        guild = self.voice_client.guild if self.voice_client else None
+        info = self.speaker_manager.resolve_speaker(user_id, guild)
+        self._current_speaker_id = info.user_id
+        self._current_speaker_name = info.name
+        self._current_speaker_activity = info.activity
 
     def _on_speech_end(self, audio: np.ndarray, user_id: Optional[int] = None):
         """Callback when speech ends (from sink thread)."""
-        audio_duration = len(audio) / 16000 if audio is not None else 0
+        audio_duration = len(audio) / SAMPLE_RATE_PROCESSING if audio is not None else 0
         logger.info(f"[CALLBACK] _on_speech_end called with {audio_duration:.2f}s audio from user {user_id}, state={self._state}")
         if self._state == "listening" and self._loop:
             self._pending_audio = audio
-            # Store speaker info
-            self._current_speaker_id = user_id
-            self._current_speaker_activity = None
-            if user_id and user_id in self.USER_NAMES:
-                self._current_speaker_name = self.USER_NAMES[user_id]
-                # Still get activity even for mapped users
-                if self.voice_client:
-                    try:
-                        member = self.voice_client.guild.get_member(user_id)
-                        self._current_speaker_activity = self._get_member_activity(member)
-                    except Exception:
-                        pass
-            elif user_id and self.voice_client:
-                # Fallback to Discord display name for unmapped users
-                try:
-                    member = self.voice_client.guild.get_member(user_id)
-                    self._current_speaker_name = member.display_name if member else None
-                    self._current_speaker_activity = self._get_member_activity(member)
-                except Exception:
-                    self._current_speaker_name = None
-            else:
-                self._current_speaker_name = None
+            # Resolve speaker info
+            self._resolve_current_speaker(user_id)
             logger.info(f"[CALLBACK] Speaker: {self._current_speaker_name} (ID: {user_id}), Activity: {self._current_speaker_activity}")
             logger.info("[CALLBACK] Setting speech_end_event")
             self._loop.call_soon_threadsafe(self._speech_end_event.set)
@@ -602,7 +433,7 @@ class VoiceSession:
                                 timeout=0.2  # Poll every 200ms
                             )
                             # Event was set - speech ended via VAD
-                            buffer_duration = len(self.sink.get_audio_buffer()) / 16000
+                            buffer_duration = len(self.sink.get_audio_buffer()) / SAMPLE_RATE_PROCESSING
                             speech_end_reason = f"VAD detected silence (buffer={buffer_duration:.2f}s)"
                             logger.info(f"[SPEECH_END] {speech_end_reason}")
                             break
@@ -619,37 +450,18 @@ class VoiceSession:
                         # Check if audio stopped (push-to-talk released)
                         if self.sink.check_audio_timeout():
                             self._pending_audio = self.sink.get_audio_buffer()
-                            buffer_duration = len(self._pending_audio) / 16000 if self._pending_audio is not None else 0
+                            buffer_duration = len(self._pending_audio) / SAMPLE_RATE_PROCESSING if self._pending_audio is not None else 0
                             speech_end_reason = f"PTT released / no audio packets (buffer={buffer_duration:.2f}s)"
                             logger.info(f"[SPEECH_END] {speech_end_reason}")
-                            # Capture speaker info below
-                            user_id = self.sink._last_user_id
-                            self._current_speaker_id = user_id
-                            self._current_speaker_activity = None
-                            if user_id and user_id in self.USER_NAMES:
-                                self._current_speaker_name = self.USER_NAMES[user_id]
-                                if self.voice_client:
-                                    try:
-                                        member = self.voice_client.guild.get_member(user_id)
-                                        self._current_speaker_activity = self._get_member_activity(member)
-                                    except Exception:
-                                        pass
-                            elif user_id and self.voice_client:
-                                try:
-                                    member = self.voice_client.guild.get_member(user_id)
-                                    self._current_speaker_name = member.display_name if member else None
-                                    self._current_speaker_activity = self._get_member_activity(member)
-                                except Exception:
-                                    self._current_speaker_name = None
-                            else:
-                                self._current_speaker_name = None
-                            logger.info(f"[STATE] Speaker: {self._current_speaker_name} (ID: {user_id}), Activity: {self._current_speaker_activity}")
+                            # Resolve speaker info
+                            self._resolve_current_speaker(self.sink._last_user_id)
+                            logger.info(f"[STATE] Speaker: {self._current_speaker_name} (ID: {self._current_speaker_id}), Activity: {self._current_speaker_activity}")
                             break
                     else:
                         # Timeout - but still process any captured audio (don't abandon)
                         listen_time = time.perf_counter() - listen_start
                         buffer = self.sink.get_audio_buffer()
-                        buffer_duration = len(buffer) / 16000 if len(buffer) > 0 else 0
+                        buffer_duration = len(buffer) / SAMPLE_RATE_PROCESSING if len(buffer) > 0 else 0
                         logger.warning(
                             f"[STATE] TIMEOUT after {listen_time:.2f}s - "
                             f"processing {buffer_duration:.2f}s of captured audio"
@@ -657,27 +469,8 @@ class VoiceSession:
                         ack_task.cancel()
                         # Capture pending audio before falling through
                         self._pending_audio = buffer
-                        # Capture speaker info (same as PTT path)
-                        user_id = self.sink._last_user_id
-                        self._current_speaker_id = user_id
-                        self._current_speaker_activity = None
-                        if user_id and user_id in self.USER_NAMES:
-                            self._current_speaker_name = self.USER_NAMES[user_id]
-                            if self.voice_client:
-                                try:
-                                    member = self.voice_client.guild.get_member(user_id)
-                                    self._current_speaker_activity = self._get_member_activity(member)
-                                except Exception:
-                                    pass
-                        elif user_id and self.voice_client:
-                            try:
-                                member = self.voice_client.guild.get_member(user_id)
-                                self._current_speaker_name = member.display_name if member else None
-                                self._current_speaker_activity = self._get_member_activity(member)
-                            except Exception:
-                                self._current_speaker_name = None
-                        else:
-                            self._current_speaker_name = None
+                        # Resolve speaker info
+                        self._resolve_current_speaker(self.sink._last_user_id)
                         # DON'T continue - fall through to process the audio
 
                     listen_time = time.perf_counter() - listen_start
@@ -903,7 +696,7 @@ class VoiceSession:
             logger.debug("[TIMING] _play_audio: no audio or no voice client")
             return
 
-        audio_duration = len(audio) / 24000  # 24kHz
+        audio_duration = len(audio) / SAMPLE_RATE_TTS  # 24kHz
         logger.debug(f"[TIMING] _play_audio: {audio_duration:.2f}s of audio")
 
         # Create audio source
@@ -1024,8 +817,61 @@ class VoiceSession:
             # Queue empty audio to not block ordering
             await self._audio_queue.put((sentence_num, np.array([], dtype=np.float32)))
 
+    # Wake word pattern for stripping from transcription
+    _WAKE_PATTERN = re.compile(
+        r'^(hey[,\s]*jarvis|a[,\s]*jarvis)[,.\s!?]*',
+        re.IGNORECASE
+    )
+
+    def _strip_wake_word(self, text: str) -> Optional[str]:
+        """Strip wake word from transcription.
+
+        Args:
+            text: Raw transcription text.
+
+        Returns:
+            Text with wake word stripped, or None if only wake word was said.
+        """
+        text_stripped = text.strip()
+        match = self._WAKE_PATTERN.match(text_stripped)
+
+        if match:
+            text_stripped = text_stripped[match.end():].strip()
+            if text_stripped:
+                logger.info(f"[WAKE-STRIP] Stripped wake word, remaining: '{text_stripped}'")
+            else:
+                return None
+
+        # If stripping left nothing meaningful
+        if not text_stripped or len(text_stripped) < 3:
+            return None
+
+        return text_stripped
+
+    def _build_prompt(self, text: str) -> str:
+        """Build LLM prompt with speaker context.
+
+        Args:
+            text: User's transcribed text.
+
+        Returns:
+            Prompt string with speaker info if known.
+        """
+        speaker = self._current_speaker_name
+        activity = self._current_speaker_activity
+
+        if speaker:
+            logger.info(f"{speaker} said: {text}" + (f" (Activity: {activity})" if activity else ""))
+            if activity:
+                return f"[{speaker} speaking, currently {activity}]: {text}"
+            else:
+                return f"[{speaker} speaking]: {text}"
+        else:
+            logger.info(f"User said: {text}")
+            return text
+
     async def _process_speech(self, audio: np.ndarray):
-        """Process captured speech.
+        """Process captured speech: transcribe -> LLM -> stream TTS.
 
         Args:
             audio: Audio as float32 numpy array (16kHz mono)
@@ -1034,30 +880,13 @@ class VoiceSession:
         total_start = time.perf_counter()
 
         # Log audio stats
-        audio_duration = len(audio) / 16000  # 16kHz sample rate
+        audio_duration = len(audio) / SAMPLE_RATE_PROCESSING
         logger.info(f"[TIMING] Audio captured: {audio_duration:.2f}s ({len(audio)} samples)")
 
-        # Transcribe - use Deepgram Flux if available, otherwise Whisper
+        # Transcribe with Groq Whisper
         t0 = time.perf_counter()
         logger.info("[TIMING] Starting transcription...")
-
-        if self.groq_client is not None:
-            logger.info("[STT] Using Groq Whisper")
-            text = await self.groq_client.transcribe_audio(audio)
-        elif self.deepgram_client is not None:
-            logger.info("[STT] Using Deepgram Flux")
-            text = await self.deepgram_client.transcribe_audio(audio)
-        elif self.transcriber is not None:
-            logger.info("[STT] Using Whisper")
-            loop = asyncio.get_running_loop()
-            text = await loop.run_in_executor(
-                None,
-                self.transcriber.transcribe,
-                audio,
-            )
-        else:
-            logger.error("No STT provider available!")
-            return
+        text = await self.groq_client.transcribe_audio(audio)
 
         transcribe_time = time.perf_counter() - t0
         logger.info(f"[TIMING] Transcription: {transcribe_time:.2f}s")
@@ -1066,50 +895,15 @@ class VoiceSession:
             logger.info("No speech detected")
             return
 
-        # Strip wake word from transcription and check if that's all they said
-        # This handles users who say "Hey Jarvis" and wait for the ack before asking
-        # Pattern matches: "hey jarvis", "hey, jarvis", "a jarvis", "hey jarvis!" etc.
-        wake_pattern = re.compile(
-            r'^(hey[,\s]*jarvis|a[,\s]*jarvis)[,.\s!?]*',
-            re.IGNORECASE
-        )
-
-        text_stripped = text.strip()
-        match = wake_pattern.match(text_stripped)
-
-        if match:
-            # Remove the wake word from the beginning
-            text_stripped = text_stripped[match.end():].strip()
-            if text_stripped:
-                logger.info(f"[WAKE-STRIP] Stripped wake word, remaining: '{text_stripped}'")
-            else:
-                # User only said the wake word - play ack and wait for follow-up question
-                logger.info(f"[WAKE-ONLY] Transcript was just wake word: '{text.strip()}' - playing ack and listening for follow-up")
-                await self._handle_wake_word_only()
-                return
-
-        # If stripping left us with nothing meaningful, same as wake-word-only
-        if not text_stripped or len(text_stripped) < 3:
-            logger.info(f"[WAKE-ONLY] After stripping, no meaningful text remains: '{text_stripped}' - playing ack and listening for follow-up")
+        # Strip wake word
+        text = self._strip_wake_word(text)
+        if text is None:
+            logger.info("[WAKE-ONLY] User only said wake word - playing ack and listening for follow-up")
             await self._handle_wake_word_only()
             return
 
-        # Use the stripped text for the prompt
-        text = text_stripped
-
-        # Include speaker name if known
-        speaker = self._current_speaker_name
-        activity = self._current_speaker_activity
-        if speaker:
-            logger.info(f"{speaker} said: {text}" + (f" (Activity: {activity})" if activity else ""))
-            # Prepend speaker info and activity so Claude knows who's talking and what they're doing
-            if activity:
-                prompt_text = f"[{speaker} speaking, currently {activity}]: {text}"
-            else:
-                prompt_text = f"[{speaker} speaking]: {text}"
-        else:
-            logger.info(f"User said: {text}")
-            prompt_text = text
+        # Build prompt with speaker context
+        prompt_text = self._build_prompt(text)
 
         # Play thinking phrase (personalized if we know who's speaking)
         # Skip if someone is still talking (they might be in conversation)
@@ -1124,8 +918,8 @@ class VoiceSession:
         self._thinking_synth_time = 0.0
 
         if should_play_thinking:
-            if speaker:
-                phrase = random.choice(self.THINKING_PHRASES_PERSONAL).format(name=speaker)
+            if self._current_speaker_name:
+                phrase = random.choice(self.THINKING_PHRASES_PERSONAL).format(name=self._current_speaker_name)
             else:
                 phrase = random.choice(self.THINKING_PHRASES)
 

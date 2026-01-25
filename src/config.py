@@ -2,7 +2,7 @@
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field
-from typing import Optional
+from typing import Dict, Optional
 
 
 class Settings(BaseSettings):
@@ -28,14 +28,8 @@ class Settings(BaseSettings):
     wake_word_model: str = Field(default="hey_jarvis", alias="WAKE_WORD_MODEL")
     wake_word_phrase: str = Field(default="hey claude", alias="WAKE_WORD_PHRASE")
 
-    # STT - Groq Whisper (primary), Deepgram Flux, or local Whisper (fallback)
+    # STT - Groq Whisper only
     groq_api_key: Optional[str] = Field(default=None, alias="GROQ_API_KEY")
-    deepgram_api_key: Optional[str] = Field(default=None, alias="DEEPGRAM_API_KEY")
-    stt_provider: str = Field(default="groq", alias="STT_PROVIDER")  # groq, deepgram, or whisper
-    # Whisper settings (fallback)
-    whisper_model: str = Field(default="medium", alias="WHISPER_MODEL")
-    whisper_device: str = Field(default="cuda", alias="WHISPER_DEVICE")
-    whisper_compute_type: str = Field(default="float16", alias="WHISPER_COMPUTE_TYPE")
 
     # TTS (Inworld)
     inworld_api_key: Optional[str] = Field(default=None, alias="INWORLD_API_KEY")
@@ -76,6 +70,18 @@ class Settings(BaseSettings):
 
     # Speaker Isolation (filter audio from non-wake-word speakers)
     speaker_isolation_enabled: bool = Field(default=True, alias="SPEAKER_ISOLATION_ENABLED")
+
+    # User name mappings (Discord user ID -> friendly name)
+    # Can be set via USER_NAMES env var as JSON: '{"123456": "Name"}'
+    user_names: Dict[int, str] = Field(
+        default={
+            100000000000000001: "Darren",
+            100000000000000003: "Pat",
+            100000000000000002: "Sam",
+            100000000000000004: "Jordan",
+        },
+        alias="USER_NAMES"
+    )
 
     # Audio
     sample_rate: int = Field(default=16000, alias="SAMPLE_RATE")
