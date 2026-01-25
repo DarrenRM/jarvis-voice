@@ -75,6 +75,8 @@ class StreamingSink(discord.sinks.Sink):
 
         # Track user for logging
         self._last_user_id = None
+        self._per_user_last_seen: dict[int, float] = {}  # Track when each user last sent audio
+        self._user_log_cooldown = 5.0  # Only log "receiving from user" after 5s of silence from them
 
         # Timing stats
         self._write_count = 0
@@ -333,9 +335,13 @@ class StreamingSink(discord.sinks.Sink):
         # Only update user ID when idle - this locks in the wake word speaker
         # and prevents someone else's noise from stealing attribution
         user_id = user if isinstance(user, int) else getattr(user, "id", user)
-        if self._state == "idle" and self._last_user_id != user_id:
+        if self._state == "idle":
+            # Only log if we haven't heard from this user recently (prevents spam with multiple users)
+            last_seen = self._per_user_last_seen.get(user_id, 0)
+            if now - last_seen >= self._user_log_cooldown:
+                logger.info(f"[SINK] Receiving audio from user: {user_id}")
+            self._per_user_last_seen[user_id] = now
             self._last_user_id = user_id
-            logger.info(f"[SINK] Receiving audio from user: {user_id}")
 
         # Handle None or empty data
         if not data:
