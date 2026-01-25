@@ -239,6 +239,16 @@ class StreamingSink(discord.sinks.Sink):
             return False
 
         gap = time.perf_counter() - self._last_audio_time
+
+        # Poll speaking detector during gaps to trigger staleness check
+        # This ensures state changes to SILENCE even when no audio arrives
+        if gap >= 0.5 and self.speaking_detector:
+            state = self.speaking_detector.get_state()
+            if state != self._last_speaking_state:
+                self._last_speaking_state = state
+                if self._on_speaking_change:
+                    self._on_speaking_change(state)
+
         # Only check if there's been a significant gap (250ms+)
         # Allow up to 5 attempts (2.5s of silence total) before giving up
         if gap >= 0.25 and self.wake_detector:
