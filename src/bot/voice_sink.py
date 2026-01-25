@@ -6,12 +6,15 @@ for wake word detection and VAD, rather than waiting for recording to stop.
 
 import logging
 import time
-from typing import Callable, Optional
+from typing import TYPE_CHECKING, Callable, Optional
 
 import discord
 import numpy as np
 
 from ..audio import resample_48k_stereo_to_16k_mono
+
+if TYPE_CHECKING:
+    from ..detection import SpeakingDetector, SpeakingState
 
 logger = logging.getLogger(__name__)
 
@@ -32,8 +35,10 @@ class StreamingSink(discord.sinks.Sink):
         *,
         wake_detector=None,
         vad=None,
+        speaking_detector: Optional["SpeakingDetector"] = None,
         on_wake_word: Optional[Callable[[], None]] = None,
         on_speech_end: Optional[Callable[[np.ndarray, Optional[int]], None]] = None,
+        on_speaking_change: Optional[Callable[["SpeakingState"], None]] = None,
         max_speech_duration: float = 30.0,
         filters=None,
     ):
@@ -42,8 +47,10 @@ class StreamingSink(discord.sinks.Sink):
         Args:
             wake_detector: WakeWordDetector instance
             vad: VAD instance
+            speaking_detector: Optional SpeakingDetector for multi-user speech detection
             on_wake_word: Callback when wake word detected
             on_speech_end: Callback when speech ends, receives (audio buffer, user_id)
+            on_speaking_change: Callback when channel speaking state changes
             max_speech_duration: Max seconds of speech before forced end (default 30s)
             filters: Optional pycord audio filters
         """
@@ -51,8 +58,11 @@ class StreamingSink(discord.sinks.Sink):
 
         self.wake_detector = wake_detector
         self.vad = vad
+        self.speaking_detector = speaking_detector
         self._on_wake_word = on_wake_word
         self._on_speech_end = on_speech_end
+        self._on_speaking_change = on_speaking_change
+        self._last_speaking_state: Optional["SpeakingState"] = None
 
         # State
         self._state = "idle"  # idle, listening
@@ -168,6 +178,25 @@ class StreamingSink(discord.sinks.Sink):
             )
             self._audio_timeout_detected = True  # Commit to this decision
             return True
+        return False
+
+    def is_speech_active(self) -> bool:
+        """Check if VAD has detected active speech.
+
+        Used by session to extend timeout while user is speaking.
+        """
+        return self._speech_started and self._state == "listening"
+
+    def is_anyone_speaking(self) -> bool:
+        """Check if anyone in the channel is currently speaking.
+
+        Uses the speaking detector if available, otherwise returns False.
+        This is useful for deciding whether to hold off on bot responses.
+        """
+        if self.speaking_detector:
+            from ..detection import SpeakingState
+
+            return self.speaking_detector.get_state() == SpeakingState.SOMEONE_SPEAKING
         return False
 
     def check_idle_audio_gap(self) -> bool:
@@ -294,6 +323,14 @@ class StreamingSink(discord.sinks.Sink):
         if len(audio_16k) == 0:
             return
 
+        # Process through speaking detector (tracks all users' speech state)
+        if self.speaking_detector:
+            state = self.speaking_detector.process_audio(audio_16k, user_id)
+            if state != self._last_speaking_state:
+                self._last_speaking_state = state
+                if self._on_speaking_change:
+                    self._on_speaking_change(state)
+
         # === DIAGNOSTIC LOGGING (both states) ===
         chunk_size = len(data) if data else 0
         gap_ms = gap_since_last * 1000
@@ -381,3 +418,5 @@ class StreamingSink(discord.sinks.Sink):
         logger.debug("StreamingSink cleanup")
         self._audio_buffer = []
         self._state = "idle"
+        if self.speaking_detector:
+            self.speaking_detector.reset()

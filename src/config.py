@@ -68,6 +68,11 @@ class Settings(BaseSettings):
     max_question_duration: float = Field(default=30.0, alias="MAX_QUESTION_DURATION")
     claude_timeout: float = Field(default=30.0, alias="CLAUDE_TIMEOUT")
 
+    # Speaking Detection (multi-user awareness)
+    speaking_detection_enabled: bool = Field(default=False, alias="SPEAKING_DETECTION_ENABLED")
+    speaking_energy_threshold: float = Field(default=0.01, alias="SPEAKING_ENERGY_THRESHOLD")
+    speaking_silence_debounce_ms: int = Field(default=3000, alias="SPEAKING_SILENCE_DEBOUNCE_MS")
+
     # Audio
     sample_rate: int = Field(default=16000, alias="SAMPLE_RATE")
     chunk_duration_ms: int = Field(default=30, alias="CHUNK_DURATION_MS")

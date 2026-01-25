@@ -528,7 +528,7 @@ class VoiceSession:
                 self.state = "listening"
                 self._speech_started = False
                 self.sink.start_listening()
-                logger.info("[STATE] Now LISTENING for user speech (10s timeout)")
+                logger.info("[STATE] Now LISTENING for user speech (extends while speaking, 30s max)")
 
                 # Play acknowledgment in background
                 ack_task = asyncio.create_task(self._play_ack())
@@ -537,8 +537,13 @@ class VoiceSession:
                 # Poll for both VAD end AND push-to-talk audio stop
                 try:
                     logger.info("[STATE] Waiting for speech_end_event...")
-                    deadline = time.perf_counter() + 10.0
+                    initial_timeout = 10.0  # Timeout for silence
+                    max_timeout = self.settings.max_question_duration  # 30s safety cap
+
+                    deadline = time.perf_counter() + initial_timeout
+                    final_deadline = time.perf_counter() + max_timeout
                     speech_end_reason = None  # Track why speech ended
+
                     while time.perf_counter() < deadline:
                         # Check if VAD detected speech end
                         try:
@@ -553,6 +558,13 @@ class VoiceSession:
                             break
                         except asyncio.TimeoutError:
                             pass
+
+                        # Extend deadline while speech is active (up to max)
+                        if self.sink.is_speech_active():
+                            new_deadline = time.perf_counter() + initial_timeout
+                            if new_deadline > deadline and new_deadline <= final_deadline:
+                                deadline = new_deadline
+                                logger.debug("[STATE] Extended deadline, speech active")
 
                         # Check if audio stopped (push-to-talk released)
                         if self.sink.check_audio_timeout():
@@ -585,11 +597,39 @@ class VoiceSession:
                             logger.info(f"[STATE] Speaker: {self._current_speaker_name} (ID: {user_id}), Activity: {self._current_speaker_activity}")
                             break
                     else:
-                        # Loop completed without break = timeout
+                        # Timeout - but still process any captured audio (don't abandon)
                         listen_time = time.perf_counter() - listen_start
-                        logger.warning(f"[STATE] TIMEOUT! No speech detected in {listen_time:.2f}s - returning to idle")
+                        buffer = self.sink.get_audio_buffer()
+                        buffer_duration = len(buffer) / 16000 if len(buffer) > 0 else 0
+                        logger.warning(
+                            f"[STATE] TIMEOUT after {listen_time:.2f}s - "
+                            f"processing {buffer_duration:.2f}s of captured audio"
+                        )
                         ack_task.cancel()
-                        continue
+                        # Capture pending audio before falling through
+                        self._pending_audio = buffer
+                        # Capture speaker info (same as PTT path)
+                        user_id = self.sink._last_user_id
+                        self._current_speaker_id = user_id
+                        self._current_speaker_activity = None
+                        if user_id and user_id in self.USER_NAMES:
+                            self._current_speaker_name = self.USER_NAMES[user_id]
+                            if self.voice_client:
+                                try:
+                                    member = self.voice_client.guild.get_member(user_id)
+                                    self._current_speaker_activity = self._get_member_activity(member)
+                                except Exception:
+                                    pass
+                        elif user_id and self.voice_client:
+                            try:
+                                member = self.voice_client.guild.get_member(user_id)
+                                self._current_speaker_name = member.display_name if member else None
+                                self._current_speaker_activity = self._get_member_activity(member)
+                            except Exception:
+                                self._current_speaker_name = None
+                        else:
+                            self._current_speaker_name = None
+                        # DON'T continue - fall through to process the audio
 
                     listen_time = time.perf_counter() - listen_start
                     logger.info(f"[TIMING] Speech captured in {listen_time:.2f}s")
