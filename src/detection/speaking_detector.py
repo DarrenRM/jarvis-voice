@@ -35,6 +35,8 @@ class UserAudioState:
     is_speaking: bool = False
     vad_buffer: np.ndarray = field(default_factory=lambda: np.array([], dtype=np.float32))
     speech_start_time: Optional[float] = None
+    # Track when low-energy/no-speech started (for per-user debounce)
+    silence_start_time: Optional[float] = None
 
 
 class SpeakingDetector:
@@ -185,25 +187,46 @@ class SpeakingDetector:
         energy = self._compute_rms(audio_16k)
         user.last_energy = energy
 
+        # Per-user silence debounce (300ms) - don't clear is_speaking on brief pauses
+        USER_SILENCE_DEBOUNCE_MS = 300
+
         if energy < self.energy_threshold:
-            # Below energy threshold - likely noise
+            # Below energy threshold - likely noise or pause
             if user.is_speaking:
-                user.is_speaking = False
-                user.speech_start_time = None
-                logger.debug(f"User {user_id}: Below energy threshold, marked not speaking")
+                # Start silence timer if not already started
+                if user.silence_start_time is None:
+                    user.silence_start_time = now
+                # Check if silence has been long enough
+                silence_ms = (now - user.silence_start_time) * 1000
+                if silence_ms >= USER_SILENCE_DEBOUNCE_MS:
+                    user.is_speaking = False
+                    user.speech_start_time = None
+                    user.silence_start_time = None
+                    logger.debug(f"User {user_id}: Silence debounce expired, marked not speaking")
         else:
             # Above energy threshold - run VAD for confirmation
             user.vad_buffer = np.concatenate([user.vad_buffer, audio_16k])
             is_speech = self._run_vad(user)
 
-            if is_speech and not user.is_speaking:
-                user.is_speaking = True
-                user.speech_start_time = now
-                logger.debug(f"User {user_id}: VAD detected speech start")
-            elif not is_speech and user.is_speaking:
-                # Keep speaking state during brief pauses (VAD handles this internally)
-                # Only clear if we've processed enough audio with no speech
-                pass
+            if is_speech:
+                # Speech detected - reset silence timer
+                user.silence_start_time = None
+                if not user.is_speaking:
+                    user.is_speaking = True
+                    user.speech_start_time = now
+                    logger.debug(f"User {user_id}: VAD detected speech start")
+            elif user.is_speaking:
+                # High energy but VAD says no speech - could be noise or brief pause
+                # Start silence timer if not already started
+                if user.silence_start_time is None:
+                    user.silence_start_time = now
+                # Check if silence has been long enough
+                silence_ms = (now - user.silence_start_time) * 1000
+                if silence_ms >= USER_SILENCE_DEBOUNCE_MS:
+                    user.is_speaking = False
+                    user.speech_start_time = None
+                    user.silence_start_time = None
+                    logger.debug(f"User {user_id}: VAD silence debounce expired, marked not speaking")
 
         # Compute aggregate state
         return self._compute_aggregate_state(now)
@@ -248,6 +271,18 @@ class SpeakingDetector:
     def get_speaking_users(self) -> list[int]:
         """Get list of user IDs currently speaking."""
         return [user.user_id for user in self._user_states.values() if user.is_speaking]
+
+    def is_anyone_actively_speaking(self) -> bool:
+        """Check if anyone is actively speaking RIGHT NOW (no debounce).
+
+        This is faster than get_state() for quick checks and doesn't apply
+        the 3-second silence debounce. Use this for:
+        - Deciding whether to play an acknowledgment immediately
+        - Checking if someone is mid-sentence
+
+        For "wait until conversation ends", use get_state() which applies debounce.
+        """
+        return any(user.is_speaking for user in self._user_states.values())
 
     def get_user_state(self, user_id: int) -> Optional[UserAudioState]:
         """Get state for a specific user."""

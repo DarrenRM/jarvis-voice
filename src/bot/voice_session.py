@@ -15,7 +15,7 @@ import discord
 import numpy as np
 
 from ..config import get_settings
-from ..detection import VAD, WakeWordDetector
+from ..detection import VAD, WakeWordDetector, SpeakingDetector
 from ..stt import Transcriber, DeepgramFluxClient, GroqWhisperClient
 from ..llm import BaseLLMClient, create_llm_client
 from ..tts import TTSSynthesizer
@@ -83,6 +83,7 @@ class VoiceSession:
         *,
         wake_detector: Optional[WakeWordDetector] = None,
         vad: Optional[VAD] = None,
+        speaking_detector: Optional[SpeakingDetector] = None,
         transcriber: Optional[Transcriber] = None,
         groq_client: Optional[GroqWhisperClient] = None,
         deepgram_client: Optional[DeepgramFluxClient] = None,
@@ -96,6 +97,7 @@ class VoiceSession:
         Args:
             wake_detector: WakeWordDetector instance
             vad: VAD instance
+            speaking_detector: SpeakingDetector instance for multi-user awareness
             transcriber: Transcriber instance (Whisper, fallback)
             groq_client: GroqWhisperClient instance (primary STT)
             deepgram_client: DeepgramFluxClient instance (alternative STT)
@@ -107,6 +109,7 @@ class VoiceSession:
         # Components (will be initialized if not provided)
         self.wake_detector = wake_detector
         self.vad = vad
+        self.speaking_detector = speaking_detector
         self.transcriber = transcriber
         self.groq_client = groq_client
         self.deepgram_client = deepgram_client
@@ -175,6 +178,19 @@ class VoiceSession:
                 sample_rate=16000,
                 speech_pad_ms=self.settings.speech_pad_ms,
                 min_silence_duration_ms=self.settings.min_silence_ms,
+            )
+
+        # Initialize speaking detector for multi-user awareness (if enabled)
+        if self.speaking_detector is None and self.settings.speaking_detection_enabled:
+            logger.info("Loading speaking detector...")
+            # Exclude bot's own user ID to avoid detecting our own audio
+            excluded_ids = set()
+            if self.voice_client and self.voice_client.user:
+                excluded_ids.add(self.voice_client.user.id)
+            self.speaking_detector = SpeakingDetector(
+                energy_threshold=self.settings.speaking_energy_threshold,
+                silence_debounce_ms=self.settings.speaking_silence_debounce_ms,
+                excluded_user_ids=excluded_ids,
             )
 
         # Initialize STT based on provider setting
@@ -451,6 +467,7 @@ class VoiceSession:
         self.sink = StreamingSink(
             wake_detector=self.wake_detector,
             vad=self.vad,
+            speaking_detector=self.speaking_detector,
             on_wake_word=self._on_wake_word,
             on_speech_end=self._on_speech_end,
             max_speech_duration=self.settings.max_question_duration,
@@ -659,9 +676,57 @@ class VoiceSession:
 
         logger.info("Voice session loop ended")
 
+    async def _wait_for_silence(
+        self,
+        max_wait: float = 30.0,
+        use_debounce: bool = True,
+        poll_interval: float = 0.1,
+    ) -> bool:
+        """Wait until no one is speaking.
+
+        Args:
+            max_wait: Maximum seconds to wait before giving up
+            use_debounce: If True, wait for full channel silence (3s debounce).
+                         If False, return as soon as active speech stops.
+            poll_interval: How often to check (seconds)
+
+        Returns:
+            True if silence detected, False if timed out
+        """
+        if not self.sink or not self.settings.speaking_detection_enabled:
+            return True  # No detector, proceed immediately
+
+        start = time.perf_counter()
+        while time.perf_counter() - start < max_wait:
+            if use_debounce:
+                # Full channel silence (3s debounce) - for responses
+                if not self.sink.is_anyone_speaking():
+                    return True
+            else:
+                # Immediate check (no debounce) - for ack
+                if not self.sink.is_anyone_actively_speaking():
+                    return True
+            await asyncio.sleep(poll_interval)
+
+        return False  # Timed out
+
     async def _play_ack(self):
-        """Play acknowledgment audio."""
+        """Play acknowledgment audio.
+
+        Waits for the user to finish speaking before playing, so we don't
+        interrupt questions like "hey jarvis what is the weather?".
+        """
         try:
+            # Wait for user to finish speaking (immediate mode, no 3s debounce)
+            # This handles "hey jarvis what is the weather?" without interrupting
+            if self.settings.speaking_detection_enabled:
+                silence = await self._wait_for_silence(max_wait=5.0, use_debounce=False)
+                if not silence:
+                    # User still speaking after 5s - they're asking a long question
+                    # Skip the ack, they'll hear the response later
+                    logger.info("[ACK] Skipping - user still speaking after 5s")
+                    return
+
             t0 = time.perf_counter()
             ack_phrase = random.choice(self.ACK_PHRASES)
             ack_audio = await self.tts.synthesize(ack_phrase)
@@ -728,10 +793,13 @@ class VoiceSession:
         """Background task that plays audio from the queue seamlessly.
 
         Receives (sentence_num, audio) tuples and plays in order.
+        Waits for channel silence before playing the first sentence
+        (so we don't talk over ongoing conversations).
         """
         logger.debug("[PLAYBACK] Consumer started")
         next_to_play = 1
         pending: dict[int, np.ndarray] = {}
+        waited_for_silence = False
 
         while True:
             try:
@@ -756,6 +824,15 @@ class VoiceSession:
                 while next_to_play in pending:
                     audio = pending.pop(next_to_play)
                     if len(audio) > 0:
+                        # Wait for silence before FIRST sentence only
+                        # This handles conversations while waiting for LLM response
+                        if not waited_for_silence and self.settings.speaking_detection_enabled:
+                            logger.info("[PLAYBACK] Waiting for channel silence before response...")
+                            silence = await self._wait_for_silence(max_wait=30.0, use_debounce=True)
+                            waited_for_silence = True
+                            if not silence:
+                                logger.warning("[PLAYBACK] Timeout waiting for silence, playing anyway")
+
                         logger.debug(f"[PLAYBACK] Playing sentence {next_to_play}")
                         await self._play_audio(audio)
                     next_to_play += 1
@@ -843,20 +920,29 @@ class VoiceSession:
             prompt_text = text
 
         # Play thinking phrase (personalized if we know who's speaking)
-        t0 = time.perf_counter()
-        if speaker:
-            phrase = random.choice(self.THINKING_PHRASES_PERSONAL).format(name=speaker)
-        else:
-            phrase = random.choice(self.THINKING_PHRASES)
-        logger.info(f"[TIMING] Synthesizing thinking phrase: '{phrase}'")
-        thinking_audio = await self.tts.synthesize(phrase)
-        thinking_synth_time = time.perf_counter() - t0
-        logger.info(f"[TIMING] Thinking phrase TTS: {thinking_synth_time:.2f}s")
+        # Skip if someone is still talking (they might be in conversation)
+        should_play_thinking = True
+        if self.settings.speaking_detection_enabled:
+            silence = await self._wait_for_silence(max_wait=3.0, use_debounce=False)
+            if not silence:
+                logger.info("[THINKING] Skipping thinking phrase - someone still speaking")
+                should_play_thinking = False
 
-        t0 = time.perf_counter()
-        await self._play_audio(thinking_audio)
-        thinking_play_time = time.perf_counter() - t0
-        logger.info(f"[TIMING] Thinking phrase playback: {thinking_play_time:.2f}s")
+        if should_play_thinking:
+            t0 = time.perf_counter()
+            if speaker:
+                phrase = random.choice(self.THINKING_PHRASES_PERSONAL).format(name=speaker)
+            else:
+                phrase = random.choice(self.THINKING_PHRASES)
+            logger.info(f"[TIMING] Synthesizing thinking phrase: '{phrase}'")
+            thinking_audio = await self.tts.synthesize(phrase)
+            thinking_synth_time = time.perf_counter() - t0
+            logger.info(f"[TIMING] Thinking phrase TTS: {thinking_synth_time:.2f}s")
+
+            t0 = time.perf_counter()
+            await self._play_audio(thinking_audio)
+            thinking_play_time = time.perf_counter() - t0
+            logger.info(f"[TIMING] Thinking phrase playback: {thinking_play_time:.2f}s")
 
         # Get LLM response with PARALLEL sentence-level streaming TTS
         # TTS runs in parallel: synthesize next sentence while current plays

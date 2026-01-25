@@ -188,15 +188,26 @@ class StreamingSink(discord.sinks.Sink):
         return self._speech_started and self._state == "listening"
 
     def is_anyone_speaking(self) -> bool:
-        """Check if anyone in the channel is currently speaking.
+        """Check if anyone in the channel is speaking (with 3s debounce).
 
         Uses the speaking detector if available, otherwise returns False.
-        This is useful for deciding whether to hold off on bot responses.
+        The 3-second debounce means this returns True for 3s after speech ends.
+        Use this for deciding whether to hold off on bot responses.
         """
         if self.speaking_detector:
             from ..detection import SpeakingState
 
             return self.speaking_detector.get_state() == SpeakingState.SOMEONE_SPEAKING
+        return False
+
+    def is_anyone_actively_speaking(self) -> bool:
+        """Check if anyone is actively speaking RIGHT NOW (no debounce).
+
+        Returns True only while speech is detected, False immediately when speech stops.
+        Use this for quick checks like acknowledgment timing.
+        """
+        if self.speaking_detector:
+            return self.speaking_detector.is_anyone_actively_speaking()
         return False
 
     def check_idle_audio_gap(self) -> bool:
@@ -335,7 +346,7 @@ class StreamingSink(discord.sinks.Sink):
         chunk_size = len(data) if data else 0
         gap_ms = gap_since_last * 1000
         energy = np.sqrt(np.mean(audio_16k**2)) if len(audio_16k) > 0 else 0
-        logger.info(
+        logger.debug(
             f"[DIAG] state={self._state}, gap={gap_ms:.0f}ms, chunk={chunk_size}B, "
             f"energy={energy:.4f}, samples={len(audio_16k)}"
         )
