@@ -8,6 +8,7 @@ from .claude_client import ClaudeClient
 from .groq_client import GroqClient
 from ..search.search_service import SearchService
 from ..image import NanoBananaClient
+from ..tools.definitions import create_tool_registry
 
 if TYPE_CHECKING:
     from ..config import Settings
@@ -83,6 +84,16 @@ def create_llm_client(
             except Exception as e:
                 logger.warning(f"Claude delegation unavailable: {e}")
 
+        # Create tool registry for new modular tool system
+        tool_registry = create_tool_registry(
+            search_service=search_service,
+            image_service=image_service,
+            claude_service=claude_service,
+            on_image_generated=on_image_generated,
+            on_user_tagged=on_user_tagged,
+            on_message_posted=on_message_posted,
+        )
+
         logger.info(f"Creating Groq client (provider: {provider}, model: {model})")
         logger.info(f"Image callback provided: {on_image_generated is not None}")
         logger.info(f"Tag callback provided: {on_user_tagged is not None}")
@@ -96,6 +107,7 @@ def create_llm_client(
             on_user_tagged=on_user_tagged,
             on_message_posted=on_message_posted,
             claude_service=claude_service,
+            tool_registry=tool_registry,
         )
 
     elif provider == "claude":
