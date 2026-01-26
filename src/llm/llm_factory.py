@@ -26,6 +26,7 @@ def create_llm_client(
     settings: "Settings",
     on_image_generated: Optional[Callable[[bytes, str], Awaitable[str]]] = None,
     on_user_tagged: Optional[Callable[[str, str], Awaitable[str]]] = None,
+    on_message_posted: Optional[Callable[[str], Awaitable[str]]] = None,
 ) -> BaseLLMClient:
     """Factory function to create the appropriate LLM client.
 
@@ -39,6 +40,7 @@ def create_llm_client(
         settings: Application settings
         on_image_generated: Callback for posting generated images (Groq only)
         on_user_tagged: Callback for tagging users in Discord (Groq only)
+        on_message_posted: Callback for posting messages to Discord (Groq only)
 
     Returns:
         LLM client instance based on LLM_PROVIDER setting
@@ -83,6 +85,7 @@ def create_llm_client(
             image_service=image_service,
             on_image_generated=on_image_generated,
             on_user_tagged=on_user_tagged,
+            on_message_posted=on_message_posted,
         )
 
     elif provider == "claude":

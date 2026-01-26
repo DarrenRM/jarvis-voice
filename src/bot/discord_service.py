@@ -154,3 +154,44 @@ class DiscordService:
         except Exception as e:
             logger.error(f"[TAG] Failed to post tag: {e}", exc_info=True)
             return f"Failed to send message: {str(e)}"
+
+    async def post_message(
+        self,
+        voice_client: discord.VoiceClient,
+        message: str,
+        requester: str,
+    ) -> str:
+        """Post a message to Discord channel.
+
+        Args:
+            voice_client: Discord voice client for guild access.
+            message: Message content to post.
+            requester: Name of the requester.
+
+        Returns:
+            Status message for TTS feedback.
+        """
+        logger.info(f"[POST] post_message called: {message[:50]}...")
+
+        if not voice_client or not voice_client.guild:
+            logger.warning("[POST] Cannot post message - no voice client or guild")
+            return "Could not post message - not connected to a server"
+
+        channel = discord.utils.get(
+            voice_client.guild.text_channels,
+            name=self._channel_name,
+        )
+
+        if not channel:
+            available = [ch.name for ch in voice_client.guild.text_channels]
+            logger.warning(f"[POST] Could not find channel #{self._channel_name}. Available: {available}")
+            return f"Could not find channel #{self._channel_name}"
+
+        try:
+            formatted = f"*{requester} asked me to share:*\n{message}"
+            await channel.send(formatted)
+            logger.info(f"[POST] Posted message to #{self._channel_name}")
+            return f"Done! I've posted that to {self._channel_name} chat."
+        except Exception as e:
+            logger.error(f"[POST] Failed to post message: {e}", exc_info=True)
+            return f"Failed to post message: {str(e)}"

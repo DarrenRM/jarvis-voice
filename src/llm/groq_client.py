@@ -108,6 +108,23 @@ TOOLS = [
                 "required": ["target_name", "message"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "post_to_chat",
+            "description": "Post a message to the Discord text channel. Use when user asks to 'post that', 'put that in chat', 'send that to discord', or wants to share something from the conversation with everyone. IMPORTANT: Do NOT include emotion tags like [happy], [laughing], [sigh] etc. in the message - those are for voice only. Use clean text with Discord markdown formatting instead.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The message content to post. Use Discord markdown (bold, lists, etc.) but NO emotion tags like [happy] or [laughing]."
+                    }
+                },
+                "required": ["message"]
+            }
+        }
     }
 ]
 
@@ -135,6 +152,7 @@ class GroqClient(BaseLLMClient):
         image_service: Optional["NanoBananaClient"] = None,
         on_image_generated: Optional[Callable[[bytes, str, str], Awaitable[str]]] = None,
         on_user_tagged: Optional[Callable[[str, str], Awaitable[str]]] = None,
+        on_message_posted: Optional[Callable[[str], Awaitable[str]]] = None,
     ):
         """Initialize Groq client.
 
@@ -147,6 +165,7 @@ class GroqClient(BaseLLMClient):
             image_service: Image generation service (Nano Banana)
             on_image_generated: Callback to post generated image (bytes, prompt, mime_type) -> result
             on_user_tagged: Callback to tag a user in Discord (target_name, message) -> result
+            on_message_posted: Callback to post a message to Discord (message) -> result
         """
         self.api_key = api_key
         self.model = model
@@ -160,6 +179,7 @@ class GroqClient(BaseLLMClient):
         self._image_service = image_service
         self._on_image_generated = on_image_generated
         self._on_user_tagged = on_user_tagged
+        self._on_message_posted = on_message_posted
         self._client = None
 
     def _ensure_client(self) -> None:
@@ -224,7 +244,7 @@ class GroqClient(BaseLLMClient):
             # After 3 SEARCH tool calls, disable search but allow action tools
             MAX_SEARCH_CALLS = 3
             SEARCH_TOOLS = {"web_search", "fetch_url"} | set(TOOL_ALIASES.keys())  # These get limited
-            ACTION_TOOLS = {"generate_image", "edit_image", "tag_user"}  # These don't
+            ACTION_TOOLS = {"generate_image", "edit_image", "tag_user", "post_to_chat"}  # These don't
 
             for turn in range(self.max_turns):
                 logger.debug(f"Groq turn {turn + 1}/{self.max_turns}")
@@ -519,6 +539,14 @@ class GroqClient(BaseLLMClient):
                 message = args.get("message", "")
                 logger.info(f"[TAG] Tagging user: {target_name} with message: {message}")
                 return await self._on_user_tagged(target_name, message)
+
+            # Post to chat tool
+            if function_name == "post_to_chat":
+                if not self._on_message_posted:
+                    return "Message posting not available - not connected to Discord"
+                message = args.get("message", "")
+                logger.info(f"[POST] Posting message to chat: {message[:50]}...")
+                return await self._on_message_posted(message)
 
             # Search tools
             if not self._search_service:

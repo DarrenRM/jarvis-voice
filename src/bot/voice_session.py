@@ -211,6 +211,7 @@ class VoiceSession:
                 self.settings,
                 on_image_generated=self._post_image_to_discord,
                 on_user_tagged=self._post_tag_to_discord,
+                on_message_posted=self._post_message_to_discord,
             )
 
         if self.tts is None:
@@ -243,6 +244,13 @@ class VoiceSession:
         requester = self._current_speaker_name or "Someone"
         return await self.discord_service.tag_user(
             self.voice_client, target_name, message, requester
+        )
+
+    async def _post_message_to_discord(self, message: str) -> str:
+        """Post a message to Discord. Delegates to DiscordService."""
+        requester = self._current_speaker_name or "Someone"
+        return await self.discord_service.post_message(
+            self.voice_client, message, requester
         )
 
     def _find_user_by_name(self, name: str) -> Optional[tuple[int, str]]:
