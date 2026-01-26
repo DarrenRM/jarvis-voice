@@ -218,6 +218,7 @@ class GroqClient(BaseLLMClient):
             # Reset tool call tracking for this request
             self._tool_calls_this_request = []
             self._search_calls_this_request = 0  # Only count search/fetch toward limit
+            last_action_success = None  # Track successful action tool results (image, tag)
 
             # Tool use loop (up to max_turns)
             # After 3 SEARCH tool calls, disable search but allow action tools
@@ -343,6 +344,13 @@ class GroqClient(BaseLLMClient):
                             "content": result,
                         })
 
+                        # Track successful action tool results for fallback
+                        # Image tools return "Done! I've posted...", tag tool returns "Done! I've tagged..."
+                        if tool_name in ACTION_TOOLS and result.startswith("Done!"):
+                            # Extract just the success message (before "You can now edit...")
+                            success_msg = result.split(".")[0] + "."
+                            last_action_success = success_msg
+
                     continue  # Next turn to process tool results
 
                 # No tool calls - stream the final response
@@ -369,7 +377,12 @@ class GroqClient(BaseLLMClient):
             # Handle Groq's output parsing error (model outputs thinking text instead of proper tool call)
             if "output_parse_failed" in error_str or "Parsing failed" in error_str:
                 logger.warning(f"Groq model output parsing failed - model may have output thinking text: {e}")
-                yield "I couldn't find specific information about that. Try asking in a different way."
+                # If an action tool (image, tag) succeeded, use that result instead of generic fallback
+                if last_action_success:
+                    logger.info(f"Using last action success as fallback: {last_action_success}")
+                    yield last_action_success
+                else:
+                    yield "I couldn't find specific information about that. Try asking in a different way."
             # Handle model trying to call tools when tools are disabled
             elif "tool_use_failed" in error_str or "model called a tool" in error_str:
                 logger.warning(f"Model tried to call tool after tools disabled: {e}")
