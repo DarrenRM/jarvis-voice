@@ -74,6 +74,15 @@ def create_llm_client(
             logger.info("Image generation enabled (Nano Banana)")
             image_service = NanoBananaClient(api_key=settings.nanobanana_api_key)
 
+        # Create Claude service for delegation if enabled
+        claude_service = None
+        if settings.claude_delegation_enabled:
+            try:
+                claude_service = ClaudeClient(model=settings.claude_model, max_tokens=1024)
+                logger.info(f"Claude delegation enabled (using {settings.claude_model} for deep analysis)")
+            except Exception as e:
+                logger.warning(f"Claude delegation unavailable: {e}")
+
         logger.info(f"Creating Groq client (provider: {provider}, model: {model})")
         logger.info(f"Image callback provided: {on_image_generated is not None}")
         logger.info(f"Tag callback provided: {on_user_tagged is not None}")
@@ -86,6 +95,7 @@ def create_llm_client(
             on_image_generated=on_image_generated,
             on_user_tagged=on_user_tagged,
             on_message_posted=on_message_posted,
+            claude_service=claude_service,
         )
 
     elif provider == "claude":

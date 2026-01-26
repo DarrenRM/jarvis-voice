@@ -46,6 +46,9 @@ class Settings(BaseSettings):
     # Groq LLM settings (used by llama and gpt-oss providers, reuses GROQ_API_KEY from STT)
     groq_max_tokens: int = Field(default=1024, alias="GROQ_MAX_TOKENS")
 
+    # Claude delegation (for Groq providers - delegate complex tasks to Claude)
+    claude_delegation_enabled: bool = Field(default=True, alias="CLAUDE_DELEGATION_ENABLED")
+
     # Search Pipeline (for Groq tool use)
     firecrawl_url: str = Field(default="http://localhost:3002", alias="FIRECRAWL_URL")
     firecrawl_api_key: Optional[str] = Field(default=None, alias="FIRECRAWL_API_KEY")

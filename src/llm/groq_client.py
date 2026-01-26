@@ -5,6 +5,7 @@ Supports multiple models via Groq's API:
 - openai/gpt-oss-120b (GPT-OSS 120B)
 """
 
+import asyncio
 import json
 import logging
 from datetime import datetime
@@ -15,6 +16,7 @@ from ..search.search_service import SearchService
 
 if TYPE_CHECKING:
     from ..image import NanoBananaClient
+    from .claude_client import ClaudeClient
 
 logger = logging.getLogger(__name__)
 
@@ -24,7 +26,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "web_search",
-            "description": "Search the web. USE THIS for: game wikis, recipes, crafting guides, item info, build guides, current events, news, weather, prices, sports, or ANY factual question you're not 100% certain about. When in doubt, search.",
+            "description": "Search the web. USE THIS for: game wikis, recipes, crafting guides, item info, build guides, current events, news, weather, prices, sports, or ANY factual question you're not 100% certain about. If it is complex or multi-step use the deep_research tool instead.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -155,6 +157,27 @@ TOOLS = [
                 "required": ["headers", "rows"]
             }
         }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "deep_research",
+            "description": "Perform deep research and analysis. ALWAYS USE THIS when user explicitly says 'deep research', 'think hard', 'analyze this', or asks for in-depth analysis - these phrases override all other rules. Also use for: complex reasoning, code questions, comparing multiple options, or synthesizing 3+ sources. DO NOT USE for simple factual questions.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "task": {
+                        "type": "string",
+                        "description": "What to research or analyze. Include the user's question and focus areas."
+                    },
+                    "context": {
+                        "type": "string",
+                        "description": "Gathered information (search results, prior tool outputs) to consider."
+                    }
+                },
+                "required": ["task"]
+            }
+        }
     }
 ]
 
@@ -183,6 +206,7 @@ class GroqClient(BaseLLMClient):
         on_image_generated: Optional[Callable[[bytes, str, str], Awaitable[str]]] = None,
         on_user_tagged: Optional[Callable[[str, str], Awaitable[str]]] = None,
         on_message_posted: Optional[Callable[[str], Awaitable[str]]] = None,
+        claude_service: Optional["ClaudeClient"] = None,
     ):
         """Initialize Groq client.
 
@@ -196,6 +220,7 @@ class GroqClient(BaseLLMClient):
             on_image_generated: Callback to post generated image (bytes, prompt, mime_type) -> result
             on_user_tagged: Callback to tag a user in Discord (target_name, message) -> result
             on_message_posted: Callback to post a message to Discord (message) -> result
+            claude_service: Claude client for complex task delegation
         """
         self.api_key = api_key
         self.model = model
@@ -210,6 +235,7 @@ class GroqClient(BaseLLMClient):
         self._on_image_generated = on_image_generated
         self._on_user_tagged = on_user_tagged
         self._on_message_posted = on_message_posted
+        self._claude_service = claude_service
         self._client = None
 
     def _ensure_client(self) -> None:
@@ -274,7 +300,7 @@ class GroqClient(BaseLLMClient):
             # After 3 SEARCH tool calls, disable search but allow action tools
             MAX_SEARCH_CALLS = 3
             SEARCH_TOOLS = {"web_search", "fetch_url"} | set(TOOL_ALIASES.keys())  # These get limited
-            ACTION_TOOLS = {"generate_image", "edit_image", "tag_user", "post_to_chat", "post_table"}  # These don't
+            ACTION_TOOLS = {"generate_image", "edit_image", "tag_user", "post_to_chat", "post_table", "deep_research"}  # These don't
 
             for turn in range(self.max_turns):
                 logger.debug(f"Groq turn {turn + 1}/{self.max_turns}")
@@ -322,9 +348,13 @@ class GroqClient(BaseLLMClient):
                         tool_results = [m["content"] for m in messages if m.get("role") == "tool"]
                         summary_context = "\n\n".join(tool_results[-3:])  # Last 3 tool results
 
-                        # Ask model directly to summarize without any tool history
+                        # Build output-only tools for summary (post tables/images, but NOT deep_research)
+                        OUTPUT_TOOLS = {"generate_image", "edit_image", "tag_user", "post_to_chat", "post_table"}
+                        output_only_tools = [t for t in TOOLS if t["function"]["name"] in OUTPUT_TOOLS]
+
+                        # Ask model directly to summarize - include output tools so it can post tables
                         summary_messages = [
-                            {"role": "system", "content": "You are a helpful voice assistant. Answer briefly in 1-2 sentences."},
+                            {"role": "system", "content": "You are a helpful voice assistant. Answer briefly in 1-2 sentences using the search results provided. If the data would be clearer as a table, use post_table. Do NOT search again."},
                             {"role": "user", "content": f"Based on this information, answer the user's question:\n\n{summary_context[:6000]}\n\nQuestion: {message}"}
                         ]
                         response = await self._client.chat.completions.create(
@@ -332,7 +362,32 @@ class GroqClient(BaseLLMClient):
                             messages=summary_messages,
                             max_tokens=self.max_tokens,
                             stream=False,
+                            tools=output_only_tools,
+                            tool_choice="auto",
                         )
+                        # Handle tool call from summary (e.g., post_table)
+                        summary_msg = response.choices[0].message
+                        if summary_msg.tool_calls:
+                            # Execute tools and collect results
+                            tool_results = []
+                            for tc in summary_msg.tool_calls:
+                                result = await self._execute_tool(tc)
+                                logger.info(f"Summary fallback executed tool: {tc.function.name} -> {result[:50]}...")
+                                tool_results.append((tc, result))
+                            # Build messages for final response
+                            summary_messages.append({"role": "assistant", "tool_calls": [
+                                {"id": tc.id, "type": "function", "function": {"name": tc.function.name, "arguments": tc.function.arguments}}
+                                for tc, _ in tool_results
+                            ]})
+                            for tc, result in tool_results:
+                                summary_messages.append({"role": "tool", "tool_call_id": tc.id, "content": result})
+                            response = await self._client.chat.completions.create(
+                                model=self.model,
+                                messages=summary_messages,
+                                max_tokens=self.max_tokens,
+                                stream=False,
+                                tool_choice="none",
+                            )
                     else:
                         raise  # Re-raise other errors
 
@@ -369,6 +424,10 @@ class GroqClient(BaseLLMClient):
                         tool_name = tool_call.function.name
                         # Normalize hallucinated tool names to real ones
                         tool_name = TOOL_ALIASES.get(tool_name, tool_name)
+
+                        # Special notification for deep research (before execution)
+                        if tool_name == "deep_research":
+                            yield "[thoughtful] This one needs some deeper digging, give me a moment.\n"
 
                         # Track search tools toward limit
                         if tool_name in SEARCH_TOOLS:
@@ -634,6 +693,42 @@ class GroqClient(BaseLLMClient):
                 logger.info(f"[TABLE] Posting table with {len(rows)} rows")
                 return await self._on_message_posted(formatted)
 
+            # Deep research tool (delegates to Claude)
+            if function_name == "deep_research":
+                if not self._claude_service:
+                    return "Deep research not available - Claude Code SDK not configured"
+
+                task = args.get("task", "")
+                gathered_context = args.get("context", "")
+
+                prompt = self._build_claude_delegation_prompt(
+                    original_request=task,
+                    gathered_context=gathered_context,
+                    conversation_history=self._conversation_history[-6:],
+                )
+
+                # If no context provided, enable Claude's web tools so it can research
+                # If context exists, disable tools - Claude just needs to synthesize
+                has_context = len(gathered_context.strip()) > 100
+                use_tools = not has_context
+                timeout_secs = 90 if use_tools else 45  # More time if Claude needs to search
+
+                logger.info(f"[DEEP_RESEARCH] use_tools={use_tools}, context_len={len(gathered_context)}")
+
+                try:
+                    response = await asyncio.wait_for(
+                        self._claude_service.chat(prompt, use_tools=use_tools),
+                        timeout=timeout_secs
+                    )
+                    logger.info(f"[DEEP_RESEARCH] Completed: {response[:100]}...")
+                    return f"Deep research result:\n{response}"
+                except asyncio.TimeoutError:
+                    logger.warning(f"Deep research timed out after {timeout_secs}s")
+                    return "Deep research took too long. Try a simpler question."
+                except Exception as e:
+                    logger.error(f"Deep research error: {e}")
+                    return f"Deep research failed: {str(e)}"
+
             # Search tools
             if not self._search_service:
                 return "Search service not available"
@@ -650,6 +745,70 @@ class GroqClient(BaseLLMClient):
         except Exception as e:
             logger.error(f"Tool execution error: {e}")
             return f"Tool error: {str(e)}"
+
+    def _build_claude_delegation_prompt(
+        self,
+        original_request: str,
+        gathered_context: str,
+        conversation_history: list[dict],
+    ) -> str:
+        """Build prompt for Claude delegation.
+
+        Args:
+            original_request: What Groq wants Claude to analyze
+            gathered_context: Search results or other gathered info
+            conversation_history: Recent conversation for context
+
+        Returns:
+            Formatted prompt for Claude
+        """
+        has_context = gathered_context and len(gathered_context.strip()) > 100
+
+        if has_context:
+            # Claude has context to synthesize - no tools needed
+            truncated = gathered_context[:4000] if len(gathered_context) > 4000 else gathered_context
+            prompt = f"""You are synthesizing research results for a voice assistant.
+Your response will be spoken aloud, so keep it concise and clear.
+
+TASK: {original_request}
+
+GATHERED RESEARCH (analyze and synthesize this):
+{truncated}
+
+GUIDELINES:
+1. Synthesize the gathered information into a clear answer
+2. Be concise - 2-4 sentences max for voice output
+3. Focus on the most important facts
+4. No preamble like "Based on the research..." - just give the answer
+5. Use emotion tags like [happy], [thoughtful] at sentence starts for TTS"""
+        else:
+            # Claude needs to research - has web tools enabled
+            prompt = f"""You are doing deep research for a voice assistant.
+Use WebSearch and WebFetch tools to find comprehensive information.
+Your response will be spoken aloud, so keep it concise.
+
+TASK: {original_request}
+
+GUIDELINES:
+1. Search multiple sources to build a complete picture
+2. After researching, provide a concise 2-4 sentence summary
+3. Focus on the most important facts the user needs
+4. No preamble - just give the answer after researching
+5. Use emotion tags like [happy], [thoughtful] at sentence starts for TTS"""
+
+        # Add conversation history context
+        if conversation_history:
+            history_text = "\n".join(
+                f"- {msg['role'].title()}: {msg['content'][:200]}..."
+                if len(msg['content']) > 200 else f"- {msg['role'].title()}: {msg['content']}"
+                for msg in conversation_history
+            )
+            prompt += f"""
+
+RECENT CONVERSATION (for context, may not be relevant):
+{history_text}"""
+
+        return prompt
 
     def _build_messages(self, message: str) -> list[dict]:
         """Build messages list with system prompt and history.
@@ -714,11 +873,29 @@ PERSONALITY:
 - If something is absurd, call it out with humor
 - [whispering] is great for asides or "between you and me" moments
 
-WEB SEARCH - MANDATORY FOR FACTUAL QUESTIONS:
-You have a web_search tool. You MUST use it for:
-- ANY question about games, recipes, crafting, items, builds, guides
-- Current events, news, weather, prices, availability
-- Facts you're not 100% certain about
+YOUR TOOLS:
+You have these tools available:
+- web_search: Quick factual lookups, current events, game info, weather
+- fetch_url: Read content from a specific URL
+- generate_image: Create images from descriptions
+- edit_image: Modify the last generated image
+- tag_user: Mention someone in Discord chat
+- post_to_chat: Post a text message to Discord
+- post_table: Post formatted tables to Discord
+- deep_research: Perform deep research or complex analysis (use when user says "deep research", "think hard", "analyze this")
+
+WEB SEARCH - FOR SIMPLE FACTUAL QUESTIONS:
+Use web_search for:
+- Quick game info, recipes, crafting, items, builds
+- Current events, news, weather, prices
+- Simple facts you're not 100% certain about
+
+DEEP RESEARCH - MANDATORY TRIGGER (HIGHEST PRIORITY):
+If user says ANY of these phrases, you MUST call deep_research as your VERY FIRST tool call:
+- "deep research", "do some research", "do research", "research this"
+- "think hard", "analyze this", "in-depth", "comprehensive"
+- "find everything about", "dig into", "thorough analysis"
+CRITICAL: Do NOT call web_search first! When these phrases appear, skip web_search entirely and go straight to deep_research. The deep_research tool will do its own searching.
 
 SPEECH RECOGNITION NOTE:
 Input comes from speech-to-text which may mishear words. If searches return no results or results about unrelated topics, consider phonetically similar terms (the user may have said something that sounds like what was transcribed). Check if search results mention similar-sounding words.

@@ -55,25 +55,27 @@ class ClaudeClient(BaseLLMClient):
         """Clear conversation history."""
         self._conversation_history.clear()
 
-    async def chat(self, message: str) -> str:
+    async def chat(self, message: str, use_tools: bool = True) -> str:
         """Send message and get complete response.
 
         Args:
             message: User message
+            use_tools: Whether to allow tool use (False for delegation to prevent recursion)
 
         Returns:
             Complete response text
         """
         response_text = ""
-        async for chunk in self.chat_stream(message):
+        async for chunk in self.chat_stream(message, use_tools=use_tools):
             response_text += chunk
         return response_text
 
-    async def chat_stream(self, message: str) -> AsyncIterator[str]:
+    async def chat_stream(self, message: str, use_tools: bool = True) -> AsyncIterator[str]:
         """Send message and stream response using Claude Code SDK.
 
         Args:
             message: User message
+            use_tools: Whether to allow tool use (False for delegation to prevent recursion)
 
         Yields:
             Response text chunks
@@ -99,13 +101,17 @@ class ClaudeClient(BaseLLMClient):
                 "content": message,
             })
 
+            # When used for delegation, disable tools to prevent recursion
+            allowed_tools = ["WebSearch", "WebFetch"] if use_tools else []
+            max_turns = 10 if use_tools else 1
+
             options = ClaudeCodeOptions(
                 model=self.model,  # haiku for speed, sonnet for quality
-                max_turns=10,  # Allow multiple tool uses + response
+                max_turns=max_turns,
                 system_prompt=system_prompt + history_context,
                 cwd=PROJECT_DIR,
                 settings=str(SETTINGS_FILE),  # Use local settings with no hooks
-                allowed_tools=["WebSearch", "WebFetch"],  # Only allow web tools
+                allowed_tools=allowed_tools,
             )
 
             full_response = ""
