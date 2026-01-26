@@ -534,10 +534,12 @@ class StreamingSink(discord.sinks.Sink):
 
         elif self._state == "listening":
             # SPEAKER ISOLATION: Only buffer audio from the wake word speaker
-            if self._speaker_isolation_enabled and self._last_user_id is not None and user_id != self._last_user_id:
+            # Use _wake_word_user_id (captured at detection time) to avoid race conditions
+            # where packets from other users arrive between detection and start_listening()
+            if self._speaker_isolation_enabled and self._wake_word_user_id is not None and user_id != self._wake_word_user_id:
                 # Track interference for debugging (log once per user per session)
                 if user_id not in self._filtered_users:
-                    logger.info(f"[SINK ISOLATION] Filtering audio from user {user_id} (locked to {self._last_user_id})")
+                    logger.info(f"[SINK ISOLATION] Filtering audio from user {user_id} (locked to {self._wake_word_user_id})")
                     self._filtered_users.add(user_id)
                 # Don't buffer this audio - PTT timing already handled above
                 # Still process through speaking detector for awareness
