@@ -51,6 +51,28 @@ Modified `src/llm/groq_client.py`:
 - `get_definitions()` used for available tools when enabled
 - `reset_counters()` called at request start when enabled
 
+### Integration Testing (Step 1.9)
+Created `tests/llm/test_groq_feature_flags.py` with 14 tests:
+- Feature flag disabled tests (3 tests)
+- Feature flag enabled tests (4 tests)
+- Tool execution routing tests (4 tests)
+- Available tools routing tests (2 tests)
+- Counter reset tests (1 test)
+
+### Ready for Production Testing
+To test the new system:
+1. Set `USE_NEW_TOOL_REGISTRY=true` in `.env`
+2. Set `USE_NEW_PROMPT_BUILDER=true` in `.env`
+3. Run the bot: `python -m src.main`
+4. Test voice commands triggering each tool:
+   - "Search for Python tutorials" (web_search)
+   - "Generate an image of a cat" (generate_image)
+   - "What is X? Do some research" (deep_research)
+5. Verify logs show "Using new modular tool registry"
+6. Disable flags and verify old path still works
+
+After production testing is successful, proceed to Step 1.10 to remove old code.
+
 ### Files Created
 - [x] src/core/__init__.py
 - [x] src/core/state_machine.py (~180 lines)
