@@ -64,7 +64,20 @@ class NanoBananaClient:
         Raises:
             ValueError: If no image found in response
         """
-        for part in response.candidates[0].content.parts:
+        # Check for valid response structure
+        if not response.candidates:
+            raise ValueError("No candidates in response - request may have been blocked")
+
+        candidate = response.candidates[0]
+        if candidate.content is None:
+            # Check if there's a block reason
+            finish_reason = getattr(candidate, 'finish_reason', None)
+            raise ValueError(f"No content in response (finish_reason: {finish_reason}) - likely blocked by safety filters")
+
+        if not candidate.content.parts:
+            raise ValueError("No parts in response content")
+
+        for part in candidate.content.parts:
             if hasattr(part, 'inline_data') and part.inline_data is not None:
                 original_mime = getattr(part.inline_data, 'mime_type', 'unknown')
                 logger.info(f"Gemini returned image with MIME type: {original_mime}")
