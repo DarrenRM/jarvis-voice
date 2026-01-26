@@ -99,6 +99,12 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     log_latency_metrics: bool = Field(default=True, alias="LOG_LATENCY_METRICS")
 
+    # Feature Flags - Architecture Refactoring (Phase 1)
+    # Set to True to use new modular tool system
+    use_new_tool_registry: bool = Field(default=False, alias="USE_NEW_TOOL_REGISTRY")
+    # Set to True to use new system prompt builder
+    use_new_prompt_builder: bool = Field(default=False, alias="USE_NEW_PROMPT_BUILDER")
+
     @property
     def chunk_size(self) -> int:
         """Calculate chunk size in samples."""

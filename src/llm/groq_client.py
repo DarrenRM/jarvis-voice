@@ -13,10 +13,12 @@ from typing import TYPE_CHECKING, AsyncIterator, Awaitable, Callable, Optional
 
 from .base import BaseLLMClient
 from ..search.search_service import SearchService
+from ..config import get_settings
 
 if TYPE_CHECKING:
     from ..image import NanoBananaClient
     from .claude_client import ClaudeClient
+    from ..tools import ToolRegistry, ToolExecutor
 
 logger = logging.getLogger(__name__)
 
@@ -207,6 +209,7 @@ class GroqClient(BaseLLMClient):
         on_user_tagged: Optional[Callable[[str, str], Awaitable[str]]] = None,
         on_message_posted: Optional[Callable[[str], Awaitable[str]]] = None,
         claude_service: Optional["ClaudeClient"] = None,
+        tool_registry: Optional["ToolRegistry"] = None,
     ):
         """Initialize Groq client.
 
@@ -221,6 +224,7 @@ class GroqClient(BaseLLMClient):
             on_user_tagged: Callback to tag a user in Discord (target_name, message) -> result
             on_message_posted: Callback to post a message to Discord (message) -> result
             claude_service: Claude client for complex task delegation
+            tool_registry: Optional tool registry for new modular tool system
         """
         self.api_key = api_key
         self.model = model
@@ -237,6 +241,21 @@ class GroqClient(BaseLLMClient):
         self._on_message_posted = on_message_posted
         self._claude_service = claude_service
         self._client = None
+
+        # Feature flag: Use new modular tool system
+        self._settings = get_settings()
+        self._tool_executor = None
+        self._prompt_builder = None
+
+        if self._settings.use_new_tool_registry and tool_registry is not None:
+            from ..tools import ToolExecutor
+            self._tool_executor = ToolExecutor(tool_registry)
+            logger.info("Using new modular tool registry")
+
+        if self._settings.use_new_prompt_builder:
+            from .system_prompt_builder import create_default_prompt_builder
+            self._prompt_builder = create_default_prompt_builder()
+            logger.info("Using new system prompt builder")
 
     def _ensure_client(self) -> None:
         """Lazy initialization of Groq client."""
@@ -296,6 +315,10 @@ class GroqClient(BaseLLMClient):
             self._search_calls_this_request = 0  # Only count search/fetch toward limit
             last_action_success = None  # Track successful action tool results (image, tag)
 
+            # Reset counters on new tool executor if using it
+            if self._tool_executor is not None:
+                self._tool_executor.reset_counters()
+
             # Tool use loop (up to max_turns)
             # After 3 SEARCH tool calls, disable search but allow action tools
             MAX_SEARCH_CALLS = 3
@@ -311,11 +334,19 @@ class GroqClient(BaseLLMClient):
                 search_limit_reached = self._search_calls_this_request >= MAX_SEARCH_CALLS
 
                 # Build available tools based on search limit
-                available_tools = TOOLS.copy()
-                if search_limit_reached:
-                    # Remove search tools, keep action tools (generate_image, edit_image, tag_user)
-                    available_tools = [t for t in TOOLS if t["function"]["name"] in ACTION_TOOLS]
-                    logger.info(f"Search limit reached ({self._search_calls_this_request}), action tools only: {[t['function']['name'] for t in available_tools]}")
+                # Feature flag: Use new executor's definitions if available
+                if self._tool_executor is not None:
+                    available_tools = self._tool_executor.get_definitions(
+                        search_limit_reached=search_limit_reached
+                    )
+                    if search_limit_reached:
+                        logger.info(f"Search limit reached ({self._search_calls_this_request}), action tools only")
+                else:
+                    available_tools = TOOLS.copy()
+                    if search_limit_reached:
+                        # Remove search tools, keep action tools (generate_image, edit_image, tag_user)
+                        available_tools = [t for t in TOOLS if t["function"]["name"] in ACTION_TOOLS]
+                        logger.info(f"Search limit reached ({self._search_calls_this_request}), action tools only: {[t['function']['name'] for t in available_tools]}")
 
                     # Add instruction to use gathered info or take action
                     force_answer_msg = "You have gathered enough search information. DO NOT search again. Either: (1) Answer the user's question using the info you gathered, OR (2) If the user requested an image/infographic, call generate_image NOW with a detailed prompt based on what you learned. Give a brief 1-2 sentence voice response."
@@ -633,6 +664,18 @@ class GroqClient(BaseLLMClient):
 
         logger.info(f"Executing tool: {function_name} with args: {args}")
 
+        # Feature flag: Use new modular tool executor
+        if self._tool_executor is not None:
+            result = await self._tool_executor.execute(
+                function_name,
+                args,
+                conversation_history=self._conversation_history[-6:],
+            )
+            if result.success:
+                return result.output
+            else:
+                return f"Error: {result.error}"
+
         try:
             # Image generation tool
             if function_name == "generate_image":
@@ -839,6 +882,10 @@ RECENT CONVERSATION (for context, may not be relevant):
 
     def _build_system_prompt(self) -> str:
         """Build system prompt for voice assistant."""
+        # Feature flag: Use new modular prompt builder
+        if self._prompt_builder is not None:
+            return self._prompt_builder.build(additional_context=self._context)
+
         base_prompt = """You are Jarvis, an AI voice assistant. You respond to voice commands.
 
 CRITICAL OUTPUT FORMAT:
