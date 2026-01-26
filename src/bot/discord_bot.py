@@ -306,6 +306,12 @@ class ClaudeBot(commands.Bot):
         # Disconnect from all voice channels
         for vc in self.voice_clients:
             try:
+                # Clear speaking state before disconnect to fix "stuck green circle"
+                if vc.ws:
+                    try:
+                        await vc.ws.speak(False)
+                    except Exception:
+                        pass
                 await vc.disconnect(force=True)
             except Exception as e:
                 logger.warning(f"Error disconnecting: {e}")

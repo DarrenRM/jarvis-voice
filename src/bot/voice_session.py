@@ -369,11 +369,28 @@ class VoiceSession:
             await asyncio.gather(*self._tts_tasks, return_exceptions=True)
             self._tts_tasks.clear()
 
-        if self.voice_client and self.voice_client.recording:
-            self.voice_client.stop_recording()
+        # Stop recording (may fail if socket already dead, that's OK)
+        if self.voice_client:
+            try:
+                if self.voice_client.recording:
+                    self.voice_client.stop_recording()
+            except Exception as e:
+                logger.debug(f"stop_recording failed (socket may be dead): {e}")
 
-        if self.voice_client and self.voice_client.is_playing():
-            self.voice_client.stop()
+        # Stop any playback
+        if self.voice_client:
+            try:
+                if self.voice_client.is_playing():
+                    self.voice_client.stop()
+            except Exception as e:
+                logger.debug(f"stop playback failed: {e}")
+
+        # Clear speaking state to fix "stuck green circle"
+        if self.voice_client:
+            try:
+                await self.voice_client.ws.speak(False)
+            except Exception as e:
+                logger.debug(f"speak(False) failed: {e}")
 
         # Reset image editing context (Gemini chat session)
         if self.llm and hasattr(self.llm, '_image_service') and self.llm._image_service:
