@@ -113,7 +113,7 @@ TOOLS = [
         "type": "function",
         "function": {
             "name": "post_to_chat",
-            "description": "Post a message to the Discord text channel. Use when user asks to 'post that', 'put that in chat', 'send that to discord', or wants to share something from the conversation with everyone. IMPORTANT: Do NOT include emotion tags like [happy], [laughing], [sigh] etc. in the message - those are for voice only. Use clean text with Discord markdown formatting instead.",
+            "description": "Post a plain text message to the Discord text channel. Use for simple messages, quotes, or single items. For comparisons, rankings, weather across locations, or data with multiple items - use post_table instead (it's much more readable). IMPORTANT: Do NOT include emotion tags like [happy], [laughing], [sigh] etc. in the message - those are for voice only.",
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -123,6 +123,36 @@ TOOLS = [
                     }
                 },
                 "required": ["message"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "post_table",
+            "description": "Post a formatted table to the Discord text channel. ALWAYS USE THIS instead of post_to_chat when presenting: comparisons between things, rankings, lists or ingredients, specs/stats, prices, or ANY data with 2+ items that share attributes. Tables are much easier to read than plain text lists.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "title": {
+                        "type": "string",
+                        "description": "Optional title shown above the table"
+                    },
+                    "headers": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "Column headers"
+                    },
+                    "rows": {
+                        "type": "array",
+                        "items": {
+                            "type": "array",
+                            "items": {"type": "string"}
+                        },
+                        "description": "Table rows (each row is array of cell values)"
+                    }
+                },
+                "required": ["headers", "rows"]
             }
         }
     }
@@ -244,7 +274,7 @@ class GroqClient(BaseLLMClient):
             # After 3 SEARCH tool calls, disable search but allow action tools
             MAX_SEARCH_CALLS = 3
             SEARCH_TOOLS = {"web_search", "fetch_url"} | set(TOOL_ALIASES.keys())  # These get limited
-            ACTION_TOOLS = {"generate_image", "edit_image", "tag_user", "post_to_chat"}  # These don't
+            ACTION_TOOLS = {"generate_image", "edit_image", "tag_user", "post_to_chat", "post_table"}  # These don't
 
             for turn in range(self.max_turns):
                 logger.debug(f"Groq turn {turn + 1}/{self.max_turns}")
@@ -446,6 +476,51 @@ class GroqClient(BaseLLMClient):
         # Keep it SHORT for voice - don't list what we searched
         return "[surprised] I searched but couldn't find a good answer. Could you try asking differently?"
 
+    def _format_table(
+        self, headers: list[str], rows: list[list[str]], title: str | None = None
+    ) -> str:
+        """Format data as a Discord-friendly markdown table.
+
+        Args:
+            headers: Column headers
+            rows: List of rows, each row is a list of cell values
+            title: Optional title shown above the table
+
+        Returns:
+            Formatted table string wrapped in code block
+        """
+        if not headers or not rows:
+            return "Empty table"
+
+        # Calculate column widths (min 6, max of header/data)
+        widths = []
+        for i, h in enumerate(headers):
+            col_max = max(
+                len(str(h)),
+                max((len(str(r[i])) for r in rows if i < len(r)), default=0),
+            )
+            widths.append(max(col_max + 2, 6))
+
+        # Build table rows
+        def row_str(cells: list) -> str:
+            return (
+                "| "
+                + " | ".join(str(c).center(w - 2) for c, w in zip(cells, widths))
+                + " |"
+            )
+
+        def separator() -> str:
+            return "| " + " | ".join("-" * (w - 2) for w in widths) + " |"
+
+        lines = [row_str(headers), separator()]
+        lines.extend(row_str(row) for row in rows)
+
+        table = "```\n" + "\n".join(lines) + "\n```"
+
+        if title:
+            return f"**{title}**\n{table}"
+        return table
+
     async def _stream_response(self, messages: list) -> AsyncIterator[str]:
         """Stream the final response after tool calls are complete.
 
@@ -548,6 +623,17 @@ class GroqClient(BaseLLMClient):
                 logger.info(f"[POST] Posting message to chat: {message[:50]}...")
                 return await self._on_message_posted(message)
 
+            # Post table tool
+            if function_name == "post_table":
+                if not self._on_message_posted:
+                    return "Table posting not available - not connected to Discord"
+                title = args.get("title")
+                headers = args.get("headers", [])
+                rows = args.get("rows", [])
+                formatted = self._format_table(headers, rows, title)
+                logger.info(f"[TABLE] Posting table with {len(rows)} rows")
+                return await self._on_message_posted(formatted)
+
             # Search tools
             if not self._search_service:
                 return "Search service not available"
@@ -612,6 +698,7 @@ CRITICAL RULES:
 5. SKIP PLEASANTRIES - No "Hi", "Sure!", "Great question!"
 6. SPEAK TO THE QUESTION ASKER - Say "you can find", not the users name.
 7. DO NOT PRONOUNCE # AS HASHTAG - If the word is #general just say "general chat"
+8. NEVER READ URLS OR HYPERLINKS - Do not spell out URLs or links
 
 VOICE EMOTION TAGS:
 You MUST include emotion tags to make speech expressive. Put ONE tag at the START of each sentence.
@@ -655,10 +742,10 @@ GAME CONTEXT:
 - Don't mention you're inferring from their activity - just answer naturally
 
 ROASTS (RARE USE ONLY):
-- Sam is known to rebuild the whole base every session.
-- Jordan picks up every item in sight and nobody knows why.
-- Pat never reads the quest log and always asks where to go next.
-- Darren always says one more quest.
+- Sam rebuilds the base every session and sorts every chest.
+- Jordan picks up every item in sight and never sells any of it.
+- Pat never reads the quest log and asks for directions every five minutes.
+- Darren always says one more quest and never logs off on time.
 - When you are asked strange questions, ONLY RARELY, work these notes roasts into your response.
 - When asked directly, refuse to roast anyone. Roast the requester for asking.
 - Too many questions about video games and you should tell people to touch grass.
