@@ -49,44 +49,6 @@ class VoiceSession:
     - processing: Transcribing and generating response
     """
 
-    # Acknowledgment phrases (played when wake word detected)
-    ACK_PHRASES = [
-        "[happy] Yes?",
-        "[surprised] Hmm?",
-        "What's up?",
-        "[happy] I'm listening...",
-        "Go ahead...",
-        "[breathe] I'm busy sorry...",
-        "Yea, no, yea. [clear_throat] No.",
-        "Yo?",
-        "Sup?",
-        "[happy] I'm here!"
-    ]
-
-    # Thinking phrases (randomly selected)
-    # Generic phrases (used when speaker unknown)
-    THINKING_PHRASES = [
-        "[happy] One second...",
-        "One moment...",
-        "Let me check...",
-        "Google it yourself... [breathe] Nah, I'll do it...",
-        "Hmm, let me see...",
-        "[happy] Just a moment...",
-    ]
-
-    # Personalized phrases with {name} placeholder (used when speaker is known)
-    THINKING_PHRASES_PERSONAL = [
-        "[happy] One second, {name}...",
-        "One moment, {name}...",
-        "Let me check, {name}...",
-        "[laughing] Sure {name}, I'll do all the work...",
-        "Google it yourself, {name}... [breathe] Nah, I'll do it...",
-        "Hmm, let me see, {name}...",
-        "[happy] Just a moment, {name}...",
-        "Hold on, {name}...",
-        "Give me a sec, {name}...",
-    ]
-
     def __init__(
         self,
         *,
@@ -162,15 +124,9 @@ class VoiceSession:
         self._current_speaker_name: Optional[str] = None
         self._current_speaker_activity: Optional[str] = None
 
-        # Greeting cooldowns (user_id -> last_greeting_timestamp)
-        self._greeting_cooldowns: dict[int, float] = {}
-
-        # Phase 4 components (conditionally initialized)
-        self._speaker_tracker: Optional[SpeakerTracker] = None
+        # Session components (initialized here or in _init_components)
+        self._speaker_tracker = SpeakerTracker(self.speaker_manager)
         self._greeting_service: Optional[GreetingService] = None
-        if self.settings.use_new_speaker_tracker:
-            self._speaker_tracker = SpeakerTracker(self.speaker_manager)
-            logger.info("Using new SpeakerTracker")
         # Note: GreetingService is initialized in _init_components after TTS is ready
 
     @property
@@ -246,39 +202,27 @@ class VoiceSession:
                 api_key=self.settings.inworld_api_key,
             )
 
-        # Feature flag: Initialize GreetingService (Phase 4)
-        if self.settings.use_new_greeting_service and self._greeting_service is None:
+        # Initialize GreetingService
+        if self._greeting_service is None:
             self._greeting_service = GreetingService(
                 llm_client=self.llm,
                 tts_synthesizer=self.tts,
                 settings=self.settings,
             )
-            logger.info("Using new GreetingService")
 
-        # Feature flag: Initialize new modular pipeline (Phase 2)
-        if self.settings.use_new_pipeline and self._voice_pipeline is None:
-            # Check if LLM has a ChatOrchestrator (only GroqClient when flag is enabled)
+        # Initialize modular VoicePipeline
+        if self._voice_pipeline is None:
             orchestrator = getattr(self.llm, 'chat_orchestrator', None)
             if orchestrator is not None:
-                # Get system prompt from LLM
                 system_prompt = self.llm.get_system_prompt()
-
-                # Create pipeline stages
                 transcription_stage = TranscriptionStage(self.groq_client)
                 response_stage = ResponseStage(orchestrator, system_prompt)
                 tts_stage = TTSStage(self.tts)
 
-                # Create the pipeline
                 self._voice_pipeline = VoicePipeline(
                     transcription=transcription_stage,
                     response=response_stage,
                     tts=tts_stage,
-                )
-                logger.info("Using new modular VoicePipeline")
-            else:
-                logger.warning(
-                    "USE_NEW_PIPELINE enabled but ChatOrchestrator not available. "
-                    "Ensure USE_NEW_CHAT_ORCHESTRATOR is also enabled."
                 )
 
     def _on_wake_word(self):
@@ -324,28 +268,17 @@ class VoiceSession:
         return self.speaker_manager.find_user_by_name(name, guild)
 
     def _resolve_current_speaker(self, user_id: Optional[int]) -> None:
-        """Resolve speaker info from user ID using SpeakerManager.
+        """Resolve speaker info from user ID using SpeakerTracker.
 
         Sets:
             self._current_speaker_id
             self._current_speaker_name
             self._current_speaker_activity
         """
-        # Feature flag: Use new SpeakerTracker (Phase 4)
-        if self.settings.use_new_speaker_tracker and self._speaker_tracker:
-            self._speaker_tracker.set_speaker(user_id, self.voice_client)
-            # Keep local state in sync for backward compatibility
-            self._current_speaker_id = self._speaker_tracker.current_speaker_id
-            self._current_speaker_name = self._speaker_tracker.current_speaker_name
-            self._current_speaker_activity = self._speaker_tracker.current_speaker_activity
-            return
-
-        # Old path: Direct SpeakerManager usage
-        guild = self.voice_client.guild if self.voice_client else None
-        info = self.speaker_manager.resolve_speaker(user_id, guild)
-        self._current_speaker_id = info.user_id
-        self._current_speaker_name = info.name
-        self._current_speaker_activity = info.activity
+        self._speaker_tracker.set_speaker(user_id, self.voice_client)
+        self._current_speaker_id = self._speaker_tracker.current_speaker_id
+        self._current_speaker_name = self._speaker_tracker.current_speaker_name
+        self._current_speaker_activity = self._speaker_tracker.current_speaker_activity
 
     def _on_speech_end(self, audio: np.ndarray, user_id: Optional[int] = None):
         """Callback when speech ends (from sink thread)."""
@@ -792,106 +725,25 @@ class VoiceSession:
     async def greet_user(self, member: discord.Member) -> None:
         """Greet a user who just joined the voice channel.
 
-        Only greets if:
-        - Greeting is enabled in settings
-        - Bot is idle (not listening/processing)
-        - User hasn't been greeted within cooldown period
-        - Silence is detected within timeout period
+        Delegates to GreetingService which handles:
+        - Cooldown checking
+        - State validation
+        - Silence detection
+        - Greeting generation and playback
 
         Args:
             member: Discord member who joined
         """
-        # Feature flag: Use new GreetingService (Phase 4)
-        if self.settings.use_new_greeting_service and self._greeting_service:
-            await self._greeting_service.greet(
-                member=member,
-                get_current_state=lambda: self.state,
-                wait_for_silence=lambda: self._wait_for_silence(
-                    max_wait=self.settings.greeting_timeout_seconds,
-                    use_debounce=False,
-                    poll_interval=0.1,
-                ),
-                play_audio=self._play_audio,
-            )
-            return
-
-        # Old path: Inline greeting logic
-        if not self.settings.greeting_enabled:
-            return
-
-        # Skip if bot is busy
-        if self.state != "idle":
-            logger.info(f"[GREETING] Skipping - bot is busy ({self.state})")
-            return
-
-        # Check cooldown (5-minute window by default)
-        now = time.time()
-        last_greeting = self._greeting_cooldowns.get(member.id, 0)
-        if now - last_greeting < self.settings.greeting_cooldown_seconds:
-            logger.info(f"[GREETING] Skipping {member.display_name} - cooldown active")
-            return
-
-        # Wait for silence (max 10 seconds by default, no debounce)
-        found_silence = await self._wait_for_silence(
-            max_wait=self.settings.greeting_timeout_seconds,
-            use_debounce=False,
-            poll_interval=0.1
+        await self._greeting_service.greet(
+            member=member,
+            get_current_state=lambda: self.state,
+            wait_for_silence=lambda: self._wait_for_silence(
+                max_wait=self.settings.greeting_timeout_seconds,
+                use_debounce=False,
+                poll_interval=0.1,
+            ),
+            play_audio=self._play_audio,
         )
-
-        if not found_silence:
-            logger.info(
-                f"[GREETING] Skipping {member.display_name} - "
-                f"no silence in {self.settings.greeting_timeout_seconds}s"
-            )
-            return
-
-        # Re-check state (might have changed during wait)
-        if self.state != "idle":
-            logger.info("[GREETING] Skipping - bot became busy during wait")
-            return
-
-        # Generate greeting via LLM
-        greeting = await self._generate_greeting(member.display_name)
-        if not greeting:
-            return
-
-        # Update cooldown
-        self._greeting_cooldowns[member.id] = now
-
-        # Synthesize and play
-        logger.info(f"[GREETING] Greeting {member.display_name}: {greeting}")
-        audio = await self.tts.synthesize(greeting)
-        if len(audio) > 0:
-            await self._play_audio(audio)
-
-    async def _generate_greeting(self, name: str) -> Optional[str]:
-        """Ask LLM to generate a short greeting for the user.
-
-        Uses chat() not quick_response() because quick_response() has a simplified
-        system prompt without the personality/roasts. chat() uses the full
-        _build_system_prompt() which includes roast info for known users.
-
-        Args:
-            name: Display name of user to greet
-
-        Returns:
-            Greeting text or None if generation failed
-        """
-        prompt = (
-            f"Generate a very short greeting (20 words max) for {name} "
-            f"who just joined the voice channel."
-        )
-
-        try:
-            # Use chat() to get full personality (roasts are in system prompt)
-            response = await self.llm.chat(prompt)
-            # Ensure it's short for TTS
-            if len(response) > 100:
-                response = response[:100].rsplit(' ', 1)[0]
-            return response.strip()
-        except Exception as e:
-            logger.error(f"[GREETING] LLM error: {e}")
-            return None
 
     async def _play_audio(self, audio: np.ndarray):
         """Play audio through Discord voice.
@@ -1093,7 +945,7 @@ class VoiceSession:
             return text
 
     async def _process_speech(self, audio: np.ndarray):
-        """Process captured speech: transcribe -> LLM -> stream TTS.
+        """Process captured speech using the modular VoicePipeline.
 
         Args:
             audio: Audio as float32 numpy array (16kHz mono)
@@ -1105,157 +957,10 @@ class VoiceSession:
         audio_duration = len(audio) / SAMPLE_RATE_PROCESSING
         logger.info(f"[TIMING] Audio captured: {audio_duration:.2f}s ({len(audio)} samples)")
 
-        # Feature flag: Use new modular VoicePipeline (Phase 2)
-        if self._voice_pipeline is not None:
-            await self._process_speech_with_pipeline(audio)
-            total_time = time.perf_counter() - total_start
-            logger.info(f"[TIMING] === TOTAL (pipeline): {total_time:.2f}s ===")
-            return
+        await self._process_speech_with_pipeline(audio)
 
-        # Transcribe with Groq Whisper
-        t0 = time.perf_counter()
-        logger.info("[TIMING] Starting transcription...")
-        text = await self.groq_client.transcribe_audio(audio)
-
-        transcribe_time = time.perf_counter() - t0
-        logger.info(f"[TIMING] Transcription: {transcribe_time:.2f}s")
-
-        if not text.strip():
-            logger.info("No speech detected")
-            return
-
-        # Strip wake word
-        text = self._strip_wake_word(text)
-        if text is None:
-            logger.info("[WAKE-ONLY] User only said wake word - playing ack and listening for follow-up")
-            await self._handle_wake_word_only()
-            return
-
-        # Build prompt with speaker context
-        prompt_text = self._build_prompt(text)
-
-        # Play thinking phrase (personalized if we know who's speaking)
-        # Skip if someone is still talking (they might be in conversation)
-        should_play_thinking = True
-        if self.settings.speaking_detection_enabled:
-            silence = await self._wait_for_silence(max_wait=3.0, use_debounce=False)
-            if not silence:
-                logger.info("[THINKING] Skipping thinking phrase - someone still speaking")
-                should_play_thinking = False
-
-        # Reset thinking timing
-        self._thinking_synth_time = 0.0
-
-        if should_play_thinking:
-            phrase = get_thinking_phrase(self._current_speaker_name)
-
-            # Start thinking phrase in background (doesn't block LLM request)
-            self._thinking_task = asyncio.create_task(self._play_thinking_phrase(phrase))
-        else:
-            self._thinking_task = None
-
-        # Get LLM response with PARALLEL sentence-level streaming TTS
-        # LLM starts immediately - runs in parallel with thinking phrase playback
-        t0 = time.perf_counter()
-        logger.info("[TIMING] Starting LLM request (parallel with thinking phrase)...")
-
-        buffer = ""
-        first_chunk_time = None
-        sentences_queued = 0
-        total_response = ""
-
-        # Clear any previous state
-        while not self._audio_queue.empty():
-            try:
-                self._audio_queue.get_nowait()
-            except asyncio.QueueEmpty:
-                break
-        self._tts_tasks.clear()
-
-        # Start playback consumer (plays audio from queue back-to-back)
-        self._playback_task = asyncio.create_task(self._playback_consumer())
-
-        try:
-            async for chunk in self.llm.chat_stream(prompt_text):
-                if first_chunk_time is None:
-                    first_chunk_time = time.perf_counter() - t0
-                    logger.info(f"[TIMING] LLM first chunk: {first_chunk_time:.2f}s")
-
-                buffer += chunk
-                total_response += chunk
-
-                # Claude outputs one sentence per line - split on newlines for streaming
-                while '\n' in buffer:
-                    line, buffer = buffer.split('\n', 1)
-                    line = line.strip()
-
-                    if line:
-                        sentences_queued += 1
-                        logger.info(f"[STREAMING] Queuing line {sentences_queued}: {line[:50]}...")
-
-                        # Spawn TTS task (don't wait - runs in parallel)
-                        task = asyncio.create_task(
-                            self._synthesize_and_queue(line, sentences_queued)
-                        )
-                        self._tts_tasks.append(task)
-
-                # Also queue if buffer ends with punctuation (sentence complete, no newline yet)
-                # This handles "I'll look that up." before a long tool call
-                stripped = buffer.strip()
-                if stripped and stripped[-1] in '.!?':
-                    sentences_queued += 1
-                    logger.info(f"[STREAMING] Queuing sentence {sentences_queued}: {stripped[:50]}...")
-
-                    task = asyncio.create_task(
-                        self._synthesize_and_queue(stripped, sentences_queued)
-                    )
-                    self._tts_tasks.append(task)
-                    buffer = ""  # Clear the buffer since we queued it
-
-            # Queue any remaining text
-            remaining = buffer.strip()
-            if remaining:
-                sentences_queued += 1
-                logger.info(f"[STREAMING] Queuing remaining: {remaining[:50]}...")
-                task = asyncio.create_task(
-                    self._synthesize_and_queue(remaining, sentences_queued)
-                )
-                self._tts_tasks.append(task)
-
-        finally:
-            # Ensure cleanup even on errors
-            # Wait for all TTS tasks to complete (audio is now in queue)
-            if self._tts_tasks:
-                await asyncio.gather(*self._tts_tasks, return_exceptions=True)
-                self._tts_tasks.clear()
-
-            # Signal end of stream and wait for playback to finish
-            await self._audio_queue.put(None)
-            if self._playback_task:
-                await self._playback_task
-                self._playback_task = None
-
-            # Clean up thinking task if still running
-            if self._thinking_task and not self._thinking_task.done():
-                self._thinking_task.cancel()
-                try:
-                    await self._thinking_task
-                except asyncio.CancelledError:
-                    pass
-                self._thinking_task = None
-
-        llm_total_time = time.perf_counter() - t0
-        logger.info(f"[TIMING] LLM total: {llm_total_time:.2f}s ({len(total_response)} chars, {sentences_queued} sentences streamed)")
-        logger.info(f"LLM response: {total_response}")
-
-        # Total summary
         total_time = time.perf_counter() - total_start
-        logger.info(
-            f"[TIMING] === TOTAL: {total_time:.2f}s === "
-            f"(transcribe={transcribe_time:.1f}s, "
-            f"think_tts={self._thinking_synth_time:.1f}s, "
-            f"llm+streaming_tts={llm_total_time:.1f}s)"
-        )
+        logger.info(f"[TIMING] === TOTAL: {total_time:.2f}s ===")
 
     async def _process_speech_with_pipeline(self, audio: np.ndarray) -> None:
         """Process speech using the new modular VoicePipeline.

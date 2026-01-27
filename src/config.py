@@ -99,30 +99,6 @@ class Settings(BaseSettings):
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
     log_latency_metrics: bool = Field(default=True, alias="LOG_LATENCY_METRICS")
 
-    # Feature Flags - Architecture Refactoring (Phase 1)
-    # Set to True to use new modular tool system
-    use_new_tool_registry: bool = Field(default=False, alias="USE_NEW_TOOL_REGISTRY")
-    # Set to True to use new system prompt builder
-    use_new_prompt_builder: bool = Field(default=False, alias="USE_NEW_PROMPT_BUILDER")
-
-    # Feature Flags - Architecture Refactoring (Phase 2)
-    # Set to True to use new VoicePipeline (parallel TTS, ordered playback)
-    use_new_pipeline: bool = Field(default=False, alias="USE_NEW_PIPELINE")
-    # Set to True to use new ChatOrchestrator (extracted tool loop)
-    use_new_chat_orchestrator: bool = Field(default=False, alias="USE_NEW_CHAT_ORCHESTRATOR")
-
-    # Feature Flags - Architecture Refactoring (Phase 3)
-    # Set to True to use new PerUserAudioManager (per-user state management)
-    use_new_sink_manager: bool = Field(default=False, alias="USE_NEW_SINK_MANAGER")
-    # Set to True to use new WakeWordProcessor (wake detection logic)
-    use_new_wake_processor: bool = Field(default=False, alias="USE_NEW_WAKE_PROCESSOR")
-
-    # Feature Flags - Architecture Refactoring (Phase 4)
-    # Set to True to use new SpeakerTracker (speaker context management)
-    use_new_speaker_tracker: bool = Field(default=False, alias="USE_NEW_SPEAKER_TRACKER")
-    # Set to True to use new GreetingService (greeting logic with cooldowns)
-    use_new_greeting_service: bool = Field(default=False, alias="USE_NEW_GREETING_SERVICE")
-
     @property
     def chunk_size(self) -> int:
         """Calculate chunk size in samples."""
