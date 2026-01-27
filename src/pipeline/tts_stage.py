@@ -14,6 +14,7 @@ from typing import AsyncIterator, Callable, Optional, Protocol
 import numpy as np
 
 from ..audio import OrderedPlaybackQueue
+from ..tts.text_filter import is_reasoning_text
 from .base import PipelineContext, StreamingPipelineStage
 
 logger = logging.getLogger(__name__)
@@ -176,6 +177,15 @@ class TTSStage(StreamingPipelineStage):
             sentence_num: Sentence number for ordering
             queue: Playback queue for audio output
         """
+        # Filter out LLM reasoning/thinking text before TTS
+        if is_reasoning_text(text):
+            logger.debug(f"[TTS] Filtered reasoning text: {text[:80]}...")
+            # Queue empty audio to maintain ordering
+            asyncio.create_task(
+                queue.put(sentence_num, np.array([], dtype=np.float32))
+            )
+            return
+
         task = asyncio.create_task(
             self._synthesize_and_queue(text, sentence_num, queue)
         )

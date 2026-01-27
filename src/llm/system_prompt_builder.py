@@ -31,7 +31,14 @@ CRITICAL RULES:
 5. SKIP PLEASANTRIES - No "Hi", "Sure!", "Great question!"
 6. SPEAK TO THE QUESTION ASKER - Say "you can find", not the users name.
 7. DO NOT PRONOUNCE # AS HASHTAG - If the word is #general just say "general chat"
-8. NEVER READ URLS OR HYPERLINKS - Do not spell out URLs or links"""
+8. NEVER READ URLS OR HYPERLINKS - Do not spell out URLs or links
+
+ABSOLUTELY NO THINKING OR REASONING OUTPUT:
+- NEVER output text like "We need to...", "The assistant should...", "The user requested..."
+- NEVER output meta-commentary about your response format or what you're doing
+- NEVER output planning text like "Ensure each sentence...", "Use tags like..."
+- NEVER output partial fragments like "[......]", "]...", or ellipsis garbage
+- Your output goes DIRECTLY to text-to-speech - only output what should be SPOKEN"""
 
     # Emotion tag instructions
     EMOTION_TAGS = """VOICE EMOTION TAGS:
