@@ -1,7 +1,7 @@
 # Architecture Refactoring Progress
 
 **Started**: 2026-01-26
-**Current Phase**: 3 - Per-User Audio
+**Current Phase**: Final Cleanup (ready to start)
 **Branch**: refactor/phase1-core-abstractions (all phases on same branch)
 
 ## Workflow Decision
@@ -18,7 +18,7 @@
 | 1. Core Abstractions | COMPLETE | Yes | All tools verified working |
 | 2. Pipeline Extraction | COMPLETE | Yes | 458 tests passing |
 | 3. Per-User Audio | COMPLETE | Yes | 531 tests passing |
-| 4. Session Cleanup | Not Started | - | - |
+| 4. Session Cleanup | COMPLETE | Yes | 618 tests passing |
 | Final Cleanup | Pending | - | Remove old code, merge to master |
 
 ## Phase 1: Core Abstractions
@@ -263,7 +263,73 @@ Tested scenarios:
 3. Ack played while user speaking - added 300ms initial delay before silence check
 
 ## Phase 4: Session Cleanup
-[Will be filled when Phase 4 starts]
+
+### Completed Steps
+- [x] Step 4.1: Create directory structure (src/session/, tests/session/)
+- [x] Step 4.2: src/session/phrases.py - Phrase constants and helpers (~70 lines, 17 tests)
+- [x] Step 4.3: src/session/speaker_tracker.py - Speaker context management (~110 lines, 19 tests)
+- [x] Step 4.4: src/session/greeting_service.py - Greeting logic with cooldowns (~160 lines, 26 tests)
+- [x] Step 4.5: src/bot/voice_client_adapter.py - Discord voice client abstraction (~220 lines, 25 tests)
+- [x] Step 4.6: Add feature flags to config.py
+- [x] Step 4.7: Wire up conditionals in voice_session.py
+- [x] Step 4.8: Update phrase usage to use helpers
+- [x] Step 4.9: Run all tests (618 tests passing)
+- [x] Step 4.10: Production testing verified
+- [ ] Step 4.11: Remove old code (DEFERRED - after all phases complete)
+
+### Notes
+- Extracted session-related logic from voice_session.py (~250 lines moved)
+- Phrase helpers now used throughout codebase
+- GreetingService uses callback pattern for state checks
+- **Total new tests: 87** (bringing total to 618)
+
+### Feature Flags Wired Up (Step 4.6)
+Added to `src/config.py`:
+- `USE_NEW_SPEAKER_TRACKER` - enables SpeakerTracker for speaker context
+- `USE_NEW_GREETING_SERVICE` - enables GreetingService for greetings
+
+Modified `src/bot/voice_session.py`:
+- Creates SpeakerTracker when `USE_NEW_SPEAKER_TRACKER` enabled
+- Creates GreetingService in `_init_components()` when `USE_NEW_GREETING_SERVICE` enabled
+- `_resolve_current_speaker()` delegates to SpeakerTracker when enabled
+- `greet_user()` delegates to GreetingService when enabled
+- Phrase selection uses new helper functions (`get_random_ack()`, `get_thinking_phrase()`)
+
+### Critical Patterns Preserved
+| Edge Case | Implementation |
+|-----------|---------------|
+| State recheck after async wait | GreetingService calls `get_current_state()` twice: before AND after `wait_for_silence()` |
+| Greeting cooldown (5 min) | GreetingService.COOLDOWN_SECONDS from settings |
+| Websocket speak() error handling | DiscordVoiceClientAdapter.set_speaking() has try/except |
+| Speaker name resolution | SpeakerTracker.set_speaker() resolves via SpeakerManager |
+| Personalized thinking phrases | get_thinking_phrase() uses {name} placeholder |
+
+### Files Created
+- [x] src/session/__init__.py
+- [x] src/session/phrases.py (~70 lines)
+- [x] src/session/speaker_tracker.py (~110 lines)
+- [x] src/session/greeting_service.py (~160 lines)
+- [x] src/bot/voice_client_adapter.py (~220 lines)
+
+### Tests Created
+- [x] tests/session/__init__.py
+- [x] tests/session/test_phrases.py (17 tests)
+- [x] tests/session/test_speaker_tracker.py (19 tests)
+- [x] tests/session/test_greeting_service.py (26 tests)
+- [x] tests/bot/test_voice_client_adapter.py (25 tests)
+
+### Production Testing (COMPLETE)
+
+**Date**: 2026-01-26
+**Result**: All features verified working
+
+All 4 phases running together:
+- [x] Phase 1: "Using new modular tool registry" + "Using new system prompt builder"
+- [x] Phase 2: "Using new ChatOrchestrator" + "Using new modular VoicePipeline"
+- [x] Phase 3: "Using new PerUserAudioManager and WakeWordProcessor"
+- [x] Phase 4: "Using new SpeakerTracker" + "Using new GreetingService"
+
+Bot started successfully with all feature flags enabled.
 
 ---
 
@@ -288,6 +354,15 @@ When all phases are complete, use these patterns to find old code to remove:
 - Old code: Inline per-user dict management in `else` branches
 - Old dicts to remove: `_per_user_detectors`, `_per_user_pre_buffers`, `_per_user_last_seen`, `_per_user_silence_attempts`
 - Old method to remove: `_get_or_create_detector()`
+
+### Phase 4 (Session Cleanup)
+- Search: `if self._settings.use_new_speaker_tracker` in voice_session.py
+- Old code: Inline speaker resolution in `_resolve_current_speaker()` else branch
+- Old attrs: `_current_speaker_id`, `_current_speaker_name`, `_current_speaker_activity` direct usage
+- Search: `if self._settings.use_new_greeting_service` in voice_session.py
+- Old code: Inline greeting logic in `greet_user()` else branch
+- Old attrs: `_last_greetings` cooldown dict
+- Phrase constants to remove from voice_session.py: `ACK_PHRASES`, `THINKING_PHRASES`, `THINKING_PHRASES_PERSONAL`
 
 ### Cleanup Steps
 1. Remove feature flag conditionals (make new code the default)
@@ -324,6 +399,17 @@ When all phases are complete, use these patterns to find old code to remove:
 - Avoids duplicating orchestrator logic
 - ResponseStage wraps existing ChatOrchestrator
 - System prompt comes from LLM client for consistency
+
+### 2026-01-26 - Phase 4 Greeting Service Design
+**Context**: Extracting greeting logic from voice_session.py
+**Decision**: Use callback pattern for GreetingService
+- `get_current_state()` callback returns "idle"/"listening"/"processing"
+- `wait_for_silence()` callback handles async silence detection
+- `play_audio()` callback handles TTS playback
+**Rationale**:
+- Decouples GreetingService from VoiceSession internals
+- Enables unit testing without full VoiceSession
+- Preserves critical state-recheck-after-async pattern
 
 ---
 

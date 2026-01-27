@@ -32,6 +32,11 @@ from .speaker_manager import SpeakerManager, SpeakerInfo
 from .voice_sink import StreamingSink
 from .voice_source import TTSAudioSource
 
+# Phase 4 imports (conditionally used based on feature flags)
+from ..session.speaker_tracker import SpeakerTracker
+from ..session.greeting_service import GreetingService
+from ..session.phrases import get_random_ack, get_thinking_phrase
+
 logger = logging.getLogger(__name__)
 
 
@@ -160,6 +165,14 @@ class VoiceSession:
         # Greeting cooldowns (user_id -> last_greeting_timestamp)
         self._greeting_cooldowns: dict[int, float] = {}
 
+        # Phase 4 components (conditionally initialized)
+        self._speaker_tracker: Optional[SpeakerTracker] = None
+        self._greeting_service: Optional[GreetingService] = None
+        if self.settings.use_new_speaker_tracker:
+            self._speaker_tracker = SpeakerTracker(self.speaker_manager)
+            logger.info("Using new SpeakerTracker")
+        # Note: GreetingService is initialized in _init_components after TTS is ready
+
     @property
     def state(self) -> str:
         """Current session state."""
@@ -232,6 +245,15 @@ class VoiceSession:
                 voice=self.settings.tts_voice,
                 api_key=self.settings.inworld_api_key,
             )
+
+        # Feature flag: Initialize GreetingService (Phase 4)
+        if self.settings.use_new_greeting_service and self._greeting_service is None:
+            self._greeting_service = GreetingService(
+                llm_client=self.llm,
+                tts_synthesizer=self.tts,
+                settings=self.settings,
+            )
+            logger.info("Using new GreetingService")
 
         # Feature flag: Initialize new modular pipeline (Phase 2)
         if self.settings.use_new_pipeline and self._voice_pipeline is None:
@@ -309,6 +331,16 @@ class VoiceSession:
             self._current_speaker_name
             self._current_speaker_activity
         """
+        # Feature flag: Use new SpeakerTracker (Phase 4)
+        if self.settings.use_new_speaker_tracker and self._speaker_tracker:
+            self._speaker_tracker.set_speaker(user_id, self.voice_client)
+            # Keep local state in sync for backward compatibility
+            self._current_speaker_id = self._speaker_tracker.current_speaker_id
+            self._current_speaker_name = self._speaker_tracker.current_speaker_name
+            self._current_speaker_activity = self._speaker_tracker.current_speaker_activity
+            return
+
+        # Old path: Direct SpeakerManager usage
         guild = self.voice_client.guild if self.voice_client else None
         info = self.speaker_manager.resolve_speaker(user_id, guild)
         self._current_speaker_id = info.user_id
@@ -622,7 +654,7 @@ class VoiceSession:
                     return
 
             t0 = time.perf_counter()
-            ack_phrase = random.choice(self.ACK_PHRASES)
+            ack_phrase = get_random_ack()
             self._ack_played = True  # Mark early - prevents race with fast transcription
             ack_audio = await self.tts.synthesize(ack_phrase)
             synth_time = time.perf_counter() - t0
@@ -658,7 +690,7 @@ class VoiceSession:
             # Only play ack if one isn't already in progress
             # (_ack_played is set early in _play_ack to prevent race conditions)
             if not self._ack_played:
-                ack_phrase = random.choice(self.ACK_PHRASES)
+                ack_phrase = get_random_ack()
                 logger.info(f"[WAKE-ONLY] Playing ack: '{ack_phrase}'")
                 ack_audio = await self.tts.synthesize(ack_phrase)
                 if len(ack_audio) > 0:
@@ -769,6 +801,21 @@ class VoiceSession:
         Args:
             member: Discord member who joined
         """
+        # Feature flag: Use new GreetingService (Phase 4)
+        if self.settings.use_new_greeting_service and self._greeting_service:
+            await self._greeting_service.greet(
+                member=member,
+                get_current_state=lambda: self.state,
+                wait_for_silence=lambda: self._wait_for_silence(
+                    max_wait=self.settings.greeting_timeout_seconds,
+                    use_debounce=False,
+                    poll_interval=0.1,
+                ),
+                play_audio=self._play_audio,
+            )
+            return
+
+        # Old path: Inline greeting logic
         if not self.settings.greeting_enabled:
             return
 
@@ -1100,10 +1147,7 @@ class VoiceSession:
         self._thinking_synth_time = 0.0
 
         if should_play_thinking:
-            if self._current_speaker_name:
-                phrase = random.choice(self.THINKING_PHRASES_PERSONAL).format(name=self._current_speaker_name)
-            else:
-                phrase = random.choice(self.THINKING_PHRASES)
+            phrase = get_thinking_phrase(self._current_speaker_name)
 
             # Start thinking phrase in background (doesn't block LLM request)
             self._thinking_task = asyncio.create_task(self._play_thinking_phrase(phrase))
@@ -1245,12 +1289,7 @@ class VoiceSession:
         thinking_audio: Optional[np.ndarray] = None
 
         if should_play_thinking:
-            if self._current_speaker_name:
-                thinking_phrase = random.choice(self.THINKING_PHRASES_PERSONAL).format(
-                    name=self._current_speaker_name
-                )
-            else:
-                thinking_phrase = random.choice(self.THINKING_PHRASES)
+            thinking_phrase = get_thinking_phrase(self._current_speaker_name)
 
             # Pre-synthesize the thinking phrase
             try:

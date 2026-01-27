@@ -117,6 +117,12 @@ class Settings(BaseSettings):
     # Set to True to use new WakeWordProcessor (wake detection logic)
     use_new_wake_processor: bool = Field(default=False, alias="USE_NEW_WAKE_PROCESSOR")
 
+    # Feature Flags - Architecture Refactoring (Phase 4)
+    # Set to True to use new SpeakerTracker (speaker context management)
+    use_new_speaker_tracker: bool = Field(default=False, alias="USE_NEW_SPEAKER_TRACKER")
+    # Set to True to use new GreetingService (greeting logic with cooldowns)
+    use_new_greeting_service: bool = Field(default=False, alias="USE_NEW_GREETING_SERVICE")
+
     @property
     def chunk_size(self) -> int:
         """Calculate chunk size in samples."""

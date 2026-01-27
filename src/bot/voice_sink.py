@@ -516,32 +516,50 @@ class StreamingSink(discord.sinks.Sink):
                     if gap > 1.0:
                         self._per_user_pre_buffers.clear()
 
-                # Flush all per-user wake detectors - they may have stale audio from before the gap
-                # Phase 3: Flush detectors from user_manager if enabled
+                # Handle per-user wake detectors based on gap duration
+                # Short gaps (< 2.5s): flush to complete pending detections
+                # Long gaps (>= 2.5s): reset to clear stale neural network state (prevents false positives)
+                MAX_FLUSH_GAP = 2.5  # Match wake_processor.MAX_GAP_SECONDS
+
+                # Phase 3: Use new components if enabled
                 if self._settings.use_new_sink_manager and self._user_manager:
-                    for state in self._user_manager:
-                        detector = state.detector
-                        if detector and hasattr(detector, 'flush') and detector.flush():
-                            # Wake word was in pre-gap audio - attribute to that detector's user
-                            attributed_user = pre_gap_user_id if state.user_id == pre_gap_user_id else state.user_id
-                            if self._wake_processor:
-                                self._wake_processor._wake_word_user_id = attributed_user
-                            logger.info(f"[SINK] Wake word detected from flushed buffer! (user: {attributed_user})")
-                            if self._on_wake_word:
-                                self._on_wake_word()
-                                return  # Don't process current audio if wake word found
+                    if gap >= MAX_FLUSH_GAP:
+                        # Long gap - reset detectors (stale state causes false positives)
+                        logger.info(f"[SINK] Resetting wake detectors due to {gap:.1f}s gap (> {MAX_FLUSH_GAP}s)")
+                        self._user_manager.reset_all_detectors()
+                    else:
+                        # Short gap - flush to complete pending detections
+                        for state in self._user_manager:
+                            detector = state.detector
+                            if detector and hasattr(detector, 'flush') and detector.flush():
+                                # Wake word was in pre-gap audio - attribute to that detector's user
+                                attributed_user = pre_gap_user_id if state.user_id == pre_gap_user_id else state.user_id
+                                if self._wake_processor:
+                                    self._wake_processor._wake_word_user_id = attributed_user
+                                logger.info(f"[SINK] Wake word detected from flushed buffer! (user: {attributed_user})")
+                                if self._on_wake_word:
+                                    self._on_wake_word()
+                                    return  # Don't process current audio if wake word found
                 else:
                     # Old path: Flush detectors from _per_user_detectors
-                    for detector_user_id, detector in self._per_user_detectors.items():
-                        if hasattr(detector, 'flush') and detector.flush():
-                            # Wake word was in pre-gap audio - attribute to that detector's user
-                            # Use pre_gap_user_id if it matches, otherwise detector_user_id
-                            attributed_user = pre_gap_user_id if detector_user_id == pre_gap_user_id else detector_user_id
-                            self._wake_word_user_id = attributed_user
-                            logger.info(f"[SINK] Wake word detected from flushed buffer! (user: {attributed_user})")
-                            if self._on_wake_word:
-                                self._on_wake_word()
-                                return  # Don't process current audio if wake word found
+                    if gap >= MAX_FLUSH_GAP:
+                        # Long gap - reset detectors
+                        logger.info(f"[SINK] Resetting wake detectors due to {gap:.1f}s gap (> {MAX_FLUSH_GAP}s)")
+                        for detector in self._per_user_detectors.values():
+                            if hasattr(detector, 'reset'):
+                                detector.reset()
+                    else:
+                        # Short gap - flush to complete pending detections
+                        for detector_user_id, detector in self._per_user_detectors.items():
+                            if hasattr(detector, 'flush') and detector.flush():
+                                # Wake word was in pre-gap audio - attribute to that detector's user
+                                # Use pre_gap_user_id if it matches, otherwise detector_user_id
+                                attributed_user = pre_gap_user_id if detector_user_id == pre_gap_user_id else detector_user_id
+                                self._wake_word_user_id = attributed_user
+                                logger.info(f"[SINK] Wake word detected from flushed buffer! (user: {attributed_user})")
+                                if self._on_wake_word:
+                                    self._on_wake_word()
+                                    return  # Don't process current audio if wake word found
         # Update last audio time:
         # - In idle state: track all audio (for gap detection)
         # - In listening state with isolation: only track locked user (for PTT timeout)
