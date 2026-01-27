@@ -294,6 +294,9 @@ class ClaudeBot(commands.Bot):
         # Stop active session
         if self._session:
             await self._session.stop()
+            # Give recv_audio thread time to exit after stop_recording()
+            # This prevents "Event loop is closed" errors during shutdown
+            await asyncio.sleep(0.1)
 
         # Cancel session task
         if self._session_task:
