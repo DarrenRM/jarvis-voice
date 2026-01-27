@@ -150,13 +150,22 @@ class GroqClient(BaseLLMClient):
 
         self._ensure_client()
 
-        response = await self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            tools=tools if tools else None,
-            tool_choice=tool_choice if tools else None,
-            max_tokens=1024,
-        )
+        # Build API call kwargs
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "tools": tools if tools else None,
+            "tool_choice": tool_choice if tools else None,
+            "max_tokens": 1024,
+        }
+
+        # GPT-OSS models: disable reasoning output to prevent chain-of-thought leakage
+        # See: https://console.groq.com/docs/reasoning
+        if "gpt-oss" in self.model.lower():
+            kwargs["include_reasoning"] = False
+            kwargs["reasoning_effort"] = "low"  # Minimize reasoning tokens
+
+        response = await self._client.chat.completions.create(**kwargs)
 
         message = response.choices[0].message
 
@@ -186,12 +195,20 @@ class GroqClient(BaseLLMClient):
         """
         self._ensure_client()
 
-        stream = await self._client.chat.completions.create(
-            model=self.model,
-            messages=messages,
-            stream=True,
-            max_tokens=1024,
-        )
+        # Build API call kwargs
+        kwargs = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+            "max_tokens": 1024,
+        }
+
+        # GPT-OSS models: disable reasoning output to prevent chain-of-thought leakage
+        if "gpt-oss" in self.model.lower():
+            kwargs["include_reasoning"] = False
+            kwargs["reasoning_effort"] = "low"
+
+        stream = await self._client.chat.completions.create(**kwargs)
 
         async for chunk in stream:
             if chunk.choices[0].delta.content:
@@ -316,12 +333,20 @@ class GroqClient(BaseLLMClient):
                 {"role": "user", "content": message},
             ]
 
-            stream = await self._client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                max_tokens=self.max_tokens,
-                stream=True,
-            )
+            # Build API call kwargs
+            kwargs = {
+                "model": self.model,
+                "messages": messages,
+                "max_tokens": self.max_tokens,
+                "stream": True,
+            }
+
+            # GPT-OSS models: disable reasoning output
+            if "gpt-oss" in self.model.lower():
+                kwargs["include_reasoning"] = False
+                kwargs["reasoning_effort"] = "low"
+
+            stream = await self._client.chat.completions.create(**kwargs)
 
             async for chunk in stream:
                 if chunk.choices and chunk.choices[0].delta.content:

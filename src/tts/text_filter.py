@@ -32,6 +32,18 @@ REASONING_PATTERNS = [
     r"^(step|steps) \d+",
     r"^the answer\s*" + ELLIPSIS_CHARS,  # "The answer ..."
     r"^oops" + ELLIPSIS_CHARS,  # "Oops..."
+    # GPT-OSS reasoning leakage patterns (from known bug)
+    r"^the last response",
+    r"^it looks" + ELLIPSIS_CHARS,
+    r"^according to rules",
+    r"^must (be|not|include)",
+    r"^should be brief",
+    r"^could add",
+    r"^make sure",
+    r"^thus:?$",
+    r"^let's",
+    r"^first[,—]",
+    r"^sure!?\s*(let's|let me)",
 ]
 
 # Patterns for garbage/malformed output
