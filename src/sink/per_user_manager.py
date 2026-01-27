@@ -109,8 +109,8 @@ class PerUserAudioManager:
         if state.detector is not None:
             return state.detector
 
-        # Check detector limit
-        detector_count = sum(1 for s in self._users.values() if s.detector is not None)
+        # Check detector limit (snapshot to avoid race condition)
+        detector_count = sum(1 for s in list(self._users.values()) if s.detector is not None)
         if detector_count >= self._max_detectors:
             logger.warning(
                 f"[USER_MANAGER] Max detectors ({self._max_detectors}) reached, "
@@ -149,7 +149,8 @@ class PerUserAudioManager:
         Called on session stop or when sink goes to idle state
         and we want to release all resources.
         """
-        for state in self._users.values():
+        # Snapshot to avoid race condition during iteration
+        for state in list(self._users.values()):
             state.cleanup()
         self._users.clear()
         logger.debug("[USER_MANAGER] Cleaned up all users")
@@ -161,7 +162,8 @@ class PerUserAudioManager:
         Does not destroy detectors, just resets their internal state.
         Ported from voice_sink.py:147-148.
         """
-        for state in self._users.values():
+        # Snapshot to avoid race condition during iteration
+        for state in list(self._users.values()):
             state.reset_detector()
 
     def clear_all_silence_attempts(self) -> None:
@@ -170,7 +172,8 @@ class PerUserAudioManager:
         Called on idle transition.
         Ported from voice_sink.py:150.
         """
-        for state in self._users.values():
+        # Snapshot to avoid race condition during iteration
+        for state in list(self._users.values()):
             state.reset_silence_attempts()
 
     def clear_all_pre_buffers(self) -> None:
@@ -179,7 +182,8 @@ class PerUserAudioManager:
         Called after wake word transfer to prevent stale audio.
         Ported from voice_sink.py:224.
         """
-        for state in self._users.values():
+        # Snapshot to avoid race condition during iteration
+        for state in list(self._users.values()):
             state.clear_pre_buffer()
 
     def __iter__(self) -> Iterator[UserAudioState]:
@@ -187,8 +191,10 @@ class PerUserAudioManager:
 
         Yields:
             UserAudioState for each tracked user
+
+        Note: Returns snapshot to avoid race conditions.
         """
-        return iter(self._users.values())
+        return iter(list(self._users.values()))
 
     def __len__(self) -> int:
         """Number of tracked users.
@@ -214,4 +220,5 @@ class PerUserAudioManager:
         Returns:
             Count of users with active detectors
         """
-        return sum(1 for s in self._users.values() if s.detector is not None)
+        # Snapshot to avoid race condition during iteration
+        return sum(1 for s in list(self._users.values()) if s.detector is not None)
