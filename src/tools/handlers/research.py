@@ -27,17 +27,26 @@ class DeepResearchHandler(ToolHandler):
     # Context threshold for determining if we need Claude to research
     CONTEXT_THRESHOLD = 100
 
-    # Timeouts: more time if Claude needs to search
-    TIMEOUT_WITH_TOOLS = 90
-    TIMEOUT_WITHOUT_TOOLS = 45
+    # Timeout multipliers (applied to base_timeout)
+    # With tools (web search): needs more time for multiple searches
+    # Without tools (synthesis): faster, just needs to analyze provided context
+    TIMEOUT_MULTIPLIER_WITH_TOOLS = 3.0
+    TIMEOUT_MULTIPLIER_WITHOUT_TOOLS = 1.5
 
-    def __init__(self, claude_service: Optional[ClaudeService] = None):
+    def __init__(
+        self,
+        claude_service: Optional[ClaudeService] = None,
+        base_timeout: float = 30.0,
+    ):
         """Initialize deep research handler.
 
         Args:
             claude_service: Claude client for delegation
+            base_timeout: Base timeout in seconds (from CLAUDE_TIMEOUT setting).
+                         Multiplied by 3x for tool use, 1.5x for synthesis.
         """
         self._claude_service = claude_service
+        self._base_timeout = base_timeout
 
     @property
     def name(self) -> str:
@@ -173,7 +182,8 @@ RECENT CONVERSATION (for context, may not be relevant):
         # Determine if Claude needs to use tools (research) or just synthesize
         has_context = len(gathered_context.strip()) > self.CONTEXT_THRESHOLD
         use_tools = not has_context
-        timeout_secs = self.TIMEOUT_WITH_TOOLS if use_tools else self.TIMEOUT_WITHOUT_TOOLS
+        multiplier = self.TIMEOUT_MULTIPLIER_WITH_TOOLS if use_tools else self.TIMEOUT_MULTIPLIER_WITHOUT_TOOLS
+        timeout_secs = self._base_timeout * multiplier
 
         logger.info(f"Deep research: use_tools={use_tools}, context_len={len(gathered_context)}")
 

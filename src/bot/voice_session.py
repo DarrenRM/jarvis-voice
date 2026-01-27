@@ -570,15 +570,27 @@ class VoiceSession:
 
         Waits for the user to finish speaking before playing, so we don't
         interrupt questions like "hey jarvis what is the weather?".
+
+        Uses two-phase checking:
+        1. After 300ms delay, check if sink VAD detected speech (fast)
+        2. After synthesis (~800ms), check again before playing (catches continuous speech)
         """
         try:
             # Wait for user to finish speaking (immediate mode, no 3s debounce)
             # This handles "hey jarvis what is the weather?" without interrupting
             if self.settings.speaking_detection_enabled:
-                # Initial delay to let speaking detector process incoming audio.
+                # Initial delay to let VAD process incoming audio.
                 # Without this, we check too early and think no one is speaking
                 # when user is mid-sentence (race condition with audio processing).
                 await asyncio.sleep(0.3)
+
+                # Check sink's VAD first - it's faster than SpeakingDetector
+                # because it's already processing the buffer in listening state
+                if self.sink.is_speech_active():
+                    logger.info("[ACK] Skipping - sink VAD detected active speech")
+                    return
+
+                # Also check SpeakingDetector for multi-user scenarios
                 silence = await self._wait_for_silence(max_wait=5.0, use_debounce=False)
                 if not silence:
                     # User still speaking after 5s - they're asking a long question
@@ -594,6 +606,13 @@ class VoiceSession:
             logger.info(f"[TIMING] Ack TTS '{ack_phrase}': {synth_time:.2f}s")
 
             if len(ack_audio) > 0:
+                # Check again after synthesis - user may have continued speaking
+                # during the ~800ms synthesis time. This catches continuous questions
+                # that weren't detected in the initial 300ms check.
+                if self.settings.speaking_detection_enabled and self.sink.is_speech_active():
+                    logger.info("[ACK] Skipping playback - VAD detected speech during synthesis")
+                    return
+
                 t0 = time.perf_counter()
                 await self._play_audio(ack_audio)
                 play_time = time.perf_counter() - t0

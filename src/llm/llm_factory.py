@@ -92,6 +92,7 @@ def create_llm_client(
             on_image_generated=on_image_generated,
             on_user_tagged=on_user_tagged,
             on_message_posted=on_message_posted,
+            claude_timeout=settings.claude_timeout,
         )
 
         logger.info(f"Creating Groq client (provider: {provider}, model: {model})")

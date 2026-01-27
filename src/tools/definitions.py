@@ -190,6 +190,7 @@ def create_tool_registry(
     on_user_tagged: Optional[DiscordCallback] = None,
     on_message_posted: Optional[DiscordCallback] = None,
     max_searches: int = 3,
+    claude_timeout: float = 30.0,
 ) -> ToolRegistry:
     """Create a ToolRegistry with all handlers registered.
 
@@ -201,6 +202,7 @@ def create_tool_registry(
         on_user_tagged: Callback for tagging users
         on_message_posted: Callback for posting messages
         max_searches: Maximum searches per request (default 3)
+        claude_timeout: Base timeout for Claude operations (from CLAUDE_TIMEOUT setting)
 
     Returns:
         Configured ToolRegistry with all handlers
@@ -229,7 +231,7 @@ def create_tool_registry(
     registry.register(post_table)
 
     # Research handler
-    deep_research = DeepResearchHandler(claude_service)
+    deep_research = DeepResearchHandler(claude_service, base_timeout=claude_timeout)
     registry.register(deep_research)
 
     return registry
