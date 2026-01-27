@@ -163,7 +163,7 @@ class GroqClient(BaseLLMClient):
         # See: https://console.groq.com/docs/reasoning
         if "gpt-oss" in self.model.lower():
             kwargs["include_reasoning"] = False
-            kwargs["reasoning_effort"] = "low"  # Minimize reasoning tokens
+            kwargs["reasoning_effort"] = "medium"  # Minimize reasoning tokens
 
         response = await self._client.chat.completions.create(**kwargs)
 
@@ -206,7 +206,7 @@ class GroqClient(BaseLLMClient):
         # GPT-OSS models: disable reasoning output to prevent chain-of-thought leakage
         if "gpt-oss" in self.model.lower():
             kwargs["include_reasoning"] = False
-            kwargs["reasoning_effort"] = "low"
+            kwargs["reasoning_effort"] = "medium"
 
         stream = await self._client.chat.completions.create(**kwargs)
 
@@ -344,7 +344,7 @@ class GroqClient(BaseLLMClient):
             # GPT-OSS models: disable reasoning output
             if "gpt-oss" in self.model.lower():
                 kwargs["include_reasoning"] = False
-                kwargs["reasoning_effort"] = "low"
+                kwargs["reasoning_effort"] = "medium"
 
             stream = await self._client.chat.completions.create(**kwargs)
 

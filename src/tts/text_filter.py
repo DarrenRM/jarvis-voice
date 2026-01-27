@@ -16,36 +16,6 @@ logger = logging.getLogger(__name__)
 # Unicode ellipsis and ASCII dots pattern
 ELLIPSIS_CHARS = r'[.…]'  # Both ASCII period and Unicode ellipsis U+2026
 
-# Patterns that indicate internal reasoning (case-insensitive)
-REASONING_PATTERNS = [
-    r"^the assistant",
-    r"^we (need|should|have|must)",
-    r"^(need|ensure|provide|use|skip|give)",
-    r"^(probably|perhaps|maybe) due to",
-    r"^(the user|user) (requested|asked|wants)",
-    r"^(this|that) (is|was|will|should|needs)",
-    r"^(following|use) (format|tags|pattern)",
-    r"^no extra",
-    r"^(each|every) sentence",
-    r"^brief (answer|response)",
-    r"^(format|formatting):",
-    r"^(step|steps) \d+",
-    r"^the answer\s*" + ELLIPSIS_CHARS,  # "The answer ..."
-    r"^oops" + ELLIPSIS_CHARS,  # "Oops..."
-    # GPT-OSS reasoning leakage patterns (from known bug)
-    r"^the last response",
-    r"^it looks" + ELLIPSIS_CHARS,
-    r"^according to rules",
-    r"^must (be|not|include)",
-    r"^should be brief",
-    r"^could add",
-    r"^make sure",
-    r"^thus:?$",
-    r"^let's",
-    r"^first[,—]",
-    r"^sure!?\s*(let's|let me)",
-]
-
 # Patterns for garbage/malformed output
 GARBAGE_PATTERNS = [
     r"^[\[\]\.…\?\s\*]+$",  # Only brackets, dots, ellipsis, question marks, spaces, asterisks
@@ -60,7 +30,6 @@ GARBAGE_PATTERNS = [
 ]
 
 # Compiled patterns for efficiency
-_REASONING_REGEX = [re.compile(p, re.IGNORECASE) for p in REASONING_PATTERNS]
 _GARBAGE_REGEX = [re.compile(p, re.IGNORECASE) for p in GARBAGE_PATTERNS]
 
 # Minimum content length (chars) for valid speech (excludes emotion tags)
@@ -122,13 +91,8 @@ def is_reasoning_text(text: str) -> bool:
     if not text:
         return True  # Empty text - filter out
 
-    # Check garbage patterns first (fastest)
+    # Check garbage patterns
     for pattern in _GARBAGE_REGEX:
-        if pattern.search(text):
-            return True
-
-    # Check reasoning patterns
-    for pattern in _REASONING_REGEX:
         if pattern.search(text):
             return True
 
