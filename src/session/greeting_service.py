@@ -147,8 +147,11 @@ class GreetingService:
             logger.info("[GREETING] Skipping - bot became busy during wait")
             return False
 
+        # Resolve name: prefer configured mapping, fall back to display name
+        name = self._settings.user_names.get(member.id, member.display_name)
+
         # Generate greeting via LLM
-        greeting = await self._generate_greeting(member.display_name)
+        greeting = await self._generate_greeting(name)
         if not greeting:
             return False
 
@@ -156,7 +159,7 @@ class GreetingService:
         self._update_cooldown(member.id)
 
         # Synthesize and play
-        logger.info(f"[GREETING] Greeting {member.display_name}: {greeting}")
+        logger.info(f"[GREETING] Greeting {name}: {greeting}")
         audio = await self._tts.synthesize(greeting)
         if len(audio) > 0:
             await play_audio(audio)
@@ -177,7 +180,7 @@ class GreetingService:
             Greeting text or None if generation failed.
         """
         prompt = (
-            f"Generate a very short greeting (10 words max) for {name} "
+            f"Generate a very short greeting (4 words max) for {name} "
             f"who just joined the voice channel."
         )
 
