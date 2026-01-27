@@ -331,6 +331,9 @@ All 4 phases running together:
 
 Bot started successfully with all feature flags enabled.
 
+**Issues Found & Fixed**:
+1. Wake word false positive after long audio gap - reset detectors on gaps >2.5s
+
 ---
 
 ## Final Cleanup: Identifying Old Code
@@ -410,6 +413,14 @@ When all phases are complete, use these patterns to find old code to remove:
 - Decouples GreetingService from VoiceSession internals
 - Enables unit testing without full VoiceSession
 - Preserves critical state-recheck-after-async pattern
+
+### 2026-01-26 - Wake Word False Positive Fix
+**Context**: False positive wake word detection after long audio gaps (21.5s)
+**Problem**: OpenWakeWord neural network accumulates state across chunks; after long silence, state becomes stale and produces false positives when new audio arrives
+**Fix**: In voice_sink.py, reset detectors on long gaps (>2.5s) instead of flushing
+- Gap < 2.5s: Flush (may complete pending detection)
+- Gap >= 2.5s: Reset (clear stale state)
+**Commit**: `a9cf061` - Phase 4 complete: Session Cleanup with wake word fix
 
 ---
 
