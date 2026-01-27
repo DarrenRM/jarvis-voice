@@ -19,6 +19,13 @@ from ..config import get_settings
 from ..detection import VAD, SpeakingDetector
 from ..stt import GroqWhisperClient
 from ..llm import BaseLLMClient, create_llm_client
+from ..pipeline import (
+    PipelineContext,
+    ResponseStage,
+    TranscriptionStage,
+    TTSStage,
+    VoicePipeline,
+)
 from ..tts import TTSSynthesizer
 from .discord_service import DiscordService
 from .speaker_manager import SpeakerManager, SpeakerInfo
@@ -114,6 +121,9 @@ class VoiceSession:
         self.groq_client = groq_client
         self.llm = llm
         self.tts = tts
+
+        # New modular pipeline (Phase 2)
+        self._voice_pipeline: Optional[VoicePipeline] = None
 
         # Discord voice
         self.voice_client: Optional[discord.VoiceClient] = None
@@ -222,6 +232,32 @@ class VoiceSession:
                 voice=self.settings.tts_voice,
                 api_key=self.settings.inworld_api_key,
             )
+
+        # Feature flag: Initialize new modular pipeline (Phase 2)
+        if self.settings.use_new_pipeline and self._voice_pipeline is None:
+            # Check if LLM has a ChatOrchestrator (only GroqClient when flag is enabled)
+            orchestrator = getattr(self.llm, 'chat_orchestrator', None)
+            if orchestrator is not None:
+                # Get system prompt from LLM
+                system_prompt = self.llm.get_system_prompt()
+
+                # Create pipeline stages
+                transcription_stage = TranscriptionStage(self.groq_client)
+                response_stage = ResponseStage(orchestrator, system_prompt)
+                tts_stage = TTSStage(self.tts)
+
+                # Create the pipeline
+                self._voice_pipeline = VoicePipeline(
+                    transcription=transcription_stage,
+                    response=response_stage,
+                    tts=tts_stage,
+                )
+                logger.info("Using new modular VoicePipeline")
+            else:
+                logger.warning(
+                    "USE_NEW_PIPELINE enabled but ChatOrchestrator not available. "
+                    "Ensure USE_NEW_CHAT_ORCHESTRATOR is also enabled."
+                )
 
     def _on_wake_word(self):
         """Callback when wake word detected (from sink thread)."""
@@ -1018,6 +1054,13 @@ class VoiceSession:
         audio_duration = len(audio) / SAMPLE_RATE_PROCESSING
         logger.info(f"[TIMING] Audio captured: {audio_duration:.2f}s ({len(audio)} samples)")
 
+        # Feature flag: Use new modular VoicePipeline (Phase 2)
+        if self._voice_pipeline is not None:
+            await self._process_speech_with_pipeline(audio)
+            total_time = time.perf_counter() - total_start
+            logger.info(f"[TIMING] === TOTAL (pipeline): {total_time:.2f}s ===")
+            return
+
         # Transcribe with Groq Whisper
         t0 = time.perf_counter()
         logger.info("[TIMING] Starting transcription...")
@@ -1165,6 +1208,74 @@ class VoiceSession:
             f"think_tts={self._thinking_synth_time:.1f}s, "
             f"llm+streaming_tts={llm_total_time:.1f}s)"
         )
+
+    async def _process_speech_with_pipeline(self, audio: np.ndarray) -> None:
+        """Process speech using the new modular VoicePipeline.
+
+        This method delegates to the VoicePipeline which handles:
+        - Transcription with wake word stripping
+        - LLM response generation
+        - Parallel TTS synthesis with ordered playback
+
+        Args:
+            audio: Audio as float32 numpy array (16kHz mono)
+        """
+        # Build pipeline context with speaker info
+        context = PipelineContext(
+            speaker_id=self._current_speaker_id,
+            speaker_name=self._current_speaker_name,
+            speaker_activity=self._current_speaker_activity,
+        )
+
+        # Determine if we should play thinking phrase
+        # Skip if someone is still talking
+        should_play_thinking = True
+        if self.settings.speaking_detection_enabled:
+            silence = await self._wait_for_silence(max_wait=3.0, use_debounce=False)
+            if not silence:
+                logger.info("[PIPELINE] Skipping thinking phrase - someone still speaking")
+                should_play_thinking = False
+
+        # Pre-synthesize thinking phrase if needed
+        thinking_phrase: Optional[str] = None
+        thinking_audio: Optional[np.ndarray] = None
+
+        if should_play_thinking:
+            if self._current_speaker_name:
+                thinking_phrase = random.choice(self.THINKING_PHRASES_PERSONAL).format(
+                    name=self._current_speaker_name
+                )
+            else:
+                thinking_phrase = random.choice(self.THINKING_PHRASES)
+
+            # Pre-synthesize the thinking phrase
+            try:
+                thinking_audio = await self.tts.synthesize(thinking_phrase)
+                logger.debug(f"[PIPELINE] Pre-synthesized thinking: {thinking_phrase}")
+            except Exception as e:
+                logger.warning(f"[PIPELINE] Failed to synthesize thinking phrase: {e}")
+                thinking_audio = None
+
+        # Run the pipeline
+        result = await self._voice_pipeline.process(
+            audio=audio,
+            context=context,
+            play_audio=self._play_audio,
+            wait_for_silence=lambda: self._wait_for_silence(max_wait=3.0, use_debounce=True),
+            thinking_phrase=thinking_phrase,
+            thinking_audio=thinking_audio,
+        )
+
+        # Handle special results
+        if result == "wake_word_only":
+            logger.info("[PIPELINE] Wake word only detected - triggering follow-up flow")
+            await self._handle_wake_word_only()
+        elif result == "cancelled":
+            logger.info("[PIPELINE] Processing was cancelled")
+        elif result == "empty":
+            logger.info("[PIPELINE] No speech detected")
+        else:
+            logger.debug("[PIPELINE] Processing completed normally")
 
     async def _followup_loop(self):
         """Handle follow-up questions without wake word."""

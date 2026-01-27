@@ -16,7 +16,7 @@
 | Phase | Status | Tested | Notes |
 |-------|--------|--------|-------|
 | 1. Core Abstractions | COMPLETE | Yes | All tools verified working |
-| 2. Pipeline Extraction | Not Started | - | - |
+| 2. Pipeline Extraction | COMPLETE | Yes | 458 tests passing |
 | 3. Per-User Audio | Not Started | - | - |
 | 4. Session Cleanup | Not Started | - | - |
 | Final Cleanup | Pending | - | Remove old code, merge to master |
@@ -115,7 +115,83 @@ Tested tools:
 - [x] tests/llm/test_groq_feature_flags.py (14 tests)
 
 ## Phase 2: Pipeline Extraction
-[Will be filled when Phase 2 starts]
+
+### Completed Steps
+- [x] Step 2.1: Create directory structure (using existing src/pipeline/)
+- [x] Step 2.2: src/audio/playback_queue.py - OrderedPlaybackQueue (~190 lines)
+- [x] Step 2.3: src/pipeline/base.py - PipelineStage ABC, PipelineContext (~60 lines)
+- [x] Step 2.4: src/pipeline/transcription_stage.py - STT + wake word stripping (~226 lines)
+- [x] Step 2.5: src/llm/chat_orchestrator.py - Tool loop extraction (~424 lines, 22 tests)
+- [x] Step 2.6: src/pipeline/response_stage.py - ChatOrchestrator wrapper (~144 lines, 14 tests)
+- [x] Step 2.7: src/pipeline/tts_stage.py - Parallel TTS + ordered queue (~242 lines, 18 tests)
+- [x] Step 2.8: src/pipeline/voice_pipeline.py - Stage composition (~210 lines, 15 tests)
+- [x] Step 2.9: Wire up feature flags
+- [x] Step 2.10: Integration testing (458 tests passing)
+- [ ] Step 2.11: Remove old code (DEFERRED - after all phases complete)
+
+### Notes
+- Extracted pipeline patterns from voice_session.py (~400 lines moved)
+- Extracted tool loop from groq_client.py (~300 lines to ChatOrchestrator)
+- **Total new tests: 69** (bringing total to 458)
+
+### Feature Flags Wired Up (Step 2.9)
+Added to `src/config.py`:
+- `USE_NEW_PIPELINE` - enables modular VoicePipeline
+- `USE_NEW_CHAT_ORCHESTRATOR` - enables ChatOrchestrator
+
+Modified `src/llm/groq_client.py`:
+- Added `chat_orchestrator` property to expose ChatOrchestrator
+- Added `get_system_prompt()` method for ResponseStage
+- Creates ChatOrchestrator when `USE_NEW_CHAT_ORCHESTRATOR` enabled
+- `chat_stream()` delegates to orchestrator when enabled
+
+Modified `src/bot/voice_session.py`:
+- Added `_voice_pipeline` attribute
+- Creates VoicePipeline in `_init_components()` when flag enabled
+- Added `_process_speech_with_pipeline()` method
+- `_process_speech()` routes to pipeline when enabled
+
+### Critical Patterns Preserved
+- Sentence ordering via OrderedPlaybackQueue pending dict
+- Parallel TTS synthesis (tasks spawned per sentence)
+- Thinking phrase runs in parallel with LLM
+- 150ms inter-sentence pause
+- TTS error recovery (queue empty audio on failure)
+- Search limit enforcement (3 max)
+- Action success tracking for fallback
+- Pre-tool content yielding
+
+### Files Created
+- [x] src/audio/playback_queue.py (~190 lines)
+- [x] src/pipeline/base.py (~60 lines)
+- [x] src/pipeline/transcription_stage.py (~226 lines)
+- [x] src/pipeline/response_stage.py (~144 lines)
+- [x] src/pipeline/tts_stage.py (~242 lines)
+- [x] src/pipeline/voice_pipeline.py (~210 lines)
+- [x] src/llm/chat_orchestrator.py (~424 lines)
+
+### Tests Created
+- [x] tests/audio/test_playback_queue.py (19 tests)
+- [x] tests/pipeline/test_transcription_stage.py (17 tests)
+- [x] tests/pipeline/test_response_stage.py (14 tests)
+- [x] tests/pipeline/test_tts_stage.py (18 tests)
+- [x] tests/pipeline/test_voice_pipeline.py (15 tests)
+- [x] tests/llm/test_chat_orchestrator.py (22 tests)
+
+### Production Testing
+**Status**: Ready for testing
+**To test**, set these in `.env`:
+```
+USE_NEW_PIPELINE=true
+USE_NEW_CHAT_ORCHESTRATOR=true
+```
+
+Then restart the bot and test:
+1. Normal conversation (wake word -> question -> response)
+2. Long response (verify sentences play in order)
+3. Tool use (web search, image generation)
+4. Thinking phrase plays before response
+5. Multiple sentences stream correctly
 
 ## Phase 3: Per-User Audio
 [Will be filled when Phase 3 starts]
@@ -140,6 +216,17 @@ Tested tools:
 - Old code removal deferred to final cleanup
 - Single merge reduces integration risk
 - Easier to test full refactor as a unit
+
+### 2026-01-26 - Phase 2 Pipeline Design
+**Context**: Deciding how to wire VoicePipeline with existing components
+**Decision**:
+- VoicePipeline requires ChatOrchestrator from GroqClient
+- `USE_NEW_PIPELINE` implicitly requires `USE_NEW_CHAT_ORCHESTRATOR`
+- Exposed `chat_orchestrator` property and `get_system_prompt()` method on GroqClient
+**Rationale**:
+- Avoids duplicating orchestrator logic
+- ResponseStage wraps existing ChatOrchestrator
+- System prompt comes from LLM client for consistency
 
 ---
 

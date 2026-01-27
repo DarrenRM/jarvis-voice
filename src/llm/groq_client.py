@@ -19,6 +19,7 @@ if TYPE_CHECKING:
     from ..image import NanoBananaClient
     from .claude_client import ClaudeClient
     from ..tools import ToolRegistry, ToolExecutor
+    from .chat_orchestrator import ChatOrchestrator
 
 logger = logging.getLogger(__name__)
 
@@ -257,6 +258,17 @@ class GroqClient(BaseLLMClient):
             self._prompt_builder = create_default_prompt_builder()
             logger.info("Using new system prompt builder")
 
+        # Feature flag: Use new ChatOrchestrator (Phase 2)
+        self._chat_orchestrator = None
+        if self._settings.use_new_chat_orchestrator and self._tool_executor is not None:
+            from .chat_orchestrator import ChatOrchestrator
+            self._chat_orchestrator = ChatOrchestrator(
+                llm_client=self,  # self implements LLMClientProtocol
+                tool_executor=self._tool_executor,
+                max_turns=self.max_turns,
+            )
+            logger.info("Using new ChatOrchestrator")
+
     def _ensure_client(self) -> None:
         """Lazy initialization of Groq client."""
         if self._client is None:
@@ -274,6 +286,94 @@ class GroqClient(BaseLLMClient):
     def clear_history(self) -> None:
         """Clear conversation history."""
         self._conversation_history.clear()
+
+    @property
+    def chat_orchestrator(self) -> Optional["ChatOrchestrator"]:
+        """Get the ChatOrchestrator if using new orchestrator mode.
+
+        Returns:
+            ChatOrchestrator instance, or None if not enabled
+        """
+        return self._chat_orchestrator
+
+    def get_system_prompt(self) -> str:
+        """Get the current system prompt for the assistant.
+
+        Returns:
+            System prompt string (from prompt builder or default)
+        """
+        return self._build_system_prompt()
+
+    # ========== LLMClientProtocol methods (for ChatOrchestrator) ==========
+
+    async def call_api(
+        self,
+        messages: list[dict],
+        tools: Optional[list[dict]] = None,
+        tool_choice: str = "auto",
+    ) -> "APIResponse":
+        """Make a non-streaming API call (implements LLMClientProtocol).
+
+        Args:
+            messages: Conversation messages
+            tools: Tool definitions (None to disable tools)
+            tool_choice: Tool choice mode ("auto", "none")
+
+        Returns:
+            APIResponse with content and optional tool calls
+        """
+        from .chat_orchestrator import APIResponse, ToolCall
+
+        self._ensure_client()
+
+        response = await self._client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            tools=tools if tools else None,
+            tool_choice=tool_choice if tools else None,
+            max_tokens=1024,
+        )
+
+        message = response.choices[0].message
+
+        # Convert tool calls if present
+        tool_calls = []
+        if message.tool_calls:
+            for tc in message.tool_calls:
+                tool_calls.append(ToolCall(
+                    id=tc.id,
+                    name=tc.function.name,
+                    arguments=tc.function.arguments,
+                ))
+
+        return APIResponse(
+            content=message.content,
+            tool_calls=tool_calls,
+        )
+
+    async def stream_response(self, messages: list[dict]) -> AsyncIterator[str]:
+        """Stream a response without tools (implements LLMClientProtocol).
+
+        Args:
+            messages: Conversation messages
+
+        Yields:
+            Response text chunks
+        """
+        self._ensure_client()
+
+        stream = await self._client.chat.completions.create(
+            model=self.model,
+            messages=messages,
+            stream=True,
+            max_tokens=1024,
+        )
+
+        async for chunk in stream:
+            if chunk.choices[0].delta.content:
+                yield chunk.choices[0].delta.content
+
+    # ========== End LLMClientProtocol methods ==========
 
     async def chat(self, message: str) -> str:
         """Send message and get complete response.
@@ -303,6 +403,36 @@ class GroqClient(BaseLLMClient):
 
             # Build messages with system prompt and history
             messages = self._build_messages(message)
+
+            # Feature flag: Use new ChatOrchestrator (Phase 2)
+            if self._chat_orchestrator is not None:
+                # Track user message in history
+                self._conversation_history.append({
+                    "role": "user",
+                    "content": message,
+                })
+
+                # Delegate to orchestrator
+                response_chunks = []
+                async for chunk in self._chat_orchestrator.chat_stream(
+                    message=message,
+                    messages=messages,
+                    on_message_update=lambda: None,  # Messages updated in-place
+                ):
+                    response_chunks.append(chunk)
+                    yield chunk
+
+                # Track assistant response in history
+                full_response = "".join(response_chunks)
+                if full_response:
+                    self._conversation_history.append({
+                        "role": "assistant",
+                        "content": full_response,
+                    })
+
+                return  # Exit - orchestrator handled everything
+
+            # ========== Old inline tool loop (when orchestrator disabled) ==========
 
             # Track user message
             self._conversation_history.append({

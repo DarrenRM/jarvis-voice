@@ -105,6 +105,12 @@ class Settings(BaseSettings):
     # Set to True to use new system prompt builder
     use_new_prompt_builder: bool = Field(default=False, alias="USE_NEW_PROMPT_BUILDER")
 
+    # Feature Flags - Architecture Refactoring (Phase 2)
+    # Set to True to use new VoicePipeline (parallel TTS, ordered playback)
+    use_new_pipeline: bool = Field(default=False, alias="USE_NEW_PIPELINE")
+    # Set to True to use new ChatOrchestrator (extracted tool loop)
+    use_new_chat_orchestrator: bool = Field(default=False, alias="USE_NEW_CHAT_ORCHESTRATOR")
+
     @property
     def chunk_size(self) -> int:
         """Calculate chunk size in samples."""

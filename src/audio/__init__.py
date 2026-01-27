@@ -1,5 +1,6 @@
 """Audio processing module."""
 
+from .playback_queue import OrderedPlaybackQueue
 from .resampler import (
     resample_48k_stereo_to_16k_mono,
     resample_24k_mono_to_48k_stereo,
@@ -12,6 +13,7 @@ SAMPLE_RATE_PROCESSING = 16000  # Wake word, VAD, STT (mono)
 SAMPLE_RATE_TTS = 24000  # Inworld TTS output (mono)
 
 __all__ = [
+    "OrderedPlaybackQueue",
     "resample_48k_stereo_to_16k_mono",
     "resample_24k_mono_to_48k_stereo",
     "resample_16k_mono_to_48k_stereo",
