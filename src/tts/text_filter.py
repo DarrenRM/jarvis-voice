@@ -2,14 +2,19 @@
 
 Filters out:
 - Internal LLM reasoning/thinking (chain-of-thought leakage)
-- Ellipsis-only garbage fragments
+- Ellipsis-only garbage fragments (ASCII and Unicode)
 - Meta-commentary about responses
+- Very short fragments that aren't valid speech
+- Repetitive token spam
 """
 
 import re
 import logging
 
 logger = logging.getLogger(__name__)
+
+# Unicode ellipsis and ASCII dots pattern
+ELLIPSIS_CHARS = r'[.…]'  # Both ASCII period and Unicode ellipsis U+2026
 
 # Patterns that indicate internal reasoning (case-insensitive)
 REASONING_PATTERNS = [
@@ -25,37 +30,112 @@ REASONING_PATTERNS = [
     r"^brief (answer|response)",
     r"^(format|formatting):",
     r"^(step|steps) \d+",
-    r"^\[?\.+\]?$",  # Only ellipsis/dots with optional brackets
-    r"^\[.*\.\.\.\s*$",  # Starts with bracket, ends with ellipsis
-    r"^\]\.+$",  # ] followed by dots
-    r"^chaos\.+$",  # chaos with dots
+    r"^the answer\s*" + ELLIPSIS_CHARS,  # "The answer ..."
+    r"^oops" + ELLIPSIS_CHARS,  # "Oops..."
+]
+
+# Patterns for garbage/malformed output
+GARBAGE_PATTERNS = [
+    r"^[\[\]\.…\?\s\*]+$",  # Only brackets, dots, ellipsis, question marks, spaces, asterisks
+    r"^\[?" + ELLIPSIS_CHARS + r"+\]?$",  # Only ellipsis with optional brackets
+    r"^\[[^\]]*\]\s*" + ELLIPSIS_CHARS + r"+$",  # [tag] followed by only ellipsis (no real content)
+    r"^\]" + ELLIPSIS_CHARS + r"+$",  # ] followed by dots/ellipsis
+    r"^chaos" + ELLIPSIS_CHARS + r"+$",  # chaos with dots
+    r"^(the|we|this|that)\s*" + ELLIPSIS_CHARS + r"+$",  # Single word + ellipsis
+    r"\*+" + ELLIPSIS_CHARS + r"+\*+",  # Markdown bold with ellipsis: **...** (anywhere in text)
+    r"^" + ELLIPSIS_CHARS + r"+$",  # Only ellipsis/dots
+    r"^\?+$",  # Only question marks
 ]
 
 # Compiled patterns for efficiency
 _REASONING_REGEX = [re.compile(p, re.IGNORECASE) for p in REASONING_PATTERNS]
+_GARBAGE_REGEX = [re.compile(p, re.IGNORECASE) for p in GARBAGE_PATTERNS]
+
+# Minimum content length (chars) for valid speech (excludes emotion tags)
+MIN_CONTENT_LENGTH = 5
+
+
+def _has_word_repetition(text: str, threshold: int = 4) -> bool:
+    """Check if text has excessive word repetition.
+
+    Args:
+        text: Text to check
+        threshold: Number of consecutive same words to trigger
+
+    Returns:
+        True if text has word spam like "fresh fresh fresh fresh"
+    """
+    # Remove emotion tags first
+    cleaned = re.sub(r'\[[^\]]+\]', '', text).strip().lower()
+    words = cleaned.split()
+
+    if len(words) < threshold:
+        return False
+
+    # Check for consecutive same words
+    count = 1
+    for i in range(1, len(words)):
+        if words[i] == words[i - 1]:
+            count += 1
+            if count >= threshold:
+                return True
+        else:
+            count = 1
+
+    return False
+
+
+def _get_content_without_tags(text: str) -> str:
+    """Remove emotion/style tags to get actual content.
+
+    Args:
+        text: Text possibly containing [tags]
+
+    Returns:
+        Text with tags removed
+    """
+    return re.sub(r'\[[^\]]+\]', '', text).strip()
 
 
 def is_reasoning_text(text: str) -> bool:
-    """Check if text appears to be internal LLM reasoning.
+    """Check if text appears to be internal LLM reasoning or garbage.
 
     Args:
         text: Text to check
 
     Returns:
-        True if text looks like internal reasoning, False otherwise
+        True if text should be filtered out, False otherwise
     """
     text = text.strip()
     if not text:
-        return True  # Empty text is "reasoning" (filter it out)
+        return True  # Empty text - filter out
 
-    # Check against reasoning patterns
+    # Check garbage patterns first (fastest)
+    for pattern in _GARBAGE_REGEX:
+        if pattern.search(text):
+            return True
+
+    # Check reasoning patterns
     for pattern in _REASONING_REGEX:
         if pattern.search(text):
             return True
 
-    # Filter text that's mostly punctuation/dots
+    # Get content without tags
+    content = _get_content_without_tags(text)
+
+    # Filter very short fragments (unless it's just an emotion tag which is OK)
+    if len(content) < MIN_CONTENT_LENGTH and len(content) > 0:
+        # Allow short interjections that make sense
+        if content.lower() not in {'ok', 'yes', 'no', 'hi', 'hey', 'bye', 'done', 'sure', 'wow', 'nice'}:
+            return True
+
+    # Filter text that's mostly punctuation/dots/ellipsis
     alphanumeric_count = sum(1 for c in text if c.isalnum())
     if len(text) > 3 and alphanumeric_count < len(text) * 0.3:
+        return True
+
+    # Filter word repetition spam
+    if _has_word_repetition(text):
         return True
 
     return False

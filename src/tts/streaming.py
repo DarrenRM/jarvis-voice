@@ -7,6 +7,7 @@ from typing import AsyncIterator, Optional
 import numpy as np
 
 from .synthesizer import TTSSynthesizer
+from .text_filter import is_reasoning_text
 
 logger = logging.getLogger(__name__)
 
@@ -109,6 +110,11 @@ class StreamingTTSBuffer:
                     # End signal
                     await self._audio_queue.put(None)
                     break
+
+                # Filter out LLM reasoning/garbage before TTS
+                if is_reasoning_text(sentence):
+                    logger.debug(f"[TTS-STREAM] Filtered: {sentence[:80]}...")
+                    continue
 
                 # Synthesize sentence
                 audio = await self.synthesizer.synthesize(sentence)
