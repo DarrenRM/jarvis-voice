@@ -177,7 +177,7 @@ class GreetingService:
             Greeting text or None if generation failed.
         """
         prompt = (
-            f"Generate a very short greeting (20 words max) for {name} "
+            f"Generate a very short greeting (10 words max) for {name} "
             f"who just joined the voice channel."
         )
 
