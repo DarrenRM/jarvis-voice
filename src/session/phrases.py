@@ -44,6 +44,24 @@ THINKING_PHRASES_PERSONAL: list[str] = [
     "Give me a sec, {name}...",
 ]
 
+# Affirmation phrases (short, immediate acknowledgment with name - for dynamic thinking mode)
+# These play immediately after speech ends while waiting for dynamic phrase
+AFFIRMATION_PHRASES: list[str] = [
+    "Sure, {name}...",
+    "[happy] Got it, {name}...",
+    "Alright, {name}...",
+    "Okay, {name}...",
+    "[happy] Sure thing, {name}...",
+]
+
+# Generic affirmation phrases (when speaker unknown)
+AFFIRMATION_PHRASES_GENERIC: list[str] = [
+    "Sure...",
+    "[happy] Got it...",
+    "Alright...",
+    "Okay...",
+]
+
 
 def get_random_ack() -> str:
     """Get a random acknowledgment phrase.
@@ -70,3 +88,21 @@ def get_thinking_phrase(speaker_name: Optional[str] = None) -> str:
         phrase = random.choice(THINKING_PHRASES_PERSONAL)
         return phrase.format(name=speaker_name)
     return random.choice(THINKING_PHRASES)
+
+
+def get_affirmation_phrase(speaker_name: Optional[str] = None) -> str:
+    """Get a short affirmation phrase for immediate acknowledgment.
+
+    Used in dynamic thinking mode - plays immediately after speech ends
+    while waiting for the context-aware dynamic phrase to generate.
+
+    Args:
+        speaker_name: Optional name of the current speaker.
+
+    Returns:
+        A short affirmation phrase, personalized if name provided.
+    """
+    if speaker_name:
+        phrase = random.choice(AFFIRMATION_PHRASES)
+        return phrase.format(name=speaker_name)
+    return random.choice(AFFIRMATION_PHRASES_GENERIC)

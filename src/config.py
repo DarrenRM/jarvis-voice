@@ -81,6 +81,9 @@ class Settings(BaseSettings):
     greeting_timeout_seconds: float = Field(default=10.0, alias="GREETING_TIMEOUT_SECONDS")
     greeting_cooldown_seconds: float = Field(default=300.0, alias="GREETING_COOLDOWN_SECONDS")  # 5 minutes
 
+    # Dynamic Thinking Phrases (context-aware acknowledgments)
+    dynamic_thinking_enabled: bool = Field(default=False, alias="DYNAMIC_THINKING_ENABLED")
+
     # User name mappings (Discord user ID -> friendly name)
     # Can be set via USER_NAMES env var as JSON: '{"123456": "Name"}'
     user_names: Dict[int, str] = Field(

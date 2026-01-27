@@ -35,7 +35,8 @@ from .voice_source import TTSAudioSource
 # Phase 4 imports (conditionally used based on feature flags)
 from ..session.speaker_tracker import SpeakerTracker
 from ..session.greeting_service import GreetingService
-from ..session.phrases import get_random_ack, get_thinking_phrase
+from ..session.phrases import get_random_ack, get_thinking_phrase, get_affirmation_phrase
+from ..session.thinking_phrase_generator import ThinkingPhraseGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +128,7 @@ class VoiceSession:
         # Session components (initialized here or in _init_components)
         self._speaker_tracker = SpeakerTracker(self.speaker_manager)
         self._greeting_service: Optional[GreetingService] = None
+        self._thinking_generator: Optional[ThinkingPhraseGenerator] = None
         # Note: GreetingService is initialized in _init_components after TTS is ready
 
     @property
@@ -211,6 +213,16 @@ class VoiceSession:
                 tts_synthesizer=self.tts,
                 settings=self.settings,
             )
+
+        # Initialize dynamic thinking phrase generator (if enabled)
+        if self._thinking_generator is None and self.settings.dynamic_thinking_enabled:
+            if self.settings.groq_api_key:
+                logger.info("Initializing dynamic thinking phrase generator...")
+                self._thinking_generator = ThinkingPhraseGenerator(
+                    groq_api_key=self.settings.groq_api_key,
+                )
+            else:
+                logger.warning("DYNAMIC_THINKING_ENABLED but GROQ_API_KEY not set, disabling")
 
         # Initialize modular VoicePipeline
         if self._voice_pipeline is None:
@@ -1010,20 +1022,36 @@ class VoiceSession:
                 logger.info("[PIPELINE] Skipping thinking phrase - someone still speaking")
                 should_play_thinking = False
 
-        # Pre-synthesize thinking phrase if needed
+        # Prepare thinking phrase arguments
         thinking_phrase: Optional[str] = None
         thinking_audio: Optional[np.ndarray] = None
+        thinking_generator: Optional[ThinkingPhraseGenerator] = None
+        affirmation_audio: Optional[np.ndarray] = None
 
         if should_play_thinking:
-            thinking_phrase = get_thinking_phrase(self._current_speaker_name)
+            if self._thinking_generator:
+                # Dynamic mode: pre-synth affirmation, generator creates content phrase
+                thinking_generator = self._thinking_generator
 
-            # Pre-synthesize the thinking phrase
-            try:
-                thinking_audio = await self.tts.synthesize(thinking_phrase)
-                logger.debug(f"[PIPELINE] Pre-synthesized thinking: {thinking_phrase}")
-            except Exception as e:
-                logger.warning(f"[PIPELINE] Failed to synthesize thinking phrase: {e}")
-                thinking_audio = None
+                # Pre-synthesize affirmation ("Sure, {name}...") for immediate playback
+                affirmation_text = get_affirmation_phrase(self._current_speaker_name)
+                try:
+                    affirmation_audio = await self.tts.synthesize(affirmation_text)
+                    logger.debug(f"[PIPELINE] Pre-synthesized affirmation: {affirmation_text}")
+                except Exception as e:
+                    logger.warning(f"[PIPELINE] Failed to synthesize affirmation: {e}")
+                    affirmation_audio = None
+
+                logger.debug("[PIPELINE] Using dynamic thinking phrase generation")
+            else:
+                # Static mode: pre-synthesize full phrase before transcription
+                thinking_phrase = get_thinking_phrase(self._current_speaker_name)
+                try:
+                    thinking_audio = await self.tts.synthesize(thinking_phrase)
+                    logger.debug(f"[PIPELINE] Pre-synthesized static thinking: {thinking_phrase}")
+                except Exception as e:
+                    logger.warning(f"[PIPELINE] Failed to synthesize thinking phrase: {e}")
+                    thinking_audio = None
 
         # Run the pipeline
         result = await self._voice_pipeline.process(
@@ -1033,6 +1061,9 @@ class VoiceSession:
             wait_for_silence=lambda: self._wait_for_silence(max_wait=3.0, use_debounce=True),
             thinking_phrase=thinking_phrase,
             thinking_audio=thinking_audio,
+            thinking_generator=thinking_generator,
+            tts_synthesizer=self.tts if thinking_generator else None,
+            affirmation_audio=affirmation_audio,
         )
 
         # Handle special results

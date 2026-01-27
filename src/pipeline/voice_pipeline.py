@@ -4,20 +4,24 @@ Pipeline: Audio -> Transcription -> Response -> TTS -> Playback
 
 Features:
 - Thinking phrase runs in parallel with LLM
+- Dynamic thinking phrases (context-aware based on request)
 - Playback waits for thinking before first sentence
 - Cancellation at any stage
 """
 
 import asyncio
 import logging
-from typing import Awaitable, Callable, Optional
+from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
 import numpy as np
 
 from .base import PipelineContext
 from .response_stage import ResponseStage
 from .transcription_stage import TranscriptionResult, TranscriptionStage
-from .tts_stage import TTSStage
+from .tts_stage import TTSStage, TTSSynthesizerProtocol
+
+if TYPE_CHECKING:
+    from ..session.thinking_phrase_generator import ThinkingPhraseGenerator
 
 logger = logging.getLogger(__name__)
 
@@ -77,6 +81,9 @@ class VoicePipeline:
         wait_for_silence: Callable[[], Awaitable[bool]],
         thinking_phrase: Optional[str] = None,
         thinking_audio: Optional[np.ndarray] = None,
+        thinking_generator: Optional["ThinkingPhraseGenerator"] = None,
+        tts_synthesizer: Optional[TTSSynthesizerProtocol] = None,
+        affirmation_audio: Optional[np.ndarray] = None,
     ) -> Optional[str]:
         """Run full voice pipeline.
 
@@ -85,8 +92,11 @@ class VoicePipeline:
             context: Pipeline context with speaker info
             play_audio: Async function to play audio chunks
             wait_for_silence: Async function that waits for silence
-            thinking_phrase: Optional text for thinking phrase (for logging)
-            thinking_audio: Optional pre-synthesized thinking phrase audio
+            thinking_phrase: Optional text for thinking phrase (for logging, static mode)
+            thinking_audio: Optional pre-synthesized thinking phrase audio (static mode)
+            thinking_generator: Optional generator for dynamic context-aware phrases
+            tts_synthesizer: Optional TTS for synthesizing dynamic phrases
+            affirmation_audio: Pre-synthesized affirmation (dynamic mode, plays immediately)
 
         Returns:
             None normally
@@ -121,13 +131,27 @@ class VoicePipeline:
             return "cancelled"
 
         # Stage 2: Start thinking phrase in parallel with LLM
-        # (from voice_session.py:1055-1064)
         thinking_done = asyncio.Event()
-        if thinking_audio is not None and len(thinking_audio) > 0:
+
+        if thinking_generator and tts_synthesizer:
+            # Dynamic mode: play affirmation immediately, then generate context-aware phrase
+            self._thinking_task = asyncio.create_task(
+                self._generate_and_play_dynamic_thinking(
+                    thinking_generator,
+                    tts_synthesizer,
+                    text,
+                    play_audio,
+                    thinking_done,
+                    affirmation_audio=affirmation_audio,
+                )
+            )
+            logger.debug("Pipeline: Started dynamic thinking phrase generation")
+        elif thinking_audio is not None and len(thinking_audio) > 0:
+            # Static mode: use pre-synthesized audio
             self._thinking_task = asyncio.create_task(
                 self._play_thinking_phrase(thinking_audio, play_audio, thinking_done)
             )
-            logger.debug(f"Pipeline: Started thinking phrase: {thinking_phrase}")
+            logger.debug(f"Pipeline: Started static thinking phrase: {thinking_phrase}")
         else:
             thinking_done.set()  # No thinking phrase, skip waiting
 
@@ -179,6 +203,55 @@ class VoicePipeline:
             logger.debug("Thinking phrase cancelled")
         except Exception as e:
             logger.error(f"Error playing thinking phrase: {e}")
+        finally:
+            done_event.set()
+
+    async def _generate_and_play_dynamic_thinking(
+        self,
+        generator: "ThinkingPhraseGenerator",
+        tts: TTSSynthesizerProtocol,
+        transcribed_text: str,
+        play_audio: Callable[[np.ndarray], Awaitable[None]],
+        done_event: asyncio.Event,
+        affirmation_audio: Optional[np.ndarray] = None,
+    ) -> None:
+        """Play affirmation then generate and play dynamic thinking phrase.
+
+        Two-phase approach:
+        1. Play pre-synthesized affirmation immediately ("Sure, {name}...")
+        2. Generate context-aware phrase based on request ("I'll check that weather")
+
+        Args:
+            generator: ThinkingPhraseGenerator for dynamic phrase creation
+            tts: TTS synthesizer for audio generation
+            transcribed_text: The user's transcribed request
+            play_audio: Async function to play audio
+            done_event: Event to signal when done
+            affirmation_audio: Pre-synthesized affirmation to play immediately
+        """
+        try:
+            # Phase 1: Play affirmation immediately (pre-synthesized)
+            if affirmation_audio is not None and len(affirmation_audio) > 0:
+                await play_audio(affirmation_audio)
+                logger.debug("Pipeline: Played affirmation phrase")
+
+            # Phase 2: Generate and play dynamic content phrase
+            phrase = await generator.generate(transcribed_text)
+            logger.debug(f"Pipeline: Generated dynamic phrase: {phrase}")
+
+            # Synthesize the phrase
+            audio = await tts.synthesize(phrase)
+
+            if audio is not None and len(audio) > 0:
+                await play_audio(audio)
+                logger.debug("Pipeline: Played dynamic thinking phrase")
+            else:
+                logger.warning("Pipeline: TTS returned empty audio for dynamic phrase")
+
+        except asyncio.CancelledError:
+            logger.debug("Pipeline: Dynamic thinking phrase cancelled")
+        except Exception as e:
+            logger.warning(f"Pipeline: Dynamic thinking phrase failed: {e}, skipping")
         finally:
             done_event.set()
 
