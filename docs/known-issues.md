@@ -255,6 +255,57 @@ Observed during multi-speaker testing. Exact trigger unclear.
 
 ---
 
+## Issue #6: Ack + Thinking Phrase Both Cut Off During Long Questions
+
+**Date:** 2026-01-27
+**Severity:** High
+**Status:** Open (needs reproduction)
+
+### Symptoms
+
+1. User asks a very long question after wake word
+2. While user is still speaking, acknowledgment audio plays and gets cut off
+3. While user is still speaking, thinking phrase also plays and gets cut off
+4. When user finally finishes, there's silence - no response plays
+5. User thinks the question failed because they hear nothing
+
+### Root Cause
+
+**Theory (needs investigation):**
+
+The ack and thinking phrase are triggered based on timing/state changes, not on whether the user has actually finished speaking. For long questions:
+
+1. Wake word detected → ack task starts → plays while user still talking → gets interrupted
+2. Processing starts → thinking phrase plays → gets interrupted by continued speech
+3. By the time user finishes, both audio feedbacks have already been "consumed"
+4. Response may still be processing but user has no audio indication
+
+Possible factors:
+- Ack plays after brief silence detection, not true end of speech
+- Thinking phrase starts too early in the pipeline
+- Audio interruption logic cuts off ack/thinking but doesn't re-queue them
+
+### Reproduction
+
+**To investigate:**
+
+1. Say "Hey Jarvis" followed by a 10-15 second question with minimal pauses
+2. Observe timing of ack and thinking phrase relative to speech
+3. Check if response eventually plays or if processing fails entirely
+
+### Proposed Fixes
+
+1. **Delay ack until VAD confirms speech end** - Don't play ack during active speech
+2. **Re-queue interrupted thinking phrase** - If thinking phrase is cut off, play it again when speech actually ends
+3. **Add "still listening" indicator** - For long questions, periodically confirm bot is still listening
+4. **Investigate audio interruption logic** - Ensure interrupted phrases don't prevent future audio
+
+### Log Excerpt
+
+*Needs reproduction to capture logs*
+
+---
+
 ## Template for New Issues
 
 ```markdown
