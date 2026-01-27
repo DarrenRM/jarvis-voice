@@ -192,7 +192,7 @@ class PostTableHandler(ToolHandler):
     def definition(self) -> ToolDefinition:
         return ToolDefinition(
             name="post_table",
-            description="Post a formatted table to the Discord text channel. Use when presenting structured data, comparisons, or lists that are easier to read as a table.",
+            description="Post a formatted table to the Discord text channel. WIDTH LIMIT: 60 chars per line. Keep cell content SHORT - max chars per cell: 2 cols=26, 3 cols=16, 4 cols=11, 5 cols=8. Use abbreviations, be concise.",
             parameters={
                 "type": "object",
                 "properties": {

@@ -127,7 +127,7 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
         "type": "function",
         "function": {
             "name": "post_table",
-            "description": "Post a formatted table to the Discord text channel. ALWAYS USE THIS instead of post_to_chat when presenting: comparisons between things, rankings, lists or ingredients, specs/stats, prices, or ANY data with 2+ items that share attributes. Tables are much easier to read than plain text lists.",
+            "description": "Post a formatted table to the Discord text channel. ALWAYS USE THIS instead of post_to_chat when presenting: comparisons between things, rankings, lists or ingredients, specs/stats, prices, or ANY data with 2+ items that share attributes. Tables are much easier to read than plain text lists. WIDTH LIMIT: 60 chars per line. Keep cell content SHORT - max chars per cell by column count: 2 cols=26, 3 cols=16, 4 cols=11, 5 cols=8. Use abbreviations, drop units, be concise.",
             "parameters": {
                 "type": "object",
                 "properties": {
