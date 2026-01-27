@@ -610,6 +610,10 @@ class VoiceSession:
             # Wait for user to finish speaking (immediate mode, no 3s debounce)
             # This handles "hey jarvis what is the weather?" without interrupting
             if self.settings.speaking_detection_enabled:
+                # Initial delay to let speaking detector process incoming audio.
+                # Without this, we check too early and think no one is speaking
+                # when user is mid-sentence (race condition with audio processing).
+                await asyncio.sleep(0.3)
                 silence = await self._wait_for_silence(max_wait=5.0, use_debounce=False)
                 if not silence:
                     # User still speaking after 5s - they're asking a long question
@@ -630,10 +634,10 @@ class VoiceSession:
                 play_time = time.perf_counter() - t0
                 logger.info(f"[TIMING] Ack playback: {play_time:.2f}s")
         except asyncio.CancelledError:
-            logger.debug("Ack playback cancelled")
-            # Stop any ongoing playback when cancelled
-            if self.voice_client and self.voice_client.is_playing():
-                self.voice_client.stop()
+            # Let ack continue playing - it will be stopped naturally when
+            # the next audio (thinking phrase or response) starts playing.
+            # This prevents the "brief chirp" issue where ack is cut off.
+            logger.debug("Ack task cancelled, letting audio finish naturally")
         except Exception as e:
             logger.warning(f"Failed to play acknowledgment: {e}")
 

@@ -1,7 +1,7 @@
 # Architecture Refactoring Progress
 
 **Started**: 2026-01-26
-**Current Phase**: 2 - Pipeline Extraction
+**Current Phase**: 3 - Per-User Audio
 **Branch**: refactor/phase1-core-abstractions (all phases on same branch)
 
 ## Workflow Decision
@@ -17,7 +17,7 @@
 |-------|--------|--------|-------|
 | 1. Core Abstractions | COMPLETE | Yes | All tools verified working |
 | 2. Pipeline Extraction | COMPLETE | Yes | 458 tests passing |
-| 3. Per-User Audio | Not Started | - | - |
+| 3. Per-User Audio | COMPLETE | Yes | 531 tests passing |
 | 4. Session Cleanup | Not Started | - | - |
 | Final Cleanup | Pending | - | Remove old code, merge to master |
 
@@ -194,10 +194,107 @@ Then restart the bot and test:
 5. Multiple sentences stream correctly
 
 ## Phase 3: Per-User Audio
-[Will be filled when Phase 3 starts]
+
+### Completed Steps
+- [x] Step 3.1: Create directory structure (src/sink/, tests/sink/)
+- [x] Step 3.2: src/sink/user_audio_state.py - Per-user state dataclass (~130 lines, 30 tests)
+- [x] Step 3.3: src/sink/per_user_manager.py - Lifecycle management (~120 lines, 22 tests)
+- [x] Step 3.4: src/sink/wake_processor.py - Wake detection logic (~150 lines, 21 tests)
+- [x] Step 3.5: Add feature flags to config.py
+- [x] Step 3.6: Wire up conditionals in voice_sink.py
+- [x] Step 3.7: Run all tests (531 tests passing)
+- [ ] Step 3.8: Remove old code (DEFERRED - after all phases complete)
+
+### Notes
+- Consolidated 4 scattered per-user dictionaries into focused modules
+- **Total new tests: 73** (bringing total to 531)
+
+### Feature Flags Wired Up (Step 3.5)
+Added to `src/config.py`:
+- `USE_NEW_SINK_MANAGER` - enables PerUserAudioManager
+- `USE_NEW_WAKE_PROCESSOR` - enables WakeWordProcessor
+
+Modified `src/bot/voice_sink.py`:
+- Creates PerUserAudioManager and WakeWordProcessor when flags enabled
+- `write()` routes to new components for pre-buffer and wake detection
+- `check_idle_audio_gap()` routes to WakeWordProcessor when enabled
+- `state.setter` uses processor for idle transition cleanup
+- `start_listening()` gets pre-buffer from new manager
+- `remove_user()` delegates to manager when enabled
+- `cleanup()` calls manager.cleanup_all() when enabled
+- Speaker isolation uses processor's wake_word_user_id
+
+### Critical Edge Cases Preserved
+| Edge Case | Implementation |
+|-----------|---------------|
+| Wake word user capture at detection time | WakeWordProcessor.process_audio() sets wake_word_user_id |
+| Gap window 250ms-2.5s | wake_processor.py constants: MIN_GAP_SECONDS, MAX_GAP_SECONDS |
+| Max 5 silence attempts | wake_processor.py constant: MAX_SILENCE_ATTEMPTS |
+| Pre-buffer FIFO eviction (1.5s) | UserAudioState.add_to_pre_buffer() with MAX_PRE_BUFFER_SECONDS |
+| 8000 samples (500ms) silence chunk | wake_processor.py constant: SILENCE_SAMPLES |
+
+### Files Created
+- [x] src/sink/__init__.py
+- [x] src/sink/user_audio_state.py (~130 lines)
+- [x] src/sink/per_user_manager.py (~120 lines)
+- [x] src/sink/wake_processor.py (~150 lines)
+
+### Tests Created
+- [x] tests/sink/__init__.py
+- [x] tests/sink/test_user_audio_state.py (30 tests)
+- [x] tests/sink/test_per_user_manager.py (22 tests)
+- [x] tests/sink/test_wake_processor.py (21 tests)
+
+### Production Testing (COMPLETE)
+
+**Date**: 2026-01-26
+**Result**: All features verified working
+
+Tested scenarios:
+- [x] Single user wake word detection
+- [x] Pre-buffer capture (~0.88s captured)
+- [x] Ack playback completes without interruption
+- [x] PTT pattern (wake word with audio gap)
+- [x] Flush detection from gap
+
+**Issues Found & Fixed**:
+1. Ack playback cut off ("brief chirp") - removed `voice_client.stop()` on cancel
+2. Detector flush only worked for old code path - added Phase 3 flush logic
+3. Ack played while user speaking - added 300ms initial delay before silence check
 
 ## Phase 4: Session Cleanup
 [Will be filled when Phase 4 starts]
+
+---
+
+## Final Cleanup: Identifying Old Code
+
+When all phases are complete, use these patterns to find old code to remove:
+
+### Phase 1 (Tools/Prompts)
+- Search: `if self._tool_executor` in groq_client.py
+- Old code: Inline tool execution after the conditional
+- Search: `if self._prompt_builder` in groq_client.py
+- Old code: Inline prompt building after the conditional
+
+### Phase 2 (Pipeline/Orchestrator)
+- Search: `if self._chat_orchestrator` in groq_client.py
+- Old code: ~300 lines of inline tool loop after `return`
+- Search: `if self._voice_pipeline` in voice_session.py
+- Old code: ~150 lines of inline processing after `return`
+
+### Phase 3 (Per-User Audio)
+- Search: `if self._settings.use_new_sink_manager` in voice_sink.py
+- Old code: Inline per-user dict management in `else` branches
+- Old dicts to remove: `_per_user_detectors`, `_per_user_pre_buffers`, `_per_user_last_seen`, `_per_user_silence_attempts`
+- Old method to remove: `_get_or_create_detector()`
+
+### Cleanup Steps
+1. Remove feature flag conditionals (make new code the default)
+2. Delete old code paths after the `return` statements
+3. Remove flag definitions from `src/config.py`
+4. Remove unused imports
+5. Run tests to verify
 
 ---
 

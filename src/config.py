@@ -111,6 +111,12 @@ class Settings(BaseSettings):
     # Set to True to use new ChatOrchestrator (extracted tool loop)
     use_new_chat_orchestrator: bool = Field(default=False, alias="USE_NEW_CHAT_ORCHESTRATOR")
 
+    # Feature Flags - Architecture Refactoring (Phase 3)
+    # Set to True to use new PerUserAudioManager (per-user state management)
+    use_new_sink_manager: bool = Field(default=False, alias="USE_NEW_SINK_MANAGER")
+    # Set to True to use new WakeWordProcessor (wake detection logic)
+    use_new_wake_processor: bool = Field(default=False, alias="USE_NEW_WAKE_PROCESSOR")
+
     @property
     def chunk_size(self) -> int:
         """Calculate chunk size in samples."""
