@@ -119,6 +119,16 @@ class StreamingSink(discord.sinks.Sink):
         # Track who triggered the wake word (captured at detection time, not start_listening time)
         self._wake_word_user_id: Optional[int] = None
 
+        # Multi-speaker tolerance: delay speech end when others are speaking
+        # This prevents premature truncation when Discord packet timing is unreliable
+        self._pending_speech_end_time: Optional[float] = None
+        self._multi_speaker_silence_extension_ms = 500  # Extra silence required when others speaking
+
+        # Wake word refractory period: after detection, suppress further detections
+        # This prevents the same "hey jarvis" audio from triggering multiple times
+        self._wake_word_refractory_until: Optional[float] = None
+        self._wake_word_refractory_seconds = 5.0  # Suppress for 5 seconds after detection
+
         # Phase 3: New per-user management (feature flagged)
         self._settings = get_settings()
         self._user_manager: Optional[PerUserAudioManager] = None
@@ -273,6 +283,7 @@ class StreamingSink(discord.sinks.Sink):
         self._filtered_users.clear()
 
         self._speech_started = False
+        self._pending_speech_end_time = None  # Reset multi-speaker tolerance
         self._last_audio_time = None  # Reset PTT tracking
         self._audio_timeout_detected = False  # Reset timeout flag
 
@@ -388,10 +399,21 @@ class StreamingSink(discord.sinks.Sink):
                 if self._on_speaking_change:
                     self._on_speaking_change(state)
 
+        # Check refractory period - skip detection if recently triggered
+        in_refractory = (
+            self._wake_word_refractory_until is not None
+            and time.perf_counter() < self._wake_word_refractory_until
+        )
+        if in_refractory:
+            return False
+
         # Phase 3: Use new wake processor if enabled
         if self._settings.use_new_wake_processor and self._wake_processor:
             user_id = self._wake_processor.check_idle_audio_gap()
-            return user_id is not None
+            if user_id is not None:
+                self._wake_word_refractory_until = time.perf_counter() + self._wake_word_refractory_seconds
+                return True
+            return False
 
         # Old path: Check each user who recently sent audio for pending wake word detection
         # Only check users with 250ms-2.5s gap (recent enough to have pending audio)
@@ -421,12 +443,14 @@ class StreamingSink(discord.sinks.Sink):
             if detector.process(silence):
                 # User attribution is 100% accurate - we know which detector fired
                 self._wake_word_user_id = user_id
+                self._wake_word_refractory_until = time.perf_counter() + self._wake_word_refractory_seconds
                 logger.info(f"[SINK] Wake word detected from silence padding (gap={user_gap:.2f}s, user: {user_id})")
                 return True
 
             # Also try flush in case there's buffered audio
             if hasattr(detector, 'flush') and detector.flush():
                 self._wake_word_user_id = user_id
+                self._wake_word_refractory_until = time.perf_counter() + self._wake_word_refractory_seconds
                 logger.info(f"[SINK] Wake word detected from flush (gap={user_gap:.2f}s, user: {user_id})")
                 return True
 
@@ -521,14 +545,20 @@ class StreamingSink(discord.sinks.Sink):
                 # Long gaps (>= 2.5s): reset to clear stale neural network state (prevents false positives)
                 MAX_FLUSH_GAP = 2.5  # Match wake_processor.MAX_GAP_SECONDS
 
+                # Check refractory period for flush detection
+                in_refractory = (
+                    self._wake_word_refractory_until is not None
+                    and time.perf_counter() < self._wake_word_refractory_until
+                )
+
                 # Phase 3: Use new components if enabled
                 if self._settings.use_new_sink_manager and self._user_manager:
                     if gap >= MAX_FLUSH_GAP:
                         # Long gap - reset detectors (stale state causes false positives)
                         logger.info(f"[SINK] Resetting wake detectors due to {gap:.1f}s gap (> {MAX_FLUSH_GAP}s)")
                         self._user_manager.reset_all_detectors()
-                    else:
-                        # Short gap - flush to complete pending detections
+                    elif not in_refractory:
+                        # Short gap - flush to complete pending detections (skip if in refractory)
                         for state in self._user_manager:
                             detector = state.detector
                             if detector and hasattr(detector, 'flush') and detector.flush():
@@ -536,6 +566,7 @@ class StreamingSink(discord.sinks.Sink):
                                 attributed_user = pre_gap_user_id if state.user_id == pre_gap_user_id else state.user_id
                                 if self._wake_processor:
                                     self._wake_processor._wake_word_user_id = attributed_user
+                                self._wake_word_refractory_until = time.perf_counter() + self._wake_word_refractory_seconds
                                 logger.info(f"[SINK] Wake word detected from flushed buffer! (user: {attributed_user})")
                                 if self._on_wake_word:
                                     self._on_wake_word()
@@ -548,14 +579,15 @@ class StreamingSink(discord.sinks.Sink):
                         for detector in self._per_user_detectors.values():
                             if hasattr(detector, 'reset'):
                                 detector.reset()
-                    else:
-                        # Short gap - flush to complete pending detections
+                    elif not in_refractory:
+                        # Short gap - flush to complete pending detections (skip if in refractory)
                         for detector_user_id, detector in self._per_user_detectors.items():
                             if hasattr(detector, 'flush') and detector.flush():
                                 # Wake word was in pre-gap audio - attribute to that detector's user
                                 # Use pre_gap_user_id if it matches, otherwise detector_user_id
                                 attributed_user = pre_gap_user_id if detector_user_id == pre_gap_user_id else detector_user_id
                                 self._wake_word_user_id = attributed_user
+                                self._wake_word_refractory_until = time.perf_counter() + self._wake_word_refractory_seconds
                                 logger.info(f"[SINK] Wake word detected from flushed buffer! (user: {attributed_user})")
                                 if self._on_wake_word:
                                     self._on_wake_word()
@@ -602,6 +634,12 @@ class StreamingSink(discord.sinks.Sink):
         # === END DIAGNOSTIC ===
 
         if self._state == "idle":
+            # Check refractory period - skip wake word detection if recently triggered
+            in_refractory = (
+                self._wake_word_refractory_until is not None
+                and time.perf_counter() < self._wake_word_refractory_until
+            )
+
             # Phase 3: Use new components if enabled
             if self._settings.use_new_sink_manager and self._user_manager and self._wake_processor:
                 # Get or create user state and add to pre-buffer
@@ -609,9 +647,10 @@ class StreamingSink(discord.sinks.Sink):
                 state.add_to_pre_buffer(audio_16k)
                 state.update_last_seen()
 
-                # Check for wake word using wake processor
-                if self._wake_processor.process_audio(user_id, audio_16k):
-                    # Wake word detected!
+                # Check for wake word using wake processor (skip if in refractory)
+                if not in_refractory and self._wake_processor.process_audio(user_id, audio_16k):
+                    # Wake word detected! Set refractory period
+                    self._wake_word_refractory_until = time.perf_counter() + self._wake_word_refractory_seconds
                     if self._last_audio_time:
                         lag = time.perf_counter() - self._last_audio_time
                         logger.info(f"[SINK] Wake word detected! (packet lag: {lag*1000:.0f}ms, user: {user_id})")
@@ -633,20 +672,23 @@ class StreamingSink(discord.sinks.Sink):
                     removed = user_buffer.pop(0)
                     total -= len(removed)
 
-                # Check for wake word using per-user detector
-                detector = self._get_or_create_detector(user_id)
-                if detector:
-                    detected = detector.process(audio_16k)
-                    if detected and self._on_wake_word:
-                        # User attribution is 100% accurate - detector that fired = that user
-                        self._wake_word_user_id = user_id
-                        # Log time since last audio packet (shows Discord transmission lag)
-                        if self._last_audio_time:
-                            lag = time.perf_counter() - self._last_audio_time
-                            logger.info(f"[SINK] Wake word detected! (packet lag: {lag*1000:.0f}ms, user: {user_id})")
-                        else:
-                            logger.info(f"[SINK] Wake word detected! (user: {user_id})")
-                        self._on_wake_word()
+                # Check for wake word using per-user detector (skip if in refractory)
+                if not in_refractory:
+                    detector = self._get_or_create_detector(user_id)
+                    if detector:
+                        detected = detector.process(audio_16k)
+                        if detected and self._on_wake_word:
+                            # Wake word detected! Set refractory period
+                            self._wake_word_refractory_until = time.perf_counter() + self._wake_word_refractory_seconds
+                            # User attribution is 100% accurate - detector that fired = that user
+                            self._wake_word_user_id = user_id
+                            # Log time since last audio packet (shows Discord transmission lag)
+                            if self._last_audio_time:
+                                lag = time.perf_counter() - self._last_audio_time
+                                logger.info(f"[SINK] Wake word detected! (packet lag: {lag*1000:.0f}ms, user: {user_id})")
+                            else:
+                                logger.info(f"[SINK] Wake word detected! (user: {user_id})")
+                            self._on_wake_word()
 
         elif self._state == "listening":
             # SPEAKER ISOLATION: Only buffer audio from the wake word speaker
@@ -686,23 +728,53 @@ class StreamingSink(discord.sinks.Sink):
 
                 if endpoint == "start" and not self._speech_started:
                     self._speech_started = True
+                    self._pending_speech_end_time = None  # Cancel any pending end
                     logger.info("[SINK] VAD detected speech START")
 
                 elif endpoint == "end" and self._speech_started:
                     buffer_duration = buffer_samples / SAMPLE_RATE_PROCESSING
-                    logger.info(f"[SPEECH_END] VAD silence threshold reached, buffer={buffer_duration:.2f}s")
-                    # Reset state before callback
-                    self._speech_started = False
-                    if self._on_speech_end:
-                        audio = self.get_audio_buffer()
-                        self._on_speech_end(audio, self._last_user_id)
+                    others_speaking = self.speaking_detector and self.speaking_detector.is_anyone_actively_speaking()
+
+                    if others_speaking:
+                        # Multi-speaker scenario: require extra silence before committing
+                        if self._pending_speech_end_time is None:
+                            self._pending_speech_end_time = time.perf_counter()
+                            logger.info(
+                                f"[SINK] VAD detected end but others speaking - "
+                                f"waiting {self._multi_speaker_silence_extension_ms}ms to confirm"
+                            )
+                        elif (time.perf_counter() - self._pending_speech_end_time) * 1000 >= self._multi_speaker_silence_extension_ms:
+                            # Confirmed: silence persisted despite others speaking
+                            logger.info(f"[SPEECH_END] Multi-speaker silence confirmed, buffer={buffer_duration:.2f}s")
+                            self._speech_started = False
+                            self._pending_speech_end_time = None
+                            if self._on_speech_end:
+                                audio = self.get_audio_buffer()
+                                self._on_speech_end(audio, self._last_user_id)
+                            else:
+                                logger.warning("[SINK] No _on_speech_end callback set!")
+                            self._audio_buffer = []
+                        # else: still waiting for confirmation
                     else:
-                        logger.warning("[SINK] No _on_speech_end callback set!")
-                    # Clear buffer after speech end
-                    self._audio_buffer = []
+                        # Single speaker: end immediately (original behavior)
+                        logger.info(f"[SPEECH_END] VAD silence threshold reached, buffer={buffer_duration:.2f}s")
+                        self._speech_started = False
+                        self._pending_speech_end_time = None
+                        if self._on_speech_end:
+                            audio = self.get_audio_buffer()
+                            self._on_speech_end(audio, self._last_user_id)
+                        else:
+                            logger.warning("[SINK] No _on_speech_end callback set!")
+                        self._audio_buffer = []
+
+                elif self._speech_started and self._pending_speech_end_time is not None:
+                    # We were waiting for confirmation but VAD didn't say "end" this frame
+                    # This means VAD detected activity - cancel the pending end
+                    logger.info("[SINK] Pending speech end cancelled - VAD detected activity")
+                    self._pending_speech_end_time = None
 
                 # Force end if speech has been going too long (background noise protection)
-                elif self._speech_started:
+                if self._speech_started:
                     speech_duration = buffer_samples / SAMPLE_RATE_PROCESSING
                     if speech_duration >= self._max_speech_duration:
                         logger.warning(
@@ -711,6 +783,7 @@ class StreamingSink(discord.sinks.Sink):
                         )
                         # Reset state BEFORE callback to prevent spam
                         self._speech_started = False
+                        self._pending_speech_end_time = None
                         if self._on_speech_end:
                             audio = self.get_audio_buffer()
                             self._on_speech_end(audio, self._last_user_id)
