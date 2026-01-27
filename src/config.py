@@ -36,6 +36,8 @@ class Settings(BaseSettings):
     tts_model: str = Field(default="inworld-tts-1-max", alias="TTS_MODEL")
     tts_device: str = Field(default="cuda:0", alias="TTS_DEVICE")
     tts_voice: str = Field(default="alex", alias="TTS_VOICE")
+    tts_temperature: float = Field(default=1.1, alias="TTS_TEMPERATURE")  # 0.0-2.0, higher = more expressive
+    tts_speed: float = Field(default=1.0, alias="TTS_SPEED")  # 0.5-1.5, talking speed multiplier
 
     # LLM Provider Selection
     llm_provider: str = Field(default="claude", alias="LLM_PROVIDER")  # claude, llama, or gpt-oss

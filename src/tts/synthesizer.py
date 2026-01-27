@@ -35,6 +35,8 @@ class TTSSynthesizer:
         device: str = "cuda:0",  # Not used for Inworld but kept for API compatibility
         voice: str = "alex",
         api_key: Optional[str] = None,
+        temperature: float = 1.1,
+        speed: float = 1.0,
     ):
         """Initialize TTS synthesizer.
 
@@ -43,11 +45,15 @@ class TTSSynthesizer:
             device: Compute device (not used for Inworld, kept for compatibility)
             voice: Voice name (alex, ashley, craig, deborah, etc.)
             api_key: Inworld API key (or set INWORLD_API_KEY env var)
+            temperature: Expressiveness (0.0-2.0, default 1.1). Higher = more expressive.
+            speed: Talking speed multiplier (0.5-1.5, default 1.0).
         """
         self.model_name = model
         self.device = device
         self.voice = voice.lower()
         self.sample_rate = SAMPLE_RATE_TTS  # Inworld output rate
+        self.temperature = max(0.0, min(2.0, temperature))
+        self.speed = max(0.5, min(1.5, speed))
 
         # Get API key
         self.api_key = api_key or os.environ.get("INWORLD_API_KEY")
@@ -68,7 +74,7 @@ class TTSSynthesizer:
             self.voice = "alex"
 
         self._tts_type = "inworld"
-        logger.info(f"Using Inworld TTS ({self.model_name}) with voice '{self.voice}'")
+        logger.info(f"Using Inworld TTS ({self.model_name}) with voice '{self.voice}', temp={self.temperature}, speed={self.speed}")
 
     async def synthesize(self, text: str) -> np.ndarray:
         """Synthesize text to audio.
@@ -110,17 +116,20 @@ class TTSSynthesizer:
             "text": text,
             "voiceId": self.voice.capitalize(),  # API expects capitalized names
             "modelId": self.model_name,
+            "temperature": self.temperature,
             "audioConfig": {
                 "encoding": "LINEAR16",
                 "sampleRateHertz": self.sample_rate,
-                "speakingRate": 1.0,
+                "speakingRate": self.speed,
             },
         }
 
         # Log what we're sending (for debugging emotion tags)
         logger.info(f"[TTS] Sending to Inworld: model={self.model_name}, text={text[:100]}...")
 
-        audio_chunks = []
+        # Collect all raw audio bytes first, then decode once to avoid MP3 frame boundary artifacts
+        raw_audio_chunks: list[bytes] = []
+        detected_format: Optional[str] = None
 
         try:
             async with aiohttp.ClientSession() as session:
@@ -152,35 +161,44 @@ class TTSSynthesizer:
                                     logger.info(f"Inworld TTS first chunk in {ttfb:.0f}ms")
 
                                 audio_bytes = base64.b64decode(audio_base64)
+                                raw_audio_chunks.append(audio_bytes)
 
-                                # Detect format and decode appropriately
-                                if audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
-                                    # MP3 audio - decode with pydub
-                                    from pydub import AudioSegment
-                                    import io
-                                    audio_seg = AudioSegment.from_mp3(io.BytesIO(audio_bytes))
-                                    audio_seg = audio_seg.set_frame_rate(self.sample_rate).set_channels(1)
-                                    samples = np.array(audio_seg.get_array_of_samples(), dtype=np.int16)
-                                    audio_chunks.append(samples.astype(np.float32) / 32768.0)
-                                elif audio_bytes[:4] == b'RIFF':
-                                    # WAV audio - skip header
-                                    audio_bytes = audio_bytes[44:]
-                                    audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
-                                    audio_chunks.append(audio_int16.astype(np.float32) / 32768.0)
-                                else:
-                                    # Assume raw PCM
-                                    audio_int16 = np.frombuffer(audio_bytes, dtype=np.int16)
-                                    audio_chunks.append(audio_int16.astype(np.float32) / 32768.0)
+                                # Detect format from first chunk
+                                if detected_format is None:
+                                    if audio_bytes[:3] == b'ID3' or (len(audio_bytes) >= 2 and audio_bytes[0] == 0xFF and audio_bytes[1] >= 0xE0):
+                                        detected_format = "mp3"
+                                    elif audio_bytes[:4] == b'RIFF':
+                                        detected_format = "wav"
+                                    else:
+                                        detected_format = "pcm"
                         except json.JSONDecodeError:
                             continue
 
-            if audio_chunks:
-                audio = np.concatenate(audio_chunks)
-                elapsed = time.perf_counter() - start_time
-                logger.info(f"Inworld TTS generated {len(text)} chars in {elapsed:.2f}s ({len(text)/elapsed:.1f} chars/s)")
-                return audio
+            if not raw_audio_chunks:
+                return np.array([], dtype=np.float32)
 
-            return np.array([], dtype=np.float32)
+            # Decode all audio at once to avoid frame boundary artifacts
+            combined_bytes = b''.join(raw_audio_chunks)
+
+            if detected_format == "mp3":
+                from pydub import AudioSegment
+                import io
+                audio_seg = AudioSegment.from_mp3(io.BytesIO(combined_bytes))
+                audio_seg = audio_seg.set_frame_rate(self.sample_rate).set_channels(1)
+                samples = np.array(audio_seg.get_array_of_samples(), dtype=np.int16)
+                audio = samples.astype(np.float32) / 32768.0
+            elif detected_format == "wav":
+                # Skip WAV header (44 bytes)
+                audio_int16 = np.frombuffer(combined_bytes[44:], dtype=np.int16)
+                audio = audio_int16.astype(np.float32) / 32768.0
+            else:
+                # Raw PCM
+                audio_int16 = np.frombuffer(combined_bytes, dtype=np.int16)
+                audio = audio_int16.astype(np.float32) / 32768.0
+
+            elapsed = time.perf_counter() - start_time
+            logger.info(f"Inworld TTS generated {len(text)} chars in {elapsed:.2f}s ({len(text)/elapsed:.1f} chars/s)")
+            return audio
 
         except Exception as e:
             logger.error(f"Inworld TTS error: {e}")
@@ -224,10 +242,11 @@ class TTSSynthesizer:
             "text": text,
             "voiceId": self.voice.capitalize(),
             "modelId": self.model_name,
+            "temperature": self.temperature,
             "audioConfig": {
                 "encoding": "LINEAR16",
                 "sampleRateHertz": self.sample_rate,
-                "speakingRate": 1.0,
+                "speakingRate": self.speed,
             },
         }
 
@@ -299,7 +318,12 @@ class TTSSynthesizer:
 
     def _decode_audio_bytes(self, audio_bytes: bytes) -> np.ndarray:
         """Decode audio bytes to float32 numpy array."""
-        if audio_bytes[:3] == b'ID3' or audio_bytes[:2] == b'\xff\xfb':
+        # MP3: ID3 tag or frame sync (0xFF followed by 0xE0+ for MPEG audio)
+        is_mp3 = (
+            audio_bytes[:3] == b'ID3' or
+            (len(audio_bytes) >= 2 and audio_bytes[0] == 0xFF and audio_bytes[1] >= 0xE0)
+        )
+        if is_mp3:
             # MP3 audio - decode with pydub
             from pydub import AudioSegment
             import io

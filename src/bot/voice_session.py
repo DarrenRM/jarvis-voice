@@ -200,6 +200,8 @@ class VoiceSession:
                 device=self.settings.tts_device,
                 voice=self.settings.tts_voice,
                 api_key=self.settings.inworld_api_key,
+                temperature=self.settings.tts_temperature,
+                speed=self.settings.tts_speed,
             )
 
         # Initialize GreetingService

@@ -60,6 +60,8 @@ def preload_components(settings: Settings) -> dict:
         device=settings.tts_device,
         voice=settings.tts_voice,
         api_key=settings.inworld_api_key,
+        temperature=settings.tts_temperature,
+        speed=settings.tts_speed,
     )
 
     logger.info("All components loaded!")
