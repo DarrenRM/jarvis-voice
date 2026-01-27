@@ -1,17 +1,25 @@
 # Architecture Refactoring Progress
 
 **Started**: 2026-01-26
-**Current Phase**: 1 - Core Abstractions
-**Branch**: refactor/phase1-core-abstractions
+**Current Phase**: 2 - Pipeline Extraction
+**Branch**: refactor/phase1-core-abstractions (all phases on same branch)
+
+## Workflow Decision
+
+**Approach**: Complete all 4 phases on a single branch before merging to master.
+- Feature flags remain enabled throughout all phases
+- Old code removal deferred until all phases complete
+- Single merge to master after full refactor is verified
 
 ## Quick Status
 
-| Phase | Status | Branch | Merged |
-|-------|--------|--------|--------|
-| 1. Core Abstractions | IN PROGRESS | refactor/phase1-core-abstractions | No |
-| 2. Pipeline Extraction | Not Started | - | No |
-| 3. Per-User Audio | Not Started | - | No |
-| 4. Session Cleanup | Not Started | - | No |
+| Phase | Status | Tested | Notes |
+|-------|--------|--------|-------|
+| 1. Core Abstractions | COMPLETE | Yes | All tools verified working |
+| 2. Pipeline Extraction | Not Started | - | - |
+| 3. Per-User Audio | Not Started | - | - |
+| 4. Session Cleanup | Not Started | - | - |
+| Final Cleanup | Pending | - | Remove old code, merge to master |
 
 ## Phase 1: Core Abstractions
 
@@ -29,7 +37,8 @@
 - [x] Step 1.7: tools/definitions.py
 - [x] Step 1.8: Wire up with feature flags
 - [x] Step 1.9: Integration testing (14 tests)
-- [ ] Step 1.10: Remove old code
+- [x] Step 1.10: Production testing verified
+- [ ] Step 1.11: Remove old code (DEFERRED - after all phases complete)
 
 ### Notes
 - Started refactoring on 2026-01-26
@@ -59,19 +68,22 @@ Created `tests/llm/test_groq_feature_flags.py` with 14 tests:
 - Available tools routing tests (2 tests)
 - Counter reset tests (1 test)
 
-### Ready for Production Testing
-To test the new system:
-1. Set `USE_NEW_TOOL_REGISTRY=true` in `.env`
-2. Set `USE_NEW_PROMPT_BUILDER=true` in `.env`
-3. Run the bot: `python -m src.main`
-4. Test voice commands triggering each tool:
-   - "Search for Python tutorials" (web_search)
-   - "Generate an image of a cat" (generate_image)
-   - "What is X? Do some research" (deep_research)
-5. Verify logs show "Using new modular tool registry"
-6. Disable flags and verify old path still works
+### Production Testing (COMPLETE)
 
-After production testing is successful, proceed to Step 1.10 to remove old code.
+**Date**: 2026-01-26
+**Result**: All tools verified working
+
+Tested tools:
+- [x] web_search - search queries working
+- [x] generate_image - image generation working
+- [x] edit_image - image editing working
+- [x] deep_research - Claude delegation working
+- [x] tag_user - Discord mentions working
+- [x] post_table - table formatting working
+
+**Issues Found & Fixed**:
+1. `llm_factory.py` wasn't passing `tool_registry` to GroqClient - fixed
+2. `.env` inline comments broke boolean parsing - user fixed
 
 ### Files Created
 - [x] src/core/__init__.py
@@ -119,6 +131,15 @@ After production testing is successful, proceed to Step 1.10 to remove old code.
 **Context**: Beginning major architecture refactoring of 3 god classes
 **Decision**: Use 4-phase approach with feature flags
 **Rationale**: Allows safe incremental migration with easy rollback
+
+### 2026-01-26 - Single Branch Workflow
+**Context**: Phase 1 production testing complete, deciding merge strategy
+**Decision**: Keep all phases on same branch, merge once after Phase 4
+**Rationale**:
+- Feature flags provide safety net throughout
+- Old code removal deferred to final cleanup
+- Single merge reduces integration risk
+- Easier to test full refactor as a unit
 
 ---
 
