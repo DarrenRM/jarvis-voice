@@ -265,8 +265,13 @@ class ClaudeBot(commands.Bot):
         if not self._session or not self._session.sink:
             return
 
-        # Skip bot's own voice state changes
+        # Handle bot's own disconnection
         if member.id == self.user.id:
+            if before.channel and not after.channel:
+                logger.warning(f"[DISCONNECT] Bot was disconnected from {before.channel.name}")
+                # Clean up session
+                if self._session:
+                    asyncio.create_task(self._cleanup_session())
             return
 
         # User left voice channel entirely

@@ -418,6 +418,11 @@ class VoiceSession:
 
         while self._running:
             try:
+                # Check for silent disconnect
+                if not self.voice_client or not self.voice_client.is_connected():
+                    logger.warning("[DISCONNECT] Voice client disconnected, ending session")
+                    break
+
                 # Reset to idle state
                 self.state = "idle"
                 self._wake_event.clear()
@@ -433,6 +438,11 @@ class VoiceSession:
                     try:
                         await asyncio.wait_for(self._wake_event.wait(), timeout=0.2)
                     except asyncio.TimeoutError:
+                        # Check for silent disconnect during idle
+                        if not self.voice_client or not self.voice_client.is_connected():
+                            logger.warning("[DISCONNECT] Voice client disconnected during idle")
+                            self._running = False
+                            break
                         # Check if wake word is in buffer but not yet detected
                         if self.sink and self.sink.check_idle_audio_gap():
                             logger.info("[STATE] Wake word detected from periodic flush")
