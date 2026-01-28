@@ -332,14 +332,17 @@ Filter audio from non-wake-word speakers:
 ```python
 # voice_sink.py - Only buffer audio from wake word speaker
 if self._state == "listening":
-    if self._speaker_isolation_enabled and self._last_user_id is not None:
-        if user_id != self._last_user_id:
+    wake_user = self._wake_processor.wake_word_user_id
+    if self._speaker_isolation_enabled and wake_user is not None:
+        if user_id != wake_user:
             # Log once per user per session
             if user_id not in self._filtered_users:
                 logger.info(f"Filtering audio from user {user_id}")
                 self._filtered_users.add(user_id)
             return  # Don't buffer this audio
 ```
+
+**Important**: Use `wake_word_user_id` (who triggered the wake word) not `_last_user_id` (last audio sender). Otherwise another user's background noise can steal attribution.
 
 ### Pattern 6: Tool Use Loop with Search Limiting
 
@@ -567,10 +570,11 @@ AUTO_JOIN_CHANNEL=channel_name     # Channel to auto-join
 
 ---
 
-## Recent Changes (2026-01-25)
+## Recent Changes (2026-01-27)
 
 | Change | Impact |
 |--------|--------|
+| **wake_user_id property** | Fixed speaker attribution bug where bot addressed wrong user |
 | **Per-user wake detection** | 100% accurate speaker attribution, no cross-talk |
 | User lifecycle management | `on_voice_state_update` cleans up when users leave |
 | Removed shared wake_detector | Config values passed to StreamingSink instead |
@@ -604,6 +608,10 @@ AUTO_JOIN_CHANNEL=channel_name     # Channel to auto-join
 ### Image not posting
 - Check: `NANOBANANA_API_KEY` configured
 - Check: `IMAGE_CHANNEL_NAME` matches a text channel
+
+### Bot addresses wrong user
+- Cause: Speaker resolution used `_last_user_id` (last audio sender) instead of wake word user
+- Fix: Now uses `sink.wake_user_id` property (2026-01-27)
 
 ---
 

@@ -506,7 +506,7 @@ class VoiceSession:
                             speech_end_reason = f"PTT released / no audio packets (buffer={buffer_duration:.2f}s)"
                             logger.info(f"[SPEECH_END] {speech_end_reason}")
                             # Resolve speaker info
-                            self._resolve_current_speaker(self.sink._last_user_id)
+                            self._resolve_current_speaker(self.sink.wake_user_id)
                             logger.info(f"[STATE] Speaker: {self._current_speaker_name} (ID: {self._current_speaker_id}), Activity: {self._current_speaker_activity}")
                             break
                     else:
@@ -522,7 +522,7 @@ class VoiceSession:
                         # Capture pending audio before falling through
                         self._pending_audio = buffer
                         # Resolve speaker info
-                        self._resolve_current_speaker(self.sink._last_user_id)
+                        self._resolve_current_speaker(self.sink.wake_user_id)
                         # DON'T continue - fall through to process the audio
 
                     listen_time = time.perf_counter() - self._listen_start

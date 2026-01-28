@@ -153,6 +153,15 @@ class StreamingSink(discord.sinks.Sink):
                 self._audio_buffer = []
                 self._wake_processor.on_idle_transition()
 
+    @property
+    def wake_user_id(self) -> Optional[int]:
+        """Get the user who triggered the wake word, falling back to last audio sender.
+
+        Use this for speaker attribution instead of _last_user_id, which can be
+        overwritten by other users' audio packets after wake word detection.
+        """
+        return self._wake_processor.wake_word_user_id or self._last_user_id
+
     def remove_user(self, user_id: int) -> None:
         """Clean up when user leaves voice channel.
 
