@@ -47,18 +47,13 @@ THINKING_PHRASES_PERSONAL: list[str] = [
 # Affirmation phrases (short, immediate acknowledgment with name - for dynamic thinking mode)
 # These play immediately after speech ends while waiting for dynamic phrase
 AFFIRMATION_PHRASES: list[str] = [
-    "Sure, {name}...",
-    "[happy] Got it, {name}...",
-    "Alright, {name}...",
-    "Okay, {name}...",
-    "[happy] Sure thing, {name}...",
+    "Sure {name}...",
+    "Okay {name}...",
 ]
 
 # Generic affirmation phrases (when speaker unknown)
 AFFIRMATION_PHRASES_GENERIC: list[str] = [
     "Sure...",
-    "[happy] Got it...",
-    "Alright...",
     "Okay...",
 ]
 
