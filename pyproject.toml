@@ -29,6 +29,7 @@ dependencies = [
 
     # TTS (Inworld API)
     "aiohttp>=3.9.0",
+    "num2words>=0.5.13",  # Number to words for better TTS pronunciation
 
     # Claude Code SDK (headless mode - no API key needed)
     "claude-code-sdk>=0.0.20",

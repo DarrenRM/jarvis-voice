@@ -6,12 +6,127 @@ Filters out:
 - Meta-commentary about responses
 - Very short fragments that aren't valid speech
 - Repetitive token spam
+
+Also normalizes:
+- Numbers to words (400 -> "four hundred")
+- Number ranges (400-600 -> "four hundred to six hundred")
 """
 
 import re
 import logging
 
+try:
+    from num2words import num2words
+    HAS_NUM2WORDS = True
+except ImportError:
+    HAS_NUM2WORDS = False
+
 logger = logging.getLogger(__name__)
+
+
+# Number range pattern - matches various dash types between numbers
+# Handles: 400-600, 400‑600 (non-breaking hyphen), 400–600 (en-dash), 400—600 (em-dash)
+NUMBER_RANGE_PATTERN = re.compile(
+    r'(\d+(?:,\d{3})*(?:\.\d+)?)\s*[-‑–—]\s*(\d+(?:,\d{3})*(?:\.\d+)?)'
+)
+
+# Numbers with plus sign (e.g., "25,000+")
+NUMBER_PLUS_PATTERN = re.compile(
+    r'(\d+(?:,\d{3})*(?:\.\d+)?)\+'
+)
+
+# Standalone numbers (not part of a range, not followed by certain units that TTS handles well)
+# Matches both comma-separated (1,234) and plain numbers (1234)
+STANDALONE_NUMBER_PATTERN = re.compile(
+    r'(?<![0-9.,-‑–—])(\d+(?:,\d{3})*(?:\.\d+)?)(?![0-9.,-‑–—%+])'
+)
+
+
+def _number_to_words(num_str: str) -> str:
+    """Convert a number string to words.
+
+    Args:
+        num_str: Number as string (e.g., "400", "1,234", "3.14")
+
+    Returns:
+        Number as words (e.g., "four hundred", "one thousand two hundred thirty-four")
+    """
+    if not HAS_NUM2WORDS:
+        return num_str
+
+    try:
+        # Remove commas for parsing
+        clean_num = num_str.replace(',', '')
+
+        # Check if it's a decimal
+        if '.' in clean_num:
+            num = float(clean_num)
+        else:
+            num = int(clean_num)
+
+        return num2words(num)
+    except (ValueError, TypeError):
+        return num_str
+
+
+def normalize_numbers_for_tts(text: str) -> str:
+    """Normalize numbers in text for better TTS pronunciation.
+
+    Converts:
+    - Number ranges: "400-600" -> "four hundred to six hundred"
+    - Numbers with plus: "25,000+" -> "twenty-five thousand plus"
+    - Standalone numbers >= 100: "The answer is 400" -> "The answer is four hundred"
+
+    Preserves:
+    - Small numbers < 100: "42" stays as is (TTS handles these well)
+    - Percentages: "50%" stays as is (TTS handles these)
+    - Times: "3:00" stays as is
+    - Dates in certain formats
+
+    Args:
+        text: Text containing numbers
+
+    Returns:
+        Text with numbers converted to words
+    """
+    if not HAS_NUM2WORDS:
+        logger.debug("num2words not installed, skipping number normalization")
+        return text
+
+    # First, handle number ranges (do this before standalone numbers)
+    def replace_range(match: re.Match) -> str:
+        num1 = match.group(1)
+        num2 = match.group(2)
+        words1 = _number_to_words(num1)
+        words2 = _number_to_words(num2)
+        return f"{words1} to {words2}"
+
+    text = NUMBER_RANGE_PATTERN.sub(replace_range, text)
+
+    # Handle numbers with plus sign (e.g., "25,000+" -> "twenty-five thousand plus")
+    def replace_plus(match: re.Match) -> str:
+        num_str = match.group(1)
+        words = _number_to_words(num_str)
+        return f"{words} plus"
+
+    text = NUMBER_PLUS_PATTERN.sub(replace_plus, text)
+
+    # Then handle standalone numbers (3+ digits to avoid converting small numbers unnecessarily)
+    def replace_standalone(match: re.Match) -> str:
+        num_str = match.group(1)
+        # Only convert numbers >= 100 (smaller numbers TTS usually handles fine)
+        clean_num = num_str.replace(',', '')
+        try:
+            if '.' not in clean_num and int(clean_num) < 100:
+                return num_str
+        except ValueError:
+            return num_str
+        return _number_to_words(num_str)
+
+    text = STANDALONE_NUMBER_PATTERN.sub(replace_standalone, text)
+
+    return text
+
 
 # Unicode ellipsis and ASCII dots pattern
 ELLIPSIS_CHARS = r'[.…]'  # Both ASCII period and Unicode ellipsis U+2026
@@ -121,6 +236,7 @@ def filter_for_tts(text: str) -> str:
     """Filter text before sending to TTS.
 
     Removes lines that appear to be internal reasoning or garbage.
+    Normalizes numbers to words for better pronunciation.
 
     Args:
         text: Raw text from LLM response
@@ -145,7 +261,12 @@ def filter_for_tts(text: str) -> str:
 
         filtered_lines.append(line)
 
-    return '\n'.join(filtered_lines)
+    result = '\n'.join(filtered_lines)
+
+    # Normalize numbers to words for better TTS pronunciation
+    result = normalize_numbers_for_tts(result)
+
+    return result
 
 
 def filter_chunk_for_tts(chunk: str, buffer: str = "") -> tuple[str, str]:
