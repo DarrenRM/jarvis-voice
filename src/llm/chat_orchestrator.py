@@ -22,6 +22,9 @@ logger = logging.getLogger(__name__)
 # Maximum number of search tool calls before forcing an answer
 MAX_SEARCH_CALLS = 3
 
+# Discord action tools that should have brief acknowledgments (no follow-up conversation)
+DISCORD_ACTION_TOOLS = {"tag_user", "post_to_chat", "post_table"}
+
 
 class LLMClientProtocol(Protocol):
     """Protocol for LLM clients that the orchestrator can use.
@@ -324,6 +327,18 @@ class ChatOrchestrator:
             # Extract just the success message (before "You can now edit...")
             success_msg = result_output.split(".")[0] + "."
             state.last_action_success = success_msg
+
+        # Inject brief ack guidance for Discord action tools
+        # These are side-effect tools that don't need conversational follow-up
+        if tool_name in DISCORD_ACTION_TOOLS and "Done" in result_output:
+            messages.append({
+                "role": "system",
+                "content": (
+                    "Action completed. Give only a brief 1-2 word acknowledgment "
+                    "like 'Done' or 'Tagged'. Do not elaborate or answer other "
+                    "questions from the original message."
+                ),
+            })
 
     async def _handle_api_error(
         self,
