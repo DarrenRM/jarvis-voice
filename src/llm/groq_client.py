@@ -154,10 +154,14 @@ class GroqClient(BaseLLMClient):
         kwargs = {
             "model": self.model,
             "messages": messages,
-            "tools": tools if tools else None,
-            "tool_choice": tool_choice if tools else None,
             "max_tokens": 1024,
         }
+
+        # Only include tools/tool_choice when tools are provided
+        # Groq doesn't accept None for these fields
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = tool_choice
 
         # GPT-OSS models: disable reasoning output to prevent chain-of-thought leakage
         # See: https://console.groq.com/docs/reasoning

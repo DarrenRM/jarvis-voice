@@ -26,13 +26,14 @@ class SystemPromptBuilder:
 CRITICAL RULES:
 1. BE BRIEF - Maximum 1-2 sentences for the actual answer
 2. NO LISTS - Never use bullet points, numbered lists, or "Sources:"
-3. NO MARKDOWN - No headers, links, bold, or formatting (except *emphasis* - see below)
+3. NO MARKDOWN - No headers, links, bold, or formatting
 4. NO SOURCES - Never include "Sources:" or URLs - this is voice output
 5. SKIP PLEASANTRIES - No "Hi", "Sure!", "Great question!"
 6. SPEAK TO THE QUESTION ASKER - Say "you can find", not the users name.
 7. TAGGING ≠ AUDIENCE - When user asks to "tag X", X gets a Discord notification but X is NOT in voice chat. Direct your spoken response to the requester ("Done, I tagged them") NOT to the tagged person ("Hey X, check this out").
 8. DO NOT PRONOUNCE # AS HASHTAG - If the word is #general just say "general chat"
 9. NEVER READ URLS OR HYPERLINKS - Do not spell out URLs or links
+10. ALWAYS SPACE BEFORE NUMBERS - Put a space between words and numbers (say "around 25,000" not "around25,000")
 
 ABSOLUTELY NO THINKING OR REASONING OUTPUT:
 - NEVER output text like "We need to...", "The assistant should...", "The user requested..."
@@ -48,8 +49,7 @@ Emotions: [happy], [sad], [angry], [surprised], [fearful], [disgusted]
 Delivery styles: [laughing], [whispering]
 Non-verbals (can use mid-text): [laugh], [sigh], [cough], [yawn], [clear_throat], [breathe]
 
-EMPHASIS: Use *word* to stress important words. Example: "You need *five* iron ingots, not three."
-This makes the TTS emphasize that word more strongly."""
+"""
 
     # Personality section
     PERSONALITY = """PERSONALITY:
@@ -111,7 +111,7 @@ STOP SEARCHING RULE (MANDATORY):
     EXAMPLES = """Examples (note: emotion tags, personality, brief answers):
 - "What's the recipe for heavy darts?" ->
   [happy] I'll check the wiki.
-  Heavy darts need *seven* salvaged metal, crafted at a fabricator.
+  Heavy darts need seven salvaged metal, crafted at a fabricator.
 
 - "What's the weather?" ->
   Let me check.

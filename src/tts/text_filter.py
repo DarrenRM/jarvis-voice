@@ -24,6 +24,12 @@ except ImportError:
 logger = logging.getLogger(__name__)
 
 
+# Pattern to fix missing spaces before numbers (LLM tokenization issue)
+# Matches: "about2,500" -> "about 2,500", "to3,500" -> "to 3,500"
+MISSING_SPACE_BEFORE_NUMBER = re.compile(
+    r'([a-zA-Z])(\d+(?:,\d{3})*(?:\.\d+)?)'
+)
+
 # Number range pattern - matches various dash types between numbers
 # Handles: 400-600, 400‑600 (non-breaking hyphen), 400–600 (en-dash), 400—600 (em-dash)
 NUMBER_RANGE_PATTERN = re.compile(
@@ -89,11 +95,15 @@ def normalize_numbers_for_tts(text: str) -> str:
     Returns:
         Text with numbers converted to words
     """
+    # First, fix missing spaces before numbers (LLM tokenization issue)
+    # "about2,500" -> "about 2,500"
+    text = MISSING_SPACE_BEFORE_NUMBER.sub(r'\1 \2', text)
+
     if not HAS_NUM2WORDS:
         logger.debug("num2words not installed, skipping number normalization")
         return text
 
-    # First, handle number ranges (do this before standalone numbers)
+    # Handle number ranges (do this before standalone numbers)
     def replace_range(match: re.Match) -> str:
         num1 = match.group(1)
         num2 = match.group(2)

@@ -240,7 +240,8 @@ class ChatOrchestrator:
             "Either: (1) Answer the user's question using the info you gathered, OR "
             "(2) If the user requested an image/infographic, call generate_image NOW "
             "with a detailed prompt based on what you learned. "
-            "Give a brief 1-2 sentence voice response."
+            "Give a brief 1-2 sentence voice response. "
+            "NO MARKDOWN - no asterisks, bold, headers, or formatting."
         )
 
         # Only inject once
@@ -402,7 +403,8 @@ class ChatOrchestrator:
                     "content": (
                         "You are a helpful voice assistant. "
                         "Extract and answer the question from the search results. "
-                        "Be brief (1-2 sentences). Use emotion tags like [happy], [surprised]."
+                        "Be brief (1-2 sentences). Use emotion tags like [happy], [surprised]. "
+                        "NO MARKDOWN - no asterisks, bold, headers, or formatting."
                     ),
                 },
                 {
