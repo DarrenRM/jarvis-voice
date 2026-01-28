@@ -9,6 +9,7 @@ from typing import AsyncIterator, Optional
 import numpy as np
 
 from ..audio import SAMPLE_RATE_TTS
+from .text_filter import normalize_numbers_for_tts
 
 logger = logging.getLogger(__name__)
 
@@ -91,6 +92,9 @@ class TTSSynthesizer:
         if self._tts_type != "inworld":
             logger.error("TTS not available - check INWORLD_API_KEY")
             return np.array([], dtype=np.float32)
+
+        # Normalize numbers to words for better pronunciation
+        text = normalize_numbers_for_tts(text)
 
         return await self._synthesize_inworld(text)
 
@@ -221,6 +225,9 @@ class TTSSynthesizer:
         if self._tts_type != "inworld":
             logger.error("TTS not available - check INWORLD_API_KEY")
             return
+
+        # Normalize numbers to words for better pronunciation
+        text = normalize_numbers_for_tts(text)
 
         import aiohttp
         import json
