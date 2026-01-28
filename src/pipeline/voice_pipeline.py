@@ -215,11 +215,12 @@ class VoicePipeline:
         done_event: asyncio.Event,
         affirmation_audio: Optional[np.ndarray] = None,
     ) -> None:
-        """Play affirmation then generate and play dynamic thinking phrase.
+        """Play affirmation while generating dynamic phrase in parallel.
 
-        Two-phase approach:
-        1. Play pre-synthesized affirmation immediately ("Sure, {name}...")
-        2. Generate context-aware phrase based on request ("I'll check that weather")
+        Parallel approach to minimize gap:
+        1. Start LLM generation for dynamic phrase
+        2. Play affirmation while generation runs
+        3. Wait for generation, synthesize, and play dynamic phrase
 
         Args:
             generator: ThinkingPhraseGenerator for dynamic phrase creation
@@ -230,23 +231,30 @@ class VoicePipeline:
             affirmation_audio: Pre-synthesized affirmation to play immediately
         """
         try:
-            # Phase 1: Play affirmation immediately (pre-synthesized)
+            # Start dynamic phrase generation immediately (runs in background)
+            generate_task = asyncio.create_task(generator.generate(transcribed_text))
+
+            # Play affirmation while generation runs in parallel
             if affirmation_audio is not None and len(affirmation_audio) > 0:
                 await play_audio(affirmation_audio)
                 logger.debug("Pipeline: Played affirmation phrase")
 
-            # Phase 2: Generate and play dynamic content phrase
-            phrase = await generator.generate(transcribed_text)
+            # Wait for dynamic phrase generation to complete
+            phrase = await generate_task
             logger.debug(f"Pipeline: Generated dynamic phrase: {phrase}")
 
-            # Synthesize the phrase
-            audio = await tts.synthesize(phrase)
-
-            if audio is not None and len(audio) > 0:
-                await play_audio(audio)
-                logger.debug("Pipeline: Played dynamic thinking phrase")
+            # Check if LLM decided to skip (simple request, no thinking needed)
+            if phrase.upper().strip() == "SKIP":
+                logger.info("Pipeline: Skipping dynamic phrase (simple request)")
             else:
-                logger.warning("Pipeline: TTS returned empty audio for dynamic phrase")
+                # Synthesize and play the phrase
+                audio = await tts.synthesize(phrase)
+
+                if audio is not None and len(audio) > 0:
+                    await play_audio(audio)
+                    logger.debug("Pipeline: Played dynamic thinking phrase")
+                else:
+                    logger.warning("Pipeline: TTS returned empty audio for dynamic phrase")
 
         except asyncio.CancelledError:
             logger.debug("Pipeline: Dynamic thinking phrase cancelled")

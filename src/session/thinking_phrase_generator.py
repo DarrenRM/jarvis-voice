@@ -15,24 +15,29 @@ logger = logging.getLogger(__name__)
 
 # Prompt template for generating dynamic thinking phrases
 # Note: No name needed - affirmation phrase handles personalization
-THINKING_PHRASE_PROMPT = """Generate a SHORT (3-8 words) content phrase for this request:
+THINKING_PHRASE_PROMPT = """Generate a SHORT (3-8 words) content phrase for this request, OR return SKIP if none needed.
 "{user_request}"
 
-Examples:
+Return SKIP for simple requests that don't need a thinking phrase:
+- Greetings: "how are you?", "what's up?"
+- Simple questions: "what's your name?", "tell me a joke"
+- Direct conversation: "thanks", "that's funny", "I agree"
+
+Return a phrase for requests that involve work:
 - "What's the weather in Hawaii?" -> "I'll check that weather"
-- "Tell me a joke" -> "let me think of something"
 - "Look up ingredients for ornithopter" -> "I'll look that up"
 - "Can you search for pasta recipes?" -> "I'll find some recipes"
 - "What time is it in Tokyo?" -> "let me check"
-- "Play some music" -> "I'll play something"
+- "Generate an image of a cat" -> "I'll create that"
 
 Rules:
-- 3-8 words MAXIMUM (shorter is better)
+- Return SKIP for simple conversational requests (no lookup/search/generation needed)
+- 3-8 words MAXIMUM if returning a phrase
 - Focus on the ACTION, not greeting
-- Do NOT include names or "sure" (that's handled separately)
+- Do NOT include names or "sure" (handled separately)
 - Start with "I'll", "let me", or similar action words
 
-Response (phrase only, no quotes):"""
+Response (SKIP or phrase only, no quotes):"""
 
 
 class ThinkingPhraseGenerator:
