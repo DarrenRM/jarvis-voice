@@ -83,21 +83,33 @@ class SpeakerManager:
             return None
 
         name_lower = name.lower().strip()
+        name_normalized = name_lower.replace(" ", "")
 
-        # Exact match in configured names
+        # Exact match in configured names (with space normalization)
         for user_id, friendly_name in self._user_names.items():
-            if friendly_name.lower() == name_lower:
+            friendly_lower = friendly_name.lower()
+            friendly_normalized = friendly_lower.replace(" ", "")
+            # Exact match (with or without spaces)
+            if friendly_lower == name_lower or friendly_normalized == name_normalized:
                 return (user_id, friendly_name)
 
-        # Partial match
+        # Bidirectional partial match (search in name OR name in search)
         for user_id, friendly_name in self._user_names.items():
-            if name_lower in friendly_name.lower():
+            friendly_lower = friendly_name.lower()
+            friendly_normalized = friendly_lower.replace(" ", "")
+            # Check both directions, with and without spaces
+            if (name_lower in friendly_lower or friendly_lower in name_lower or
+                name_normalized in friendly_normalized or friendly_normalized in name_normalized):
                 return (user_id, friendly_name)
 
-        # Fallback: search guild members
+        # Fallback: search guild members (with space normalization)
         if guild:
             for member in guild.members:
-                if name_lower in member.display_name.lower():
+                display_lower = member.display_name.lower()
+                display_normalized = display_lower.replace(" ", "")
+                # Check both directions, with and without spaces
+                if (name_lower in display_lower or display_lower in name_lower or
+                    name_normalized in display_normalized or display_normalized in name_normalized):
                     return (member.id, member.display_name)
 
         return None
