@@ -125,6 +125,9 @@ class VoiceSession:
         self._current_speaker_name: Optional[str] = None
         self._current_speaker_activity: Optional[str] = None
 
+        # Keep-alive tracking (prevents Discord disconnect after ~1 hour idle)
+        self._last_keep_alive_time: float = 0.0
+
         # Session components (initialized here or in _init_components)
         self._speaker_tracker = SpeakerTracker(self.speaker_manager)
         self._greeting_service: Optional[GreetingService] = None
@@ -434,6 +437,7 @@ class VoiceSession:
                 # talking before more audio arrives to trigger detection
                 logger.debug("Waiting for wake word...")
                 idle_start = time.perf_counter()
+                self._last_keep_alive_time = idle_start  # Reset keep-alive timer
                 while not self._wake_event.is_set():
                     try:
                         await asyncio.wait_for(self._wake_event.wait(), timeout=0.2)
@@ -443,16 +447,24 @@ class VoiceSession:
                             logger.warning("[DISCONNECT] Voice client disconnected during idle")
                             self._running = False
                             break
+
+                        # Keep-alive check: say something before Discord disconnects us
+                        now = time.perf_counter()
+                        if (self.settings.keep_alive_enabled and
+                                now - self._last_keep_alive_time >= self.settings.keep_alive_interval_seconds):
+                            await self._play_keep_alive()
+                            self._last_keep_alive_time = now
+
                         # Check if wake word is in buffer but not yet detected
                         if self.sink and self.sink.check_idle_audio_gap():
                             logger.info("[STATE] Wake word detected from periodic flush")
                             self._wake_event.set()
                             break
-                idle_time = time.perf_counter() - idle_start
-                logger.info(f"[TIMING] Wake word detected after {idle_time:.1f}s idle")
-
                 if not self._running:
                     break
+
+                idle_time = time.perf_counter() - idle_start
+                logger.info(f"[TIMING] Wake word detected after {idle_time:.1f}s idle")
 
                 # Transition to listening
                 self._listen_start = time.perf_counter()
@@ -588,6 +600,46 @@ class VoiceSession:
             await asyncio.sleep(poll_interval)
 
         return False  # Timed out
+
+    async def _play_keep_alive(self) -> bool:
+        """Play keep-alive message to prevent Discord disconnect.
+
+        Generates a message via LLM using the configurable prompt, then
+        synthesizes and plays it. Used when idle for too long (~50 min).
+
+        Returns:
+            True if keep-alive was played, False on error
+        """
+        if not self.settings.keep_alive_enabled:
+            return False
+
+        try:
+            logger.info("[KEEP-ALIVE] Generating keep-alive message to prevent disconnect")
+
+            # Generate message via LLM
+            response = await self.llm.chat(self.settings.keep_alive_prompt)
+            if not response or len(response.strip()) == 0:
+                logger.warning("[KEEP-ALIVE] LLM returned empty response")
+                return False
+
+            # Truncate if too long
+            message = response.strip()
+            if len(message) > 200:
+                message = message[:200].rsplit(' ', 1)[0]
+
+            logger.info(f"[KEEP-ALIVE] Playing: {message}")
+
+            # Synthesize and play
+            audio = await self.tts.synthesize(message)
+            if len(audio) > 0:
+                await self._play_audio(audio)
+                return True
+
+            return False
+
+        except Exception as e:
+            logger.error(f"[KEEP-ALIVE] Error: {e}")
+            return False
 
     async def _play_ack(self):
         """Play acknowledgment audio.

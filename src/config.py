@@ -81,6 +81,19 @@ class Settings(BaseSettings):
     greeting_timeout_seconds: float = Field(default=10.0, alias="GREETING_TIMEOUT_SECONDS")
     greeting_cooldown_seconds: float = Field(default=300.0, alias="GREETING_COOLDOWN_SECONDS")  # 5 minutes
 
+    # Keep-alive (prevent Discord disconnect after ~1 hour idle)
+    keep_alive_enabled: bool = Field(default=True, alias="KEEP_ALIVE_ENABLED")
+    keep_alive_interval_seconds: float = Field(default=3000.0, alias="KEEP_ALIVE_INTERVAL_SECONDS")  # 50 minutes
+    keep_alive_prompt: str = Field(
+        default=(
+            "You've been sitting in silence for almost an hour. "
+            "Discord will disconnect you if you don't say something soon. "
+            "Generate a brief, slightly annoyed or sarcastic comment about being legally required to speak "
+            "or Discord will kick you out. Keep it to 1-2 sentences max."
+        ),
+        alias="KEEP_ALIVE_PROMPT"
+    )
+
     # Dynamic Thinking Phrases (context-aware acknowledgments)
     dynamic_thinking_enabled: bool = Field(default=False, alias="DYNAMIC_THINKING_ENABLED")
 
