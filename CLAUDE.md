@@ -94,7 +94,19 @@ Discord Voice --> [Per-User Session] --> [Wake Word] openwakeword
                                          [TTS] Inworld --> Discord Voice
 ```
 
-**Features:** Auto-join, per-user sessions, speaker isolation, greeting on join, Claude delegation for Groq.
+**Features:** Auto-join, per-user sessions, speaker isolation, greeting on join, keep-alive, Claude delegation for Groq.
+
+### Keep-Alive
+
+Discord disconnects voice bots after ~1 hour of inactivity. The keep-alive feature generates and speaks a message before this happens.
+
+```bash
+KEEP_ALIVE_ENABLED=true  # Default: true
+KEEP_ALIVE_INTERVAL_SECONDS=3000  # Default: 50 minutes
+KEEP_ALIVE_PROMPT="Your custom prompt here"  # LLM generates response from this
+```
+
+Default prompt instructs the bot to make a slightly annoyed comment about being legally required to speak.
 
 ## File Structure
 
