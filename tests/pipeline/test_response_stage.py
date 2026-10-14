@@ -179,3 +179,64 @@ class TestHistoryTrim:
         for prev, msg in zip(history, history[1:]):
             if msg["role"] == "tool":
                 assert prev["role"] == "tool" or prev.get("tool_calls")
+
+
+class BigPage(Echo):
+    async def execute(self, args):
+        return ToolResult(success=True, output="Page: Chicago Weather\n" + "page text " * 2000)
+
+
+def tool_then_answer(answer="It's sunny."):
+    return [
+        TurnResult(tool_calls=[ToolCall("c1", "echo", "{}")], finish_reason="tool_calls"),
+        TurnResult(content=answer, finish_reason="stop"),
+    ]
+
+
+class TestToolResultExpiry:
+    def make(self, llm, now):
+        registry = ToolRegistry()
+        registry.register(BigPage())
+        return ResponseStage(ChatOrchestrator(llm, ToolExecutor(registry)), lambda: "p",
+                             tool_result_ttl=120, clock=lambda: now[0])
+
+    async def test_page_kept_whole_for_follow_ups_within_ttl(self):
+        now = [0.0]
+        llm = FakeLLM(script=tool_then_answer() + [TurnResult(content="Cool.", finish_reason="stop")])
+        stage = self.make(llm, now)
+        await run(stage, "weather?")
+        now[0] = 60
+        await run(stage, "and tomorrow?")
+        sent_tool = [m for m in llm.requests[2] if m["role"] == "tool"][0]
+        assert len(sent_tool["content"]) > 10000
+
+    async def test_page_replaced_with_note_after_ttl(self):
+        now = [0.0]
+        llm = FakeLLM(script=tool_then_answer() + [TurnResult(content="Hi.", finish_reason="stop")])
+        stage = self.make(llm, now)
+        await run(stage, "weather?")
+        now[0] = 121
+        await run(stage, "something else")
+        sent_tool = [m for m in llm.requests[2] if m["role"] == "tool"][0]
+        assert sent_tool["tool_call_id"] == "c1"  # still paired with its tool call
+        assert sent_tool["content"].startswith("[Earlier echo result removed")
+        assert "Chicago Weather" in sent_tool["content"]
+        assert len(sent_tool["content"]) < 300
+
+    async def test_short_tool_results_never_expire(self):
+        now = [0.0]
+        followup = [TurnResult(content="Hi.", finish_reason="stop")]
+        llm = FakeLLM(script=tool_then_answer("Done.") + followup)
+        stage, _ = make_stage(llm)
+        stage._clock = lambda: now[0]
+        await run(stage, "post it")
+        now[0] = 1000
+        await run(stage, "hello")
+        assert stage.get_messages()[2]["content"] == "echoed"
+
+    async def test_reset_clears_expiry_tracking(self):
+        now = [0.0]
+        stage = self.make(FakeLLM(script=tool_then_answer()), now)
+        await run(stage, "weather?")
+        stage.reset_conversation()
+        assert stage._tool_result_times == {}

@@ -55,6 +55,22 @@ class GroqWhisperClient:
             logger.error("groq not installed. Install with: pip install groq")
             raise
 
+    async def warm_up(self) -> None:
+        """Import the SDK and open the connection (free models list) ahead of the first question.
+
+        Cold, these took ~3s on the first transcription.
+        """
+        import asyncio
+        import time
+
+        t0 = time.perf_counter()
+        try:
+            await asyncio.to_thread(self._ensure_client)
+            await asyncio.to_thread(self._client.models.list)
+            logger.info(f"[WARMUP] Groq Whisper ready in {time.perf_counter() - t0:.2f}s")
+        except Exception as e:
+            logger.warning(f"[WARMUP] Groq Whisper warm-up failed: {e}")
+
     async def transcribe_audio(self, audio: np.ndarray) -> str:
         """Transcribe audio using Groq Whisper.
 

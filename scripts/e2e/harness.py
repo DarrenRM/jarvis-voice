@@ -1,0 +1,519 @@
+"""End-to-end voice harness: synthetic speech in, bot speech out, no Discord connection.
+
+Drives the real VoiceSession (sink -> wake word -> VAD -> Groq Whisper -> Cerebras
+-> Inworld TTS -> playback) with a fake voice client:
+
+- User speech is synthesized with Inworld TTS and written into the sink as 20 ms
+  48 kHz stereo frames, in real time, from a separate thread (like py-cord's
+  decoder thread).
+- Everything the bot plays is captured frame by frame with timestamps, then
+  transcribed with Groq Whisper so each step can be checked from the outside.
+
+Live APIs are used (Groq, Cerebras, Inworld). Nothing is sent to Discord.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+import re
+import threading
+import time
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Callable, Optional, Union
+
+import numpy as np
+
+from src.audio import resample_24k_mono_to_48k_stereo, resample_48k_stereo_to_16k_mono
+
+logger = logging.getLogger("e2e")
+
+FRAME_BYTES = 3840  # 20 ms of 48 kHz stereo s16le
+FRAME_SEC = 0.02
+TTS_RATE = 24000
+BOT_USER_ID = 900000000000000001
+
+
+# ---------------------------------------------------------------- fake Discord
+
+
+class FakeMember:
+    def __init__(self, user_id: int, display_name: str, activity: Optional[str] = None):
+        import discord
+
+        self.id = user_id
+        self.display_name = display_name
+        self.name = display_name.lower().replace(" ", "")
+        self.activities = [discord.Game(activity)] if activity else []
+        self.mention = f"<@{user_id}>"
+        self.bot = False
+
+
+class FakeChannel:
+    def __init__(self, name: str):
+        self.name = name
+        self.sent: list[str] = []
+
+    async def send(self, content=None, **kwargs):
+        self.sent.append(content if content is not None else str(kwargs))
+
+
+class FakeGuild:
+    def __init__(self, members: list[FakeMember], channel_name: str):
+        self.members = members
+        self.text_channels = [FakeChannel(channel_name)]
+        self.name = "e2e-guild"
+
+    def get_member(self, user_id: int) -> Optional[FakeMember]:
+        return next((m for m in self.members if m.id == user_id), None)
+
+    @property
+    def channel(self) -> FakeChannel:
+        return self.text_channels[0]
+
+
+class _FakeWS:
+    async def speak(self, *args, **kwargs):
+        return None
+
+
+@dataclass
+class PlaybackSegment:
+    start: float
+    end: float = 0.0
+    frames: list[bytes] = field(default_factory=list)
+    interrupted: bool = False
+    transcript: str = ""
+
+    @property
+    def duration(self) -> float:
+        return len(self.frames) * FRAME_SEC
+
+
+class FakeVoiceClient:
+    """Implements the parts of discord.VoiceClient that VoiceSession uses.
+
+    play() runs the source in a thread at real-time pace, like discord's AudioPlayer,
+    and records every frame.
+    """
+
+    def __init__(self, guild: FakeGuild, clock: Callable[[], float]):
+        self.guild = guild
+        self.user = FakeMember(BOT_USER_ID, "Jarvis")
+        self.ws = _FakeWS()
+        self.recording = False
+        self.sink = None
+        self.segments: list[PlaybackSegment] = []
+        self._clock = clock
+        self._thread: Optional[threading.Thread] = None
+        self._stop = threading.Event()
+
+    def is_connected(self) -> bool:
+        return True
+
+    def start_recording(self, sink, callback, *args):
+        sink.init(self)
+        self.sink = sink
+        self.recording = True
+
+    def stop_recording(self):
+        self.recording = False
+
+    def is_playing(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def stop(self):
+        if self.is_playing():
+            self._stop.set()
+            self._thread.join(timeout=2)
+
+    def play(self, source, *, after=None, **kwargs):
+        import discord
+
+        if self.is_playing():
+            raise discord.ClientException("Already playing audio.")
+        segment = PlaybackSegment(start=self._clock())
+        self.segments.append(segment)
+        self._stop = threading.Event()
+        stop = self._stop
+
+        def run():
+            error = None
+            try:
+                next_at = time.perf_counter()
+                while not stop.is_set():
+                    data = source.read()
+                    if not data:
+                        break
+                    segment.frames.append(data)
+                    next_at += FRAME_SEC
+                    delay = next_at - time.perf_counter()
+                    if delay > 0:
+                        time.sleep(delay)
+            except Exception as e:  # pragma: no cover - surfaced via after()
+                error = e
+            segment.end = self._clock()
+            segment.interrupted = stop.is_set()
+            if after:
+                after(error)
+
+        self._thread = threading.Thread(target=run, name="fake-audio-player", daemon=True)
+        self._thread.start()
+
+
+# ---------------------------------------------------------------- user speech
+
+Part = Union[str, float]  # text to speak, or seconds of silence
+
+
+@dataclass
+class Speech:
+    """One person talking. parts mixes text and pauses: ["Hey Jarvis.", 1.0, "what time is it?"]."""
+
+    user: FakeMember
+    parts: list[Part]
+    at: float = 0.5  # seconds after scenario start
+    voice: str = "ashley"
+    noise_snr_db: Optional[float] = None  # add background noise at this SNR
+    mode: str = "vad"  # "vad": frames stop in silence (Discord voice activity); "open": open mic
+    started_at: float = 0.0  # set when scheduled (scenario clock)
+    ended_at: float = 0.0  # time of the last packet sent
+
+    @property
+    def text(self) -> str:
+        return " ".join(p for p in self.parts if isinstance(p, str))
+
+
+class SpeechFactory:
+    """Synthesizes user speech with Inworld (disk-cached) and turns it into Discord frames."""
+
+    def __init__(self, api_key: str, cache_dir: Path):
+        self._api_key = api_key
+        self._cache = cache_dir
+        self._cache.mkdir(parents=True, exist_ok=True)
+        self._synths: dict = {}
+
+    def _synth(self, voice: str):
+        from src.tts.synthesizer import TTSSynthesizer
+
+        if voice not in self._synths:
+            self._synths[voice] = TTSSynthesizer(
+                model="inworld-tts-1.5-mini", device="cpu", voice=voice, api_key=self._api_key,
+                temperature=0.8, speed=1.0,
+            )
+        return self._synths[voice]
+
+    async def say(self, text: str, voice: str) -> np.ndarray:
+        key = hashlib.sha1(f"{voice}|{text}".encode()).hexdigest()[:16]
+        path = self._cache / f"{key}.npy"
+        if path.exists():
+            return np.load(path)
+        audio = await self._synth(voice).synthesize(text)
+        if len(audio) == 0:
+            raise RuntimeError(f"TTS returned no audio for {text!r} ({voice})")
+        audio = _trim_silence(audio.astype(np.float32))
+        np.save(path, audio)
+        return audio
+
+    async def render(self, speech: Speech, seed: int = 0) -> np.ndarray:
+        """24 kHz mono float32 for the whole speech."""
+        pieces = []
+        for part in speech.parts:
+            if isinstance(part, str):
+                pieces.append(await self.say(part, speech.voice))
+            else:
+                pieces.append(np.zeros(int(part * TTS_RATE), dtype=np.float32))
+        audio = np.concatenate(pieces)
+        if speech.noise_snr_db is not None:
+            audio = add_noise(audio, speech.noise_snr_db, seed)
+        return audio
+
+
+def _trim_silence(audio: np.ndarray, threshold: float = 0.01) -> np.ndarray:
+    idx = np.flatnonzero(np.abs(audio) > threshold)
+    if len(idx) == 0:
+        return audio
+    pad = int(0.05 * TTS_RATE)
+    return audio[max(0, idx[0] - pad): idx[-1] + pad]
+
+
+def add_noise(audio: np.ndarray, snr_db: float, seed: int = 0) -> np.ndarray:
+    """Add brown-ish background noise (fan/room hum) at the given SNR."""
+    rng = np.random.default_rng(seed)
+    white = rng.standard_normal(len(audio)).astype(np.float32)
+    brown = np.cumsum(white)
+    brown -= np.convolve(brown, np.ones(2400) / 2400, mode="same")  # remove drift
+    noise = 0.5 * brown / (np.std(brown) + 1e-9) + 0.5 * white
+    voiced = audio[np.abs(audio) > 0.01]
+    signal_power = np.mean(voiced ** 2) if len(voiced) else np.mean(audio ** 2)
+    noise *= np.sqrt(signal_power / (10 ** (snr_db / 10))) / (np.std(noise) + 1e-9)
+    return np.clip(audio + noise, -1, 1).astype(np.float32)
+
+
+def to_frames(audio_24k: np.ndarray, mode: str, hangover: float = 0.3,
+              open_tail: float = 3.0) -> list[Optional[bytes]]:
+    """Split into 20 ms Discord frames. None = no packet sent for that slot.
+
+    vad:  packets only while voiced, plus `hangover` seconds (Discord voice activity)
+    open: every slot gets a packet, with a quiet noise floor and an extra tail
+    """
+    if mode == "open":
+        tail = np.random.default_rng(1).standard_normal(int(open_tail * TTS_RATE)) * 0.0005
+        audio_24k = np.concatenate([audio_24k, tail.astype(np.float32)])
+    pcm = resample_24k_mono_to_48k_stereo(audio_24k)
+    pcm += b"\x00" * (-len(pcm) % FRAME_BYTES)
+    frames = [pcm[i:i + FRAME_BYTES] for i in range(0, len(pcm), FRAME_BYTES)]
+    if mode == "open":
+        return frames
+
+    samples_per_frame = int(TTS_RATE * FRAME_SEC)
+    voiced = []
+    for i in range(len(frames)):
+        chunk = audio_24k[i * samples_per_frame:(i + 1) * samples_per_frame]
+        voiced.append(len(chunk) > 0 and float(np.sqrt(np.mean(chunk ** 2))) > 0.008)
+    hang = int(hangover / FRAME_SEC)
+    out: list[Optional[bytes]] = []
+    last_voiced = -10**9
+    for i, frame in enumerate(frames):
+        if voiced[i]:
+            last_voiced = i
+        out.append(frame if i - last_voiced <= hang else None)
+    return out
+
+
+class Injector:
+    """Writes every speaker's frames into the sink at real-time pace from one thread."""
+
+    def __init__(self, sink, clock: Callable[[], float]):
+        self._sink = sink
+        self._clock = clock
+        self.user_track: list[tuple[float, int, bytes]] = []  # (time, user_id, frame)
+        self.last_frame_time: dict[int, float] = {}
+        self.error: Optional[BaseException] = None
+
+    def run(self, schedule: list[tuple[float, int, bytes]]) -> None:
+        schedule = sorted(schedule, key=lambda x: x[0])
+        try:
+            for t, user_id, frame in schedule:
+                delay = t - self._clock()
+                if delay > 0:
+                    time.sleep(delay)
+                self._sink.write(frame, user_id)
+                now = self._clock()
+                self.user_track.append((now, user_id, frame))
+                self.last_frame_time[user_id] = now
+        except BaseException as e:  # surfaced in the report
+            self.error = e
+            logger.exception("Injector failed")
+
+
+def build_schedule(speech: Speech, frames: list[Optional[bytes]],
+                   offset: float = 0.0) -> list[tuple[float, int, bytes]]:
+    start = offset + speech.at
+    speech.started_at = start
+    sent = [i for i, f in enumerate(frames) if f]
+    speech.ended_at = start + (sent[-1] + 1) * FRAME_SEC if sent else start
+    return [(start + i * FRAME_SEC, speech.user.id, frames[i]) for i in sent]
+
+
+# ---------------------------------------------------------------- analysis helpers
+
+
+def frames_to_16k(frames: list[bytes]) -> np.ndarray:
+    if not frames:
+        return np.array([], dtype=np.float32)
+    return resample_48k_stereo_to_16k_mono(b"".join(frames))
+
+
+_TAG = re.compile(r"\[[a-z ]+\]", re.IGNORECASE)
+
+
+def normalize_words(text: str) -> list[str]:
+    from num2words import num2words
+
+    text = _TAG.sub(" ", text.lower())
+    text = re.sub(r"(\d+)", lambda m: " " + num2words(int(m.group(1))) + " ", text)
+    text = re.sub(r"[^a-z' ]+", " ", text.replace("-", " "))
+    return [w.strip("'") for w in text.split() if w.strip("'")]
+
+
+def word_error_rate(reference: str, hypothesis: str) -> float:
+    ref, hyp = normalize_words(reference), normalize_words(hypothesis)
+    if not ref:
+        return 0.0 if not hyp else 1.0
+    d = list(range(len(hyp) + 1))
+    for i, r in enumerate(ref, 1):
+        prev, d[0] = d[0], i
+        for j, h in enumerate(hyp, 1):
+            cur = min(d[j] + 1, d[j - 1] + 1, prev + (r != h))
+            prev, d[j] = d[j], cur
+    return d[len(hyp)] / len(ref)
+
+
+def overlap(a: str, b: str) -> float:
+    """Share of a's words found in b."""
+    wa, wb = normalize_words(a), set(normalize_words(b))
+    return sum(w in wb for w in wa) / len(wa) if wa else 0.0
+
+
+def write_wav(path: Path, user_track, segments, duration: float) -> None:
+    """Stereo 48 kHz WAV: left = everyone talking to the bot, right = the bot."""
+    from scipy.io import wavfile
+
+    n = int((duration + 1) * 48000)
+    left = np.zeros(n, dtype=np.float32)
+    right = np.zeros(n, dtype=np.float32)
+
+    def place(track, t, frame):
+        x = np.frombuffer(frame, dtype=np.int16).reshape(-1, 2).mean(axis=1) / 32768.0
+        i = int(t * 48000)
+        x = x[: max(0, n - i)]
+        track[i:i + len(x)] += x
+
+    for t, _, frame in user_track:
+        place(left, t - FRAME_SEC, frame)
+    for seg in segments:
+        for k, frame in enumerate(seg.frames):
+            place(right, seg.start + k * FRAME_SEC, frame)
+    stereo = np.stack([left, right], axis=1)
+    wavfile.write(str(path), 48000, (np.clip(stereo, -1, 1) * 32767).astype(np.int16))
+
+
+# ---------------------------------------------------------------- scenario run
+
+
+@dataclass
+class TurnRecord:
+    user_text: str  # what the bot heard (from history)
+    answer: str  # what the LLM said (from history)
+    tools: list[str]
+
+
+@dataclass
+class RunResult:
+    name: str
+    speeches: list[Speech]
+    segments: list[PlaybackSegment]
+    turns: list[TurnRecord]
+    posts: list[str]
+    speech_end: dict[int, float]  # user_id -> last frame time
+    duration: float
+    error: Optional[str] = None
+    checks: list[tuple[str, bool, str]] = field(default_factory=list)
+    metrics: dict = field(default_factory=dict)
+
+    @property
+    def bot_transcript(self) -> str:
+        return " ".join(s.transcript for s in self.segments if s.transcript).strip()
+
+
+def turns_from_history(history: list[dict]) -> list[TurnRecord]:
+    turns: list[TurnRecord] = []
+    for msg in history:
+        if msg["role"] == "user":
+            text = re.sub(r"^\[[^\]]+\]:\s*", "", msg["content"])
+            turns.append(TurnRecord(user_text=text, answer="", tools=[]))
+        elif turns and msg["role"] == "assistant":
+            for tc in msg.get("tool_calls") or []:
+                turns[-1].tools.append(tc["function"]["name"])
+            if msg.get("content") and not msg.get("tool_calls"):
+                turns[-1].answer = msg["content"]
+    return turns
+
+
+class Rig:
+    """Shared components (loaded once) + a factory for fresh sessions."""
+
+    def __init__(self, settings, report_dir: Path):
+        from src.stt.groq_whisper import GroqWhisperClient
+
+        self.settings = settings
+        self.report_dir = report_dir
+        self.speech = SpeechFactory(settings.inworld_api_key, report_dir.parent / "speech-cache")
+        self.whisper = GroqWhisperClient(api_key=settings.groq_api_key,
+                                         model="whisper-large-v3-turbo", language="en")
+        self.vad = None
+        self.tts = None
+
+    async def run(self, name: str, speeches: list[Speech], members: list[FakeMember],
+                  settle: float = 3.0, timeout: float = 90.0,
+                  between: Optional[float] = None) -> RunResult:
+        """Run speeches through a fresh VoiceSession and collect everything it did.
+
+        If `between` is set, speeches are played as separate turns: each one starts
+        `between` seconds after the bot has gone quiet from the previous turn.
+        """
+        from src.bot.voice_session import VoiceSession
+
+        t0 = time.perf_counter()
+        clock = lambda: time.perf_counter() - t0  # noqa: E731
+        guild = FakeGuild(members, self.settings.image_channel_name)
+        vc = FakeVoiceClient(guild, clock)
+        session = VoiceSession(vad=self.vad, groq_client=self.whisper, tts=self.tts)
+        session_task = asyncio.create_task(session.start(vc))
+        while session.sink is None:
+            if session_task.done():
+                session_task.result()
+            await asyncio.sleep(0.05)
+        # share loaded models with later sessions
+        self.vad, self.tts = session.vad, session.tts
+
+        error = None
+        injector = Injector(session.sink, clock)
+        try:
+            groups = [speeches] if between is None else [[s] for s in speeches]
+            for gi, group in enumerate(groups):
+                rendered = [(sp, await self.speech.render(sp, seed=k)) for k, sp in enumerate(group)]
+                # Offsets count from now, after models loaded and speech is synthesized
+                base = clock() + (between or 0.0) - (group[0].at if gi else 0.0)
+                schedule = []
+                for sp, audio in rendered:
+                    schedule += build_schedule(sp, to_frames(audio, sp.mode), base)
+                await asyncio.to_thread(injector.run, schedule)
+                if injector.error:
+                    raise injector.error
+                await self._wait_quiet(session, vc, settle, timeout)
+        except Exception as e:
+            error = f"{type(e).__name__}: {e}"
+            logger.exception(f"[{name}] failed")
+        finally:
+            await session.stop()
+            session_task.cancel()
+            try:
+                await session_task
+            except (asyncio.CancelledError, Exception):
+                pass
+
+        for seg in vc.segments:
+            audio = frames_to_16k(seg.frames)
+            if len(audio) > 1600:
+                try:
+                    seg.transcript = (await self.whisper.transcribe_audio(audio)).strip()
+                except Exception as e:
+                    seg.transcript = f"<transcribe failed: {e}>"
+
+        history = session._voice_pipeline._response.get_messages() if session._voice_pipeline else []
+        result = RunResult(
+            name=name, speeches=speeches, segments=vc.segments,
+            turns=turns_from_history(history), posts=list(guild.channel.sent),
+            speech_end=dict(injector.last_frame_time), duration=clock(), error=error,
+        )
+        write_wav(self.report_dir / f"{name}.wav", injector.user_track, vc.segments, result.duration)
+        return result
+
+    async def _wait_quiet(self, session, vc: FakeVoiceClient, settle: float, timeout: float) -> None:
+        """Wait until the session is idle and nothing has played for `settle` seconds."""
+        deadline = time.perf_counter() + timeout
+        quiet_since = None
+        while time.perf_counter() < deadline:
+            busy = session.state != "idle" or vc.is_playing()
+            if busy:
+                quiet_since = None
+            elif quiet_since is None:
+                quiet_since = time.perf_counter()
+            elif time.perf_counter() - quiet_since >= settle:
+                return
+            await asyncio.sleep(0.1)
+        raise TimeoutError(f"session still busy after {timeout:.0f}s (state={session.state})")

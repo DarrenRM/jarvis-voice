@@ -7,12 +7,26 @@ Simple wrapper around ChatOrchestrator that:
 """
 
 import logging
+import time
 from typing import AsyncIterator, Callable
 
 from ..llm.chat_orchestrator import ChatOrchestrator, TurnOutcome
 from .base import PipelineContext, StreamingPipelineStage
 
 logger = logging.getLogger(__name__)
+
+# Tool results (web pages can be 15k chars each) stay whole in history for a
+# short while so follow-ups ("what about tomorrow?") can use them, then are
+# swapped for a note so they aren't re-sent with every later question.
+TOOL_RESULT_TTL_SECONDS = 120.0
+# Results this short (e.g. "Done! I've posted that") are cheap; keep them whole
+SMALL_TOOL_RESULT_CHARS = 300
+
+
+def _expired_note(tool_name: str, content: str) -> str:
+    first_line = content.strip().splitlines()[0][:150] if content.strip() else ""
+    return (f"[Earlier {tool_name} result removed to save space. It began: {first_line!r}. "
+            f"Call {tool_name} again if you need the details.]")
 
 
 class ResponseStage(StreamingPipelineStage):
@@ -33,6 +47,8 @@ class ResponseStage(StreamingPipelineStage):
         orchestrator: ChatOrchestrator,
         build_system_prompt: Callable[[], str],
         max_history_messages: int = 60,
+        tool_result_ttl: float = TOOL_RESULT_TTL_SECONDS,
+        clock: Callable[[], float] = time.monotonic,
     ):
         """Initialize response stage.
 
@@ -41,12 +57,18 @@ class ResponseStage(StreamingPipelineStage):
             build_system_prompt: Returns the base system prompt. Called every turn
                 so the date/time is current.
             max_history_messages: History cap; oldest whole exchanges are dropped
+            tool_result_ttl: Seconds a large tool result stays whole in history
+            clock: Time source (tests)
         """
         self._orchestrator = orchestrator
         self._build_base_prompt = build_system_prompt
         self._max_history = max_history_messages
         # Conversation without the system prompt (rebuilt each turn)
         self._history: list[dict] = []
+        self._tool_result_ttl = tool_result_ttl
+        self._clock = clock
+        # tool_call_id -> when its (large) result entered history
+        self._tool_result_times: dict[str, float] = {}
 
     @property
     def name(self) -> str:
@@ -56,6 +78,7 @@ class ResponseStage(StreamingPipelineStage):
     def reset_conversation(self) -> None:
         """Reset conversation history to start fresh."""
         self._history = []
+        self._tool_result_times = {}
         logger.debug("Conversation history reset")
 
     def get_messages(self) -> list[dict]:
@@ -76,6 +99,7 @@ class ResponseStage(StreamingPipelineStage):
         Yields:
             Response text chunks
         """
+        self._expire_tool_results()
         messages = [
             {"role": "system", "content": self._build_system_prompt(context)},
             *self._history,
@@ -88,9 +112,32 @@ class ResponseStage(StreamingPipelineStage):
 
         # Only keep turns that completed; a failed turn may end mid tool-loop
         if outcome.ok:
+            now = self._clock()
+            for msg in messages[len(self._history) + 1:]:
+                big = len(msg.get("content") or "") > SMALL_TOOL_RESULT_CHARS
+                if msg.get("role") == "tool" and big:
+                    self._tool_result_times[msg["tool_call_id"]] = now
             self._history = self._trim(messages[1:])
         else:
             logger.info("Turn did not complete, not adding it to history")
+
+    def _expire_tool_results(self) -> None:
+        """Replace large tool results older than the TTL with a short note."""
+        now = self._clock()
+        expired = {cid for cid, t in self._tool_result_times.items()
+                   if now - t >= self._tool_result_ttl}
+        if not expired:
+            return
+        names = {tc["id"]: tc["function"]["name"]
+                 for m in self._history for tc in (m.get("tool_calls") or [])}
+        for i, msg in enumerate(self._history):
+            cid = msg.get("tool_call_id")
+            if msg.get("role") == "tool" and cid in expired:
+                tool_name = names.get(cid, "the tool")
+                self._history[i] = {**msg, "content": _expired_note(tool_name, msg["content"])}
+        for cid in expired:
+            del self._tool_result_times[cid]
+        logger.debug(f"Expired {len(expired)} tool result(s) from history")
 
     def _trim(self, history: list[dict]) -> list[dict]:
         """Drop oldest exchanges so history fits, cutting only at user messages.

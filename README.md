@@ -110,8 +110,8 @@ Text commands in any channel:
 
 | Tool | What it does | Setup |
 |------|--------------|-------|
-| `web_search` | DuckDuckGo search (titles, links, snippets) | Nothing needed |
-| `web_extract` | Read one page's main text locally (Trafilatura) | Nothing needed |
+| `web_search` | Web search via ddgs (metasearch: Wikipedia, Bing, Brave, DuckDuckGo, Google, ...) | Nothing needed |
+| `web_extract` | Read up to 5 pages in parallel, locally (Trafilatura) | Nothing needed |
 | `tag_user` | Mention someone in the text channel | Nothing needed |
 | `post_to_chat` / `post_table` | Post a message or table to the text channel | Nothing needed |
 | `generate_image` / `edit_image` | Make or edit an image and post it | `IMAGE_GENERATION_ENABLED=true` + `NANOBANANA_API_KEY` |
@@ -145,7 +145,7 @@ src/
   llm/        Cerebras client, tool loop, system prompt
   tts/        Inworld TTS
   tools/      Tool handlers (web, images, Discord actions)
-  web/        DuckDuckGo search + local page reader
+  web/        ddgs search + local page reader
   image/      Image generation
   pipeline/   Voice pipeline orchestration
   config.py   All settings (read from .env)

@@ -50,11 +50,11 @@ class Settings(BaseSettings):
     # Voice conversation history kept per session (oldest whole exchanges dropped first)
     llm_history_max_messages: int = Field(default=60, alias="LLM_HISTORY_MAX_MESSAGES")
 
-    # Web lookup: DuckDuckGo search + local page reader (no keys, no hosted services)
+    # Web lookup: ddgs metasearch + local page reader (no keys, no hosted services)
     web_tools_enabled: bool = Field(default=True, alias="WEB_TOOLS_ENABLED")
     web_search_max_results: int = Field(default=5, alias="WEB_SEARCH_MAX_RESULTS")
-    # Page text handed to the model is cut at this length (keeps voice turns fast)
-    web_extract_max_chars: int = Field(default=6000, alias="WEB_EXTRACT_MAX_CHARS")
+    # Text handed to the model per page is cut at this length
+    web_extract_max_chars: int = Field(default=15000, alias="WEB_EXTRACT_MAX_CHARS")
 
     # Deep research via OpenAI (Codex/ChatGPT subscription sign-in). Not wired up yet.
     deep_research_enabled: bool = Field(default=False, alias="DEEP_RESEARCH_ENABLED")

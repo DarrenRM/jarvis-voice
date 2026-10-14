@@ -1,4 +1,8 @@
-"""Web search via DuckDuckGo (ddgs). No API key, no hosted service."""
+"""Web search via ddgs. No API key, no hosted service.
+
+ddgs' default "auto" backend is a metasearch: Wikipedia first, then a rotating
+mix of Bing, Brave, DuckDuckGo, Google, Mojeek, Yahoo and Yandex.
+"""
 
 import asyncio
 import logging
@@ -15,7 +19,7 @@ class SearchHit:
 
 
 class WebSearcher:
-    """Runs DuckDuckGo text searches off the event loop."""
+    """Runs ddgs text searches off the event loop."""
 
     def __init__(self, max_results: int = 5, timeout: float = 10.0, region: str = "us-en"):
         self._max_results = max_results
@@ -50,5 +54,5 @@ class WebSearcher:
             ) or []
         except DDGSException as e:
             # ddgs raises when no backend returns results
-            logger.info(f"DuckDuckGo returned nothing for {query!r}: {e}")
+            logger.info(f"Web search returned nothing for {query!r}: {e}")
             return []

@@ -1,4 +1,4 @@
-"""Local, credit-free web access: DuckDuckGo search and Trafilatura page reading."""
+"""Local, credit-free web access: ddgs metasearch and Trafilatura page reading."""
 
 from .reader import PageReader, WebPage, WebReadError
 from .search import SearchHit, WebSearcher

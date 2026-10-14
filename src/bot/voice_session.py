@@ -116,6 +116,7 @@ class VoiceSession:
         self._playback_task: Optional[asyncio.Task] = None
         self._tts_tasks: list[asyncio.Task] = []
         self._thinking_task: Optional[asyncio.Task] = None
+        self._warmup_task: Optional[asyncio.Task] = None
         self._thinking_synth_time: float = 0.0
         self._ack_played: bool = False  # Track if ack played this session
         self._listen_start: float = 0.0  # Track when listening started
@@ -219,13 +220,14 @@ class VoiceSession:
 
         # Initialize dynamic thinking phrase generator (if enabled)
         if self._thinking_generator is None and self.settings.dynamic_thinking_enabled:
-            if self.settings.groq_api_key:
+            if self.settings.cerebras_api_key:
                 logger.info("Initializing dynamic thinking phrase generator...")
                 self._thinking_generator = ThinkingPhraseGenerator(
-                    groq_api_key=self.settings.groq_api_key,
+                    api_key=self.settings.cerebras_api_key,
+                    model=self.settings.cerebras_model,
                 )
             else:
-                logger.warning("DYNAMIC_THINKING_ENABLED but GROQ_API_KEY not set, disabling")
+                logger.warning("DYNAMIC_THINKING_ENABLED but CEREBRAS_API_KEY not set, disabling")
 
         # Initialize modular VoicePipeline
         if self._voice_pipeline is None:
@@ -325,6 +327,9 @@ class VoiceSession:
         # Initialize components
         self._init_components()
 
+        # Open API connections in the background so the first question isn't slow
+        self._warmup_task = asyncio.create_task(self._warm_up())
+
         # Create the streaming sink with per-user wake detection config
         self.sink = StreamingSink(
             wake_model_name=self.settings.wake_word_model,
@@ -356,6 +361,16 @@ class VoiceSession:
 
         # Run the main loop
         await self._run_loop()
+
+    async def _warm_up(self) -> None:
+        """Warm STT, LLM and thinking-phrase connections concurrently (failures only log)."""
+        try:
+            jobs = [self.groq_client.warm_up(), self.llm.warm_up()]
+            if self._thinking_generator:
+                jobs.append(self._thinking_generator.warm_up())
+            await asyncio.gather(*jobs, return_exceptions=True)
+        except Exception as e:
+            logger.warning(f"[WARMUP] Skipped: {e}")
 
     async def stop(self):
         """Stop the voice session."""

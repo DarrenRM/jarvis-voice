@@ -75,3 +75,6 @@ firecrawl-repo/
 
 # Claude Code local settings (machine-specific, may hold secrets)
 .claude/settings.local.json
+
+# E2E harness output (audio, logs)
+reports/

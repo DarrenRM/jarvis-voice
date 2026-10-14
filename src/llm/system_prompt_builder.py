@@ -80,7 +80,7 @@ Use web_search for:
 - Quick game info, recipes, crafting, items, builds
 - Current events, news, weather, prices
 - Simple facts you're not 100% certain about
-The snippets usually answer it. Only use web_extract to read a page when they don't.
+The snippets usually answer it. Only use web_extract to read pages when they don't; give it 2-3 links at once.
 If searches return no results or results about unrelated topics, the speech-to-text may have misheard - try a similar-sounding term.
 
 STOP SEARCHING RULE (MANDATORY):

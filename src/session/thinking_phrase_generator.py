@@ -43,26 +43,35 @@ Response (SKIP or phrase only, no quotes):"""
 class ThinkingPhraseGenerator:
     """Generates context-aware thinking phrases via fast LLM call.
 
-    Uses Groq's Llama 3.3 70B for fast inference to generate personalized
-    thinking phrases based on what the user actually asked.
+    Uses Qwen on Cerebras with reasoning off: a phrase this short doesn't need
+    it, and every millisecond here is dead air.
     """
 
-    def __init__(self, groq_api_key: str, model: str = "llama-3.3-70b-versatile"):
+    def __init__(
+        self,
+        api_key: str,
+        model: str = "qwen-3.8-27b",
+        base_url: str = "https://api.cerebras.ai/v1",
+    ):
         """Initialize the generator.
 
         Args:
-            groq_api_key: Groq API key for LLM calls.
-            model: Model to use for generation (default: llama-3.3-70b-versatile).
+            api_key: Cerebras API key.
+            model: Model to use for generation (default: qwen-3.8-27b).
+            base_url: OpenAI-compatible endpoint (default: Cerebras).
         """
-        self._api_key = groq_api_key
+        self._api_key = api_key
         self._model = model
+        self._base_url = base_url
         self._client = None
 
     def _ensure_client(self) -> None:
-        """Lazy initialization of Groq client."""
+        """Lazy initialization of the OpenAI-compatible client."""
         if self._client is None:
-            from groq import AsyncGroq
-            self._client = AsyncGroq(api_key=self._api_key)
+            from openai import AsyncOpenAI
+            self._client = AsyncOpenAI(
+                api_key=self._api_key, base_url=self._base_url, timeout=5.0, max_retries=0
+            )
 
     async def generate(self, transcribed_text: str) -> str:
         """Generate a dynamic thinking phrase based on the user's request.
@@ -89,8 +98,9 @@ class ThinkingPhraseGenerator:
         response = await self._client.chat.completions.create(
             model=self._model,
             messages=[{"role": "user", "content": prompt}],
-            max_tokens=30,  # Very short response
+            max_completion_tokens=30,  # Very short response
             temperature=0.7,  # Some variety
+            reasoning_effort="none",
         )
 
         phrase = response.choices[0].message.content.strip()
@@ -100,3 +110,16 @@ class ThinkingPhraseGenerator:
 
         logger.info(f"[THINKING] Generated phrase: {phrase}")
         return phrase
+
+    async def warm_up(self) -> None:
+        """Open the connection ahead of the first request (first call is ~2s slower)."""
+        self._ensure_client()
+        try:
+            await self._client.chat.completions.create(
+                model=self._model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_completion_tokens=1,
+                reasoning_effort="none",
+            )
+        except Exception as e:
+            logger.warning(f"[WARMUP] Thinking phrase warm-up failed: {e}")

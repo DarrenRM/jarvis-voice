@@ -45,6 +45,10 @@ class LLMService:
             speaker_activity=speaker_activity,
         )
 
+    async def warm_up(self) -> None:
+        """Open the LLM connection so the first answer isn't slowed by setup."""
+        await self._client.warm_up()
+
     async def chat(self, message: str) -> str:
         """One-shot reply without tools or history (greetings, keep-alive).
 

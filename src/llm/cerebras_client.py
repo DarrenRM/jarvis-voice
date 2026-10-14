@@ -78,7 +78,9 @@ class CerebrasClient:
         """
         t0 = time.perf_counter()
         stream = await self._client.chat.completions.create(
-            stream=True, **self._request_kwargs(messages, tools)
+            stream=True,
+            stream_options={"include_usage": True},
+            **self._request_kwargs(messages, tools),
         )
 
         content_parts: list[str] = []
@@ -86,8 +88,11 @@ class CerebrasClient:
         finish_reason: Optional[str] = None
         first_text_at: Optional[float] = None
         reasoning_chars = 0
+        usage = None
 
         async for chunk in stream:
+            if chunk.usage:
+                usage = chunk.usage
             # Final usage chunk can arrive with no choices
             if not chunk.choices:
                 continue
@@ -126,6 +131,8 @@ class CerebrasClient:
             f"[TIMING] LLM turn: first_text={first_text_at and round(first_text_at, 2)}s "
             f"total={time.perf_counter() - t0:.2f}s reasoning_chars={reasoning_chars} "
             f"tool_calls={len(calls)} finish={finish_reason}"
+            + (f" tokens_in={usage.prompt_tokens} tokens_out={usage.completion_tokens}"
+               if usage else "")
         )
 
         yield TurnResult(
@@ -143,6 +150,24 @@ class CerebrasClient:
             **self._request_kwargs(messages, tools=None)
         )
         return (response.choices[0].message.content or "").strip()
+
+    async def warm_up(self) -> None:
+        """Open the connection with a one-token request.
+
+        The first call after startup takes ~2.4s (TLS + first-request setup) versus
+        ~0.2s after; doing it at startup keeps that off the first spoken answer.
+        """
+        t0 = time.perf_counter()
+        try:
+            await self._client.chat.completions.create(
+                model=self.model,
+                messages=[{"role": "user", "content": "hi"}],
+                max_completion_tokens=1,
+                reasoning_effort="none",
+            )
+            logger.info(f"[WARMUP] Cerebras ready in {time.perf_counter() - t0:.2f}s")
+        except Exception as e:
+            logger.warning(f"[WARMUP] Cerebras warm-up failed: {e}")
 
     async def close(self) -> None:
         await self._client.close()

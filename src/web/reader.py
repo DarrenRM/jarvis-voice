@@ -63,13 +63,13 @@ class PageReader:
 
     def __init__(
         self,
-        max_chars: int = 6000,
+        max_chars: int = 15000,
         resolver: Optional[Resolver] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
     ):
         """
         Args:
-            max_chars: Extracted text longer than this is cut (keeps voice turns fast)
+            max_chars: Extracted text longer than this is cut
             resolver: DNS lookup override (tests)
             transport: httpx transport override (tests)
         """
