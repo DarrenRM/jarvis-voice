@@ -10,7 +10,7 @@ import logging
 import random
 import re
 import time
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 import discord
 import numpy as np
@@ -40,6 +40,9 @@ from ..session.greeting_service import GreetingService
 from ..session.phrases import get_random_ack, get_thinking_phrase, get_affirmation_phrase
 from ..session.thinking_phrase_generator import ThinkingPhraseGenerator
 
+if TYPE_CHECKING:
+    from ..monitor import TurnRecorder
+
 logger = logging.getLogger(__name__)
 
 
@@ -60,6 +63,7 @@ class VoiceSession:
         groq_client: Optional[GroqWhisperClient] = None,
         llm: Optional[LLMService] = None,
         tts: Optional[TTSSynthesizer] = None,
+        turn_observer: Optional["TurnRecorder"] = None,
     ):
         """Initialize voice session.
 
@@ -71,8 +75,11 @@ class VoiceSession:
             groq_client: GroqWhisperClient instance (STT)
             llm: LLM client instance (Claude or Groq)
             tts: TTSSynthesizer instance
+            turn_observer: Live monitor's recorder (MONITOR_ENABLED); notified of each
+                turn's timings and results, never changes what the session does
         """
         self.settings = get_settings()
+        self.turn_observer = turn_observer
 
         # Speaker identification
         self.speaker_manager = SpeakerManager(self.settings.user_names)
@@ -247,6 +254,7 @@ class VoiceSession:
                 response=response_stage,
                 tts=tts_stage,
             )
+            self._voice_pipeline.observer = self.turn_observer
 
     def _on_wake_word(self):
         """Callback when wake word detected (from sink thread)."""
@@ -909,10 +917,13 @@ class VoiceSession:
         if self.voice_client.is_playing():
             self.voice_client.stop()
 
+        clip = self.turn_observer.clip_started(audio) if self.turn_observer else None
         self.voice_client.play(source, after=after_playback)
 
         # Wait for playback to complete
         await playback_done.wait()
+        if self.turn_observer:
+            self.turn_observer.clip_ended(clip)
 
         # Clean up source and natural pause between sentences
         source.cleanup()
@@ -1087,7 +1098,21 @@ class VoiceSession:
         audio_duration = len(audio) / SAMPLE_RATE_PROCESSING
         logger.info(f"[TIMING] Audio captured: {audio_duration:.2f}s ({len(audio)} samples)")
 
-        await self._process_speech_with_pipeline(audio)
+        monitor_token = None
+        if self.turn_observer:
+            monitor_token = self.turn_observer.turn_started(
+                self._current_speaker_id, self._current_speaker_name,
+                speech_end=self.sink.last_audio_time if self.sink else None,
+            )
+        error: Optional[BaseException] = None
+        try:
+            await self._process_speech_with_pipeline(audio)
+        except BaseException as e:
+            error = e
+            raise
+        finally:
+            if self.turn_observer:
+                self.turn_observer.turn_ended(monitor_token, error)
 
         total_time = time.perf_counter() - total_start
         logger.info(f"[TIMING] === TOTAL: {total_time:.2f}s ===")
@@ -1143,6 +1168,8 @@ class VoiceSession:
             tts_synthesizer=self.tts if thinking_generator else None,
             opening=opening,
         )
+        if self.turn_observer:
+            self.turn_observer.pipeline_result(result)
 
         # Handle special results
         if result == "wake_word_only":

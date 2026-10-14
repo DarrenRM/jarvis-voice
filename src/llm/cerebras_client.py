@@ -133,12 +133,19 @@ class CerebrasClient:
                 f"(reasoning chars: {reasoning_chars})"
             )
 
+        total = time.perf_counter() - t0
         logger.info(
             f"[TIMING] LLM turn: first_text={first_text_at and round(first_text_at, 2)}s "
-            f"total={time.perf_counter() - t0:.2f}s reasoning_chars={reasoning_chars} "
+            f"total={total:.2f}s reasoning_chars={reasoning_chars} "
             f"tool_calls={len(calls)} finish={finish_reason}"
             + (f" tokens_in={usage.prompt_tokens} tokens_out={usage.completion_tokens}"
-               if usage else "")
+               if usage else ""),
+            # Structured copy for the live monitor (src/monitor)
+            extra={"llm_turn": {
+                "first_text_s": first_text_at and round(first_text_at, 2),
+                "total_s": round(total, 2), "tool_calls": len(calls), "finish": finish_reason,
+                "tokens_in": usage.prompt_tokens if usage else None,
+            }},
         )
 
         yield TurnResult(
