@@ -1,27 +1,23 @@
 """LLM integration module."""
 
-from .base import BaseLLMClient
+from .cerebras_client import CerebrasClient
 from .chat_orchestrator import (
-    APIResponse,
     ChatOrchestrator,
     LLMClientProtocol,
-    OrchestratorState,
     ToolCall,
+    TurnOutcome,
+    TurnResult,
 )
-from .claude_client import ClaudeClient
-from .groq_client import GroqClient
 from .llm_factory import create_llm_client
-from .prompt_builder import PromptBuilder
+from .service import LLMService
 
 __all__ = [
-    "APIResponse",
-    "BaseLLMClient",
+    "CerebrasClient",
     "ChatOrchestrator",
-    "ClaudeClient",
-    "GroqClient",
     "LLMClientProtocol",
-    "OrchestratorState",
-    "PromptBuilder",
+    "LLMService",
     "ToolCall",
+    "TurnOutcome",
+    "TurnResult",
     "create_llm_client",
 ]

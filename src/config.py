@@ -39,25 +39,28 @@ class Settings(BaseSettings):
     tts_temperature: float = Field(default=1.1, alias="TTS_TEMPERATURE")  # 0.0-2.0, higher = more expressive
     tts_speed: float = Field(default=1.0, alias="TTS_SPEED")  # 0.5-1.5, talking speed multiplier
 
-    # LLM Provider Selection
-    llm_provider: str = Field(default="claude", alias="LLM_PROVIDER")  # claude, llama, or gpt-oss
+    # LLM (Cerebras, OpenAI-compatible API)
+    cerebras_api_key: Optional[str] = Field(default=None, alias="CEREBRAS_API_KEY")
+    cerebras_model: str = Field(default="qwen-3.8-27b", alias="CEREBRAS_MODEL")
+    # none | low | medium | high. Reasoning never reaches TTS or history.
+    cerebras_reasoning_effort: str = Field(default="high", alias="CEREBRAS_REASONING_EFFORT")
+    # Output budget per model turn; reasoning tokens count against it
+    llm_max_completion_tokens: int = Field(default=16384, alias="LLM_MAX_COMPLETION_TOKENS")
+    llm_timeout_seconds: float = Field(default=60.0, alias="LLM_TIMEOUT_SECONDS")
+    # Voice conversation history kept per session (oldest whole exchanges dropped first)
+    llm_history_max_messages: int = Field(default=60, alias="LLM_HISTORY_MAX_MESSAGES")
 
-    # Claude LLM
-    claude_model: str = Field(default="haiku", alias="CLAUDE_MODEL")  # haiku, sonnet, opus
+    # Web lookup: DuckDuckGo search + local page reader (no keys, no hosted services)
+    web_tools_enabled: bool = Field(default=True, alias="WEB_TOOLS_ENABLED")
+    web_search_max_results: int = Field(default=5, alias="WEB_SEARCH_MAX_RESULTS")
+    # Page text handed to the model is cut at this length (keeps voice turns fast)
+    web_extract_max_chars: int = Field(default=6000, alias="WEB_EXTRACT_MAX_CHARS")
 
-    # Groq LLM settings (used by llama and gpt-oss providers, reuses GROQ_API_KEY from STT)
-    groq_max_tokens: int = Field(default=1024, alias="GROQ_MAX_TOKENS")
-
-    # Claude delegation (for Groq providers - delegate complex tasks to Claude)
-    claude_delegation_enabled: bool = Field(default=True, alias="CLAUDE_DELEGATION_ENABLED")
-
-    # Search Pipeline (for Groq tool use)
-    firecrawl_url: str = Field(default="http://localhost:3002", alias="FIRECRAWL_URL")
-    firecrawl_api_key: Optional[str] = Field(default=None, alias="FIRECRAWL_API_KEY")
-    search_max_results: int = Field(default=3, alias="SEARCH_MAX_RESULTS")
-    search_max_content_length: int = Field(default=6000, alias="SEARCH_MAX_CONTENT_LENGTH")
+    # Deep research via OpenAI (Codex/ChatGPT subscription sign-in). Not wired up yet.
+    deep_research_enabled: bool = Field(default=False, alias="DEEP_RESEARCH_ENABLED")
 
     # Image Generation (Nano Banana / Gemini)
+    image_generation_enabled: bool = Field(default=False, alias="IMAGE_GENERATION_ENABLED")
     nanobanana_api_key: Optional[str] = Field(default=None, alias="NANOBANANA_API_KEY")
     image_channel_name: str = Field(default="general", alias="IMAGE_CHANNEL_NAME")
 
@@ -66,7 +69,6 @@ class Settings(BaseSettings):
     speech_pad_ms: int = Field(default=300, alias="SPEECH_PAD_MS")
     min_silence_ms: int = Field(default=500, alias="MIN_SILENCE_MS")  # Silence to trigger speech end
     max_question_duration: float = Field(default=30.0, alias="MAX_QUESTION_DURATION")
-    claude_timeout: float = Field(default=30.0, alias="CLAUDE_TIMEOUT")
 
     # Speaking Detection (multi-user awareness)
     speaking_detection_enabled: bool = Field(default=False, alias="SPEAKING_DETECTION_ENABLED")
@@ -99,15 +101,12 @@ class Settings(BaseSettings):
 
     # User name mappings (Discord user ID -> friendly name)
     # Can be set via USER_NAMES env var as JSON: '{"123456": "Name"}'
-    user_names: Dict[int, str] = Field(
-        default={
-            100000000000000001: "Darren",
-            100000000000000003: "Pat",
-            100000000000000002: "Sam",
-            100000000000000004: "Jordan",
-        },
-        alias="USER_NAMES"
-    )
+    # Users not listed fall back to their Discord display name.
+    user_names: Dict[int, str] = Field(default_factory=dict, alias="USER_NAMES")
+
+    # Optional per-user roasts the assistant may rarely work into answers.
+    # Set via USER_ROASTS env var as JSON: '{"Name": "is always late."}'
+    user_roasts: Dict[str, str] = Field(default_factory=dict, alias="USER_ROASTS")
 
     # Audio
     sample_rate: int = Field(default=16000, alias="SAMPLE_RATE")

@@ -1,122 +1,81 @@
-"""Factory for creating LLM clients based on configuration."""
+"""Factory for creating the LLM service from configuration."""
 
 import logging
 from typing import TYPE_CHECKING, Awaitable, Callable, Optional
 
-from .base import BaseLLMClient
-from .claude_client import ClaudeClient
-from .groq_client import GroqClient
-from ..search.search_service import SearchService
-from ..image import NanoBananaClient
-from ..tools.definitions import create_tool_registry
+from ..tools import ToolExecutor, create_tool_registry
+from .cerebras_client import CerebrasClient
+from .service import LLMService
+from .system_prompt_builder import create_default_prompt_builder
 
 if TYPE_CHECKING:
     from ..config import Settings
 
 logger = logging.getLogger(__name__)
 
-# Map provider names to Groq model IDs
-GROQ_MODEL_MAP = {
-    "llama": "llama-3.3-70b-versatile",
-    "gpt-oss": "openai/gpt-oss-120b",
-    "groq": "llama-3.3-70b-versatile",  # backwards compat
-}
-
 
 def create_llm_client(
     settings: "Settings",
-    on_image_generated: Optional[Callable[[bytes, str], Awaitable[str]]] = None,
+    on_image_generated: Optional[Callable[[bytes, str, str], Awaitable[str]]] = None,
     on_user_tagged: Optional[Callable[[str, str], Awaitable[str]]] = None,
     on_message_posted: Optional[Callable[[str], Awaitable[str]]] = None,
-) -> BaseLLMClient:
-    """Factory function to create the appropriate LLM client.
-
-    Creates either a Claude client or a Groq client based on LLM_PROVIDER:
-    - claude: Claude via Claude Code SDK
-    - llama: Llama 3.3 70B via Groq
-    - gpt-oss: GPT-OSS 120B via Groq
-    - groq: (deprecated) alias for llama
+) -> LLMService:
+    """Create the LLM service (Cerebras) with its tools.
 
     Args:
         settings: Application settings
-        on_image_generated: Callback for posting generated images (Groq only)
-        on_user_tagged: Callback for tagging users in Discord (Groq only)
-        on_message_posted: Callback for posting messages to Discord (Groq only)
-
-    Returns:
-        LLM client instance based on LLM_PROVIDER setting
+        on_image_generated: Callback for posting generated images
+        on_user_tagged: Callback for tagging users in Discord
+        on_message_posted: Callback for posting messages to Discord
 
     Raises:
-        ValueError: If provider is unknown or required API key is missing
+        ValueError: If CEREBRAS_API_KEY is missing
     """
-    provider = settings.llm_provider.lower()
+    if not settings.cerebras_api_key:
+        raise ValueError("CEREBRAS_API_KEY is required. Set it in your .env file.")
 
-    # Groq-based providers (llama, gpt-oss, groq)
-    if provider in GROQ_MODEL_MAP:
-        if not settings.groq_api_key:
-            raise ValueError(
-                f"GROQ_API_KEY required for {provider} provider. "
-                "Set it in your .env file."
-            )
-
-        model = GROQ_MODEL_MAP[provider]
-
-        # Create search service for tool use
-        search_service = SearchService(
-            firecrawl_url=settings.firecrawl_url,
-            firecrawl_api_key=settings.firecrawl_api_key,
-            max_results=settings.search_max_results,
-            max_content_length=settings.search_max_content_length,
-        )
-
-        # Create image service if API key is configured
-        image_service = None
+    image_service = None
+    if settings.image_generation_enabled:
         if settings.nanobanana_api_key:
+            from ..image import NanoBananaClient
+
             logger.info("Image generation enabled (Nano Banana)")
             image_service = NanoBananaClient(api_key=settings.nanobanana_api_key)
+        else:
+            logger.warning("IMAGE_GENERATION_ENABLED but NANOBANANA_API_KEY not set, disabling")
 
-        # Create Claude service for delegation if enabled
-        claude_service = None
-        if settings.claude_delegation_enabled:
-            try:
-                claude_service = ClaudeClient(model=settings.claude_model, max_tokens=1024)
-                logger.info(f"Claude delegation enabled (using {settings.claude_model} for deep analysis)")
-            except Exception as e:
-                logger.warning(f"Claude delegation unavailable: {e}")
+    web_searcher = page_reader = None
+    if settings.web_tools_enabled:
+        from ..web import PageReader, WebSearcher
 
-        # Create tool registry for new modular tool system
-        tool_registry = create_tool_registry(
-            search_service=search_service,
-            image_service=image_service,
-            claude_service=claude_service,
-            on_image_generated=on_image_generated,
-            on_user_tagged=on_user_tagged,
-            on_message_posted=on_message_posted,
-            claude_timeout=settings.claude_timeout,
-        )
+        web_searcher = WebSearcher(max_results=settings.web_search_max_results)
+        page_reader = PageReader(max_chars=settings.web_extract_max_chars)
 
-        logger.info(f"Creating Groq client (provider: {provider}, model: {model})")
-        logger.info(f"Image callback provided: {on_image_generated is not None}")
-        logger.info(f"Tag callback provided: {on_user_tagged is not None}")
-        return GroqClient(
-            api_key=settings.groq_api_key,
-            model=model,
-            max_tokens=settings.groq_max_tokens,
-            search_service=search_service,
-            image_service=image_service,
-            on_image_generated=on_image_generated,
-            on_user_tagged=on_user_tagged,
-            on_message_posted=on_message_posted,
-            claude_service=claude_service,
-            tool_registry=tool_registry,
-        )
+    tool_registry = create_tool_registry(
+        image_service=image_service,
+        on_image_generated=on_image_generated,
+        on_user_tagged=on_user_tagged,
+        on_message_posted=on_message_posted,
+        web_searcher=web_searcher,
+        page_reader=page_reader,
+    )
 
-    elif provider == "claude":
-        logger.info(f"Creating Claude client (model: {settings.claude_model})")
-        return ClaudeClient(model=settings.claude_model)
+    client = CerebrasClient(
+        api_key=settings.cerebras_api_key,
+        model=settings.cerebras_model,
+        reasoning_effort=settings.cerebras_reasoning_effort,
+        max_completion_tokens=settings.llm_max_completion_tokens,
+        timeout=settings.llm_timeout_seconds,
+    )
 
-    else:
-        raise ValueError(
-            f"Unknown LLM provider: {provider}. "
-            "Valid options are 'claude', 'llama', or 'gpt-oss'."
-        )
+    logger.info(
+        f"Creating Cerebras client (model: {settings.cerebras_model}, "
+        f"reasoning: {settings.cerebras_reasoning_effort}, "
+        f"tools: {[d['function']['name'] for d in tool_registry.get_definitions()]})"
+    )
+    return LLMService(
+        client=client,
+        tool_executor=ToolExecutor(tool_registry),
+        prompt_builder=create_default_prompt_builder(web_tools=settings.web_tools_enabled),
+        image_service=image_service,
+    )

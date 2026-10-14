@@ -1,512 +1,306 @@
 """Tests for ChatOrchestrator.
 
-Tests the tool loop logic extracted from groq_client.py (lines 292-567).
+Uses a scripted fake LLM that streams like the Cerebras client: text chunks
+followed by exactly one TurnResult per call.
 """
 
 import json
-from unittest.mock import AsyncMock, MagicMock, patch
+from typing import Optional
 
 import pytest
 
 from src.llm.chat_orchestrator import (
-    APIResponse,
+    DISCORD_ACTION_ACK_NOTE,
+    ERROR_REPLY,
+    GRACEFUL_FAILURE_REPLY,
     ChatOrchestrator,
-    OrchestratorState,
     ToolCall,
-    MAX_SEARCH_CALLS,
+    TurnOutcome,
+    TurnResult,
 )
-from src.tools.base import ToolResult
+from src.tools import ToolDefinition, ToolExecutor, ToolHandler, ToolRegistry, ToolResult
 
 
-@pytest.fixture
-def mock_llm():
-    """Create a mock LLM client."""
-    llm = MagicMock()
-    llm.call_api = AsyncMock(return_value=APIResponse(content="Hello!"))
+class FakeLLM:
+    """Plays back one scripted turn per stream_turn call and records requests."""
 
-    # For stream_response, we need a function that returns an async generator
-    # (not AsyncMock, which wraps it in a coroutine)
-    async def default_stream(messages):
-        yield "Hello "
-        yield "world!"
+    def __init__(self, turns: list):
+        self._turns = list(turns)
+        self.requests: list[dict] = []
 
-    llm.stream_response = default_stream
-    return llm
-
-
-@pytest.fixture
-def mock_executor():
-    """Create a mock tool executor."""
-    executor = MagicMock()
-    executor.reset_counters = MagicMock()
-    executor.get_definitions = MagicMock(return_value=[
-        {"function": {"name": "web_search", "description": "Search the web"}},
-        {"function": {"name": "generate_image", "description": "Generate an image"}},
-    ])
-    executor.normalize_name = MagicMock(side_effect=lambda x: x)
-    executor.is_search_tool = MagicMock(side_effect=lambda x: x in {"web_search", "fetch_url"})
-    executor.is_action_tool = MagicMock(side_effect=lambda x: x in {"generate_image", "tag_user"})
-    executor.execute = AsyncMock(return_value=ToolResult(success=True, output="Search results: ..."))
-    return executor
+    async def stream_turn(self, messages: list[dict], tools: Optional[list[dict]] = None):
+        self.requests.append({"messages": [dict(m) for m in messages], "tools": tools})
+        turn = self._turns.pop(0)
+        if isinstance(turn, Exception):
+            raise turn
+        chunks, result = turn
+        for chunk in chunks:
+            yield chunk
+        yield result
 
 
-@pytest.fixture
-def orchestrator(mock_llm, mock_executor):
-    """Create an orchestrator with mocks."""
-    return ChatOrchestrator(mock_llm, mock_executor, max_turns=5)
+class EchoHandler(ToolHandler):
+    """Tool that records calls and returns a fixed output."""
 
+    def __init__(self, name: str = "echo", output: str = "echoed", fail: bool = False):
+        self._name = name
+        self._output = output
+        self._fail = fail
+        self.calls: list[dict] = []
 
-class TestOrchestratorState:
-    """Test OrchestratorState dataclass."""
+    @property
+    def name(self) -> str:
+        return self._name
 
-    def test_initial_state(self):
-        """Initial state has empty counters."""
-        state = OrchestratorState()
-
-        assert state.tool_calls_this_request == []
-        assert state.search_calls_this_request == 0
-        assert state.last_action_success is None
-        assert state.search_limit_reached is False
-
-    def test_search_limit_reached(self):
-        """search_limit_reached is True after MAX_SEARCH_CALLS."""
-        state = OrchestratorState()
-
-        state.search_calls_this_request = MAX_SEARCH_CALLS - 1
-        assert state.search_limit_reached is False
-
-        state.search_calls_this_request = MAX_SEARCH_CALLS
-        assert state.search_limit_reached is True
-
-
-class TestAPIResponse:
-    """Test APIResponse dataclass."""
-
-    def test_no_tool_calls(self):
-        """has_tool_calls is False when no tool calls."""
-        response = APIResponse(content="Hello")
-
-        assert response.has_tool_calls is False
-
-    def test_with_tool_calls(self):
-        """has_tool_calls is True when tool calls present."""
-        response = APIResponse(
-            content="I'll search for that",
-            tool_calls=[ToolCall(id="1", name="web_search", arguments='{"query": "test"}')],
+    @property
+    def definition(self) -> ToolDefinition:
+        return ToolDefinition(
+            name=self._name,
+            description="test tool",
+            parameters={"type": "object", "properties": {"text": {"type": "string"}}},
         )
 
-        assert response.has_tool_calls is True
+    async def execute(self, args):
+        self.calls.append(args)
+        if self._fail:
+            raise RuntimeError("boom")
+        return ToolResult(success=True, output=self._output)
 
 
-class TestChatOrchestrator:
-    """Test ChatOrchestrator functionality."""
+def make_orchestrator(turns, handlers=(), max_turns=5):
+    registry = ToolRegistry()
+    for handler in handlers:
+        registry.register(handler)
+    llm = FakeLLM(turns)
+    return ChatOrchestrator(llm, ToolExecutor(registry), max_turns=max_turns), llm
 
-    @pytest.mark.asyncio
-    async def test_simple_response_no_tools(self, orchestrator, mock_llm):
-        """Simple response without tool calls streams directly."""
-        mock_llm.call_api.return_value = APIResponse(content=None)
 
-        stream_called = []
-        async def stream_gen(messages):
-            stream_called.append(messages)
-            yield "Hello "
-            yield "world!"
+def base_messages():
+    return [
+        {"role": "system", "content": "You are Jarvis."},
+        {"role": "user", "content": "[Alice]: hi"},
+    ]
 
-        mock_llm.stream_response = stream_gen
 
-        messages = [{"role": "user", "content": "Hi"}]
-        chunks = []
-        async for chunk in orchestrator.chat_stream("Hi", messages):
-            chunks.append(chunk)
+async def collect(orchestrator, messages, outcome=None):
+    return [c async for c in orchestrator.chat_stream(messages, outcome)]
 
-        assert chunks == ["Hello ", "world!"]
-        assert len(stream_called) == 1  # stream_response was called once
 
-    @pytest.mark.asyncio
-    async def test_resets_counters(self, orchestrator, mock_executor, mock_llm):
-        """Counters are reset at start of chat_stream."""
-        mock_llm.call_api.return_value = APIResponse(content=None)
+def tool_turn(*calls, content=""):
+    return ([content] if content else [], TurnResult(content=content, tool_calls=list(calls),
+                                                     finish_reason="tool_calls"))
 
-        async def stream_gen(messages):
-            yield "Done"
 
-        mock_llm.stream_response = stream_gen
+def text_turn(*chunks):
+    return (list(chunks), TurnResult(content="".join(chunks), finish_reason="stop"))
 
-        messages = [{"role": "user", "content": "Hi"}]
-        async for _ in orchestrator.chat_stream("Hi", messages):
-            pass
 
-        mock_executor.reset_counters.assert_called_once()
+class TestPlainResponse:
+    async def test_streams_text_chunks(self):
+        orch, _ = make_orchestrator([text_turn("Hello ", "world!")])
+        assert await collect(orch, base_messages()) == ["Hello ", "world!"]
 
-    @pytest.mark.asyncio
-    async def test_tool_call_execution(self, orchestrator, mock_llm, mock_executor):
-        """Tool calls are executed and results added to messages."""
-        # First call returns tool call, second call streams response
-        tool_call = ToolCall(id="tc1", name="web_search", arguments='{"query": "weather"}')
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[tool_call]),
-            APIResponse(content=None),
-        ]
+    async def test_single_llm_call_for_plain_answer(self):
+        orch, llm = make_orchestrator([text_turn("Hi.")])
+        await collect(orch, base_messages())
+        assert len(llm.requests) == 1
 
-        async def stream_gen(messages):
-            yield "The weather is sunny"
+    async def test_appends_final_assistant_message_and_marks_ok(self):
+        orch, _ = make_orchestrator([text_turn("Hi ", "there.")])
+        messages = base_messages()
+        outcome = TurnOutcome()
+        await collect(orch, messages, outcome)
+        assert messages[-1] == {"role": "assistant", "content": "Hi there."}
+        assert outcome.ok
 
-        mock_llm.stream_response = stream_gen
+    async def test_no_tools_sent_when_registry_empty(self):
+        orch, llm = make_orchestrator([text_turn("Hi.")])
+        await collect(orch, base_messages())
+        assert llm.requests[0]["tools"] is None
 
-        messages = [{"role": "user", "content": "What's the weather?"}]
-        chunks = []
-        async for chunk in orchestrator.chat_stream("What's the weather?", messages):
-            chunks.append(chunk)
 
-        # Tool was executed
-        mock_executor.execute.assert_called_once_with("web_search", {"query": "weather"})
-
-        # Messages updated with tool call and result
-        assert any(m.get("role") == "assistant" and "tool_calls" in m for m in messages)
-        assert any(m.get("role") == "tool" for m in messages)
-
-        # Response streamed
-        assert "The weather is sunny" in chunks
-
-    @pytest.mark.asyncio
-    async def test_pre_tool_content_yielded(self, orchestrator, mock_llm, mock_executor):
-        """Content before tool call is yielded."""
-        tool_call = ToolCall(id="tc1", name="web_search", arguments='{"query": "test"}')
-        mock_llm.call_api.side_effect = [
-            APIResponse(content="Let me search for that", tool_calls=[tool_call]),
-            APIResponse(content=None),
-        ]
-
-        async def stream_gen(messages):
-            yield "Result"
-
-        mock_llm.stream_response = stream_gen
-
-        messages = [{"role": "user", "content": "Test"}]
-        chunks = []
-        async for chunk in orchestrator.chat_stream("Test", messages):
-            chunks.append(chunk)
-
-        # Pre-tool content yielded
-        assert "Let me search for that" in chunks
-
-    @pytest.mark.asyncio
-    async def test_deep_research_notification(self, orchestrator, mock_llm, mock_executor):
-        """Deep research tool yields notification before execution."""
-        tool_call = ToolCall(id="tc1", name="deep_research", arguments='{"topic": "test"}')
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[tool_call]),
-            APIResponse(content=None),
-        ]
-
-        async def stream_gen(messages):
-            yield "Result"
-
-        mock_llm.stream_response = stream_gen
-
-        messages = [{"role": "user", "content": "Research test"}]
-        chunks = []
-        async for chunk in orchestrator.chat_stream("Research test", messages):
-            chunks.append(chunk)
-
-        # Notification yielded
-        assert any("deeper digging" in chunk for chunk in chunks)
-
-    @pytest.mark.asyncio
-    async def test_search_limit_enforcement(self, orchestrator, mock_llm, mock_executor):
-        """After MAX_SEARCH_CALLS, search tools are excluded."""
-        search_call = ToolCall(id="tc1", name="web_search", arguments='{"query": "test"}')
-
-        # Return search calls up to limit, then response
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[search_call]),
-            APIResponse(content=None, tool_calls=[search_call]),
-            APIResponse(content=None, tool_calls=[search_call]),
-            APIResponse(content=None),  # After limit
-        ]
-
-        async def stream_gen(messages):
-            yield "Final response"
-
-        mock_llm.stream_response = stream_gen
-
-        messages = [{"role": "user", "content": "Test"}]
-        async for _ in orchestrator.chat_stream("Test", messages):
-            pass
-
-        # get_definitions called with search_limit_reached=True on 4th call
-        calls = mock_executor.get_definitions.call_args_list
-        assert len(calls) == 4
-        assert calls[3][1]["search_limit_reached"] is True
-
-    @pytest.mark.asyncio
-    async def test_force_answer_message_injected(self, orchestrator, mock_llm, mock_executor):
-        """Force answer message injected when search limit reached."""
-        search_call = ToolCall(id="tc1", name="web_search", arguments='{"query": "test"}')
-
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[search_call]),
-            APIResponse(content=None, tool_calls=[search_call]),
-            APIResponse(content=None, tool_calls=[search_call]),
-            APIResponse(content=None),
-        ]
-
-        async def stream_gen(messages):
-            yield "Result"
-
-        mock_llm.stream_response = stream_gen
-
-        messages = [{"role": "user", "content": "Test"}]
-        async for _ in orchestrator.chat_stream("Test", messages):
-            pass
-
-        # Force answer message should be in messages
-        assert any("DO NOT search again" in m.get("content", "") for m in messages)
-
-    @pytest.mark.asyncio
-    async def test_action_success_tracking(self, orchestrator, mock_llm, mock_executor):
-        """Successful action tool results are tracked."""
-        tool_call = ToolCall(id="tc1", name="generate_image", arguments='{"prompt": "cat"}')
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[tool_call]),
-            APIResponse(content=None),
-        ]
-
-        mock_executor.execute.return_value = ToolResult(
-            success=True, output="Done! I've posted the image."
+class TestToolLoop:
+    async def test_executes_tool_then_answers(self):
+        handler = EchoHandler()
+        orch, llm = make_orchestrator(
+            [tool_turn(ToolCall("call_1", "echo", '{"text": "x"}')), text_turn("Done.")],
+            handlers=[handler],
         )
+        messages = base_messages()
+        outcome = TurnOutcome()
+        chunks = await collect(orch, messages, outcome)
 
-        async def stream_gen(messages):
-            yield "Result"
+        assert chunks == ["Done."]
+        assert handler.calls == [{"text": "x"}]
+        assert outcome.ok
+        roles = [m["role"] for m in messages]
+        assert roles == ["system", "user", "assistant", "tool", "assistant"]
+        assert messages[2]["tool_calls"][0]["id"] == "call_1"
+        assert messages[3] == {"role": "tool", "tool_call_id": "call_1", "content": "echoed"}
+        # Second request sees the tool result
+        assert llm.requests[1]["messages"][-1]["role"] == "tool"
 
-        mock_llm.stream_response = stream_gen
+    async def test_tool_definitions_sent(self):
+        orch, llm = make_orchestrator([text_turn("Hi.")], handlers=[EchoHandler()])
+        await collect(orch, base_messages())
+        assert [t["function"]["name"] for t in llm.requests[0]["tools"]] == ["echo"]
 
-        messages = [{"role": "user", "content": "Generate cat"}]
-        async for _ in orchestrator.chat_stream("Generate cat", messages):
-            pass
-
-        # Action tool was executed
-        mock_executor.execute.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_max_turns_exhausted(self, orchestrator, mock_llm, mock_executor):
-        """Graceful failure when max turns exhausted."""
-        tool_call = ToolCall(id="tc1", name="web_search", arguments='{"query": "test"}')
-
-        # Always return tool calls (never finishes)
-        mock_llm.call_api.return_value = APIResponse(content=None, tool_calls=[tool_call])
-
-        messages = [{"role": "user", "content": "Test"}]
-        chunks = []
-        async for chunk in orchestrator.chat_stream("Test", messages):
-            chunks.append(chunk)
-
-        # Graceful failure message
-        full_response = "".join(chunks)
-        assert "couldn't find a good answer" in full_response
-
-    @pytest.mark.asyncio
-    async def test_output_parse_failed_with_action_success(
-        self, orchestrator, mock_llm, mock_executor
-    ):
-        """Action success used as fallback on parse failure."""
-        # First call: successful image generation
-        img_call = ToolCall(id="tc1", name="generate_image", arguments='{"prompt": "cat"}')
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[img_call]),
-            Exception("output_parse_failed"),
-        ]
-
-        mock_executor.execute.return_value = ToolResult(
-            success=True, output="Done! I've posted the cat image."
+    async def test_pre_tool_text_is_spoken_and_flushed(self):
+        orch, _ = make_orchestrator(
+            [tool_turn(ToolCall("c1", "echo", "{}"), content="On it."), text_turn("Done.")],
+            handlers=[EchoHandler()],
         )
+        messages = base_messages()
+        chunks = await collect(orch, messages)
+        assert chunks == ["On it.", "\n", "Done."]
+        assert messages[2]["content"] == "On it."
 
-        messages = [{"role": "user", "content": "Generate cat"}]
-        chunks = []
-        async for chunk in orchestrator.chat_stream("Generate cat", messages):
-            chunks.append(chunk)
-
-        # Should yield the action success
-        full_response = "".join(chunks)
-        assert "Done!" in full_response
-
-    @pytest.mark.asyncio
-    async def test_output_parse_failed_no_action_success(
-        self, orchestrator, mock_llm, mock_executor
-    ):
-        """Generic fallback on parse failure without action success."""
-        mock_llm.call_api.side_effect = Exception("output_parse_failed")
-
-        messages = [{"role": "user", "content": "Test"}]
-        chunks = []
-        async for chunk in orchestrator.chat_stream("Test", messages):
-            chunks.append(chunk)
-
-        full_response = "".join(chunks)
-        assert "couldn't find specific information" in full_response
-
-    @pytest.mark.asyncio
-    async def test_tool_use_failed_attempts_summary(
-        self, orchestrator, mock_llm, mock_executor
-    ):
-        """Attempts summary when tool_use_failed error occurs."""
-        # First call succeeds with tool, second fails
-        search_call = ToolCall(id="tc1", name="web_search", arguments='{"query": "test"}')
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[search_call]),
-            Exception("tool_use_failed"),
-            APIResponse(content="Summary response"),  # Summary attempt
-        ]
-
-        messages = [{"role": "user", "content": "Test"}]
-        chunks = []
-        async for chunk in orchestrator.chat_stream("Test", messages):
-            chunks.append(chunk)
-
-        # Should attempt summary
-        full_response = "".join(chunks)
-        assert "Summary response" in full_response or "couldn't find a good answer" in full_response
-
-    @pytest.mark.asyncio
-    async def test_on_message_update_callback(self, orchestrator, mock_llm, mock_executor):
-        """on_message_update callback is called when messages change."""
-        tool_call = ToolCall(id="tc1", name="web_search", arguments='{"query": "test"}')
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[tool_call]),
-            APIResponse(content=None),
-        ]
-
-        async def stream_gen(messages):
-            yield "Result"
-
-        mock_llm.stream_response = stream_gen
-
-        callback = MagicMock()
-        messages = [{"role": "user", "content": "Test"}]
-
-        async for _ in orchestrator.chat_stream("Test", messages, on_message_update=callback):
-            pass
-
-        # Callback called for tool call message and tool result message
-        assert callback.call_count >= 2
-
-    @pytest.mark.asyncio
-    async def test_tool_argument_parsing_error(self, orchestrator, mock_llm, mock_executor):
-        """Invalid tool arguments handled gracefully."""
-        tool_call = ToolCall(id="tc1", name="web_search", arguments="invalid json")
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[tool_call]),
-            APIResponse(content=None),
-        ]
-
-        async def stream_gen(messages):
-            yield "Result"
-
-        mock_llm.stream_response = stream_gen
-
-        messages = [{"role": "user", "content": "Test"}]
-        async for _ in orchestrator.chat_stream("Test", messages):
-            pass
-
-        # Tool result should indicate error
-        tool_result = next(m for m in messages if m.get("role") == "tool")
-        assert "Error" in tool_result["content"]
-
-
-class TestSearchCallTracking:
-    """Test search call tracking and limit behavior."""
-
-    @pytest.mark.asyncio
-    async def test_search_calls_incremented(self, orchestrator, mock_llm, mock_executor):
-        """Search calls are counted toward limit."""
-        search_call = ToolCall(id="tc1", name="web_search", arguments='{"query": "test"}')
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[search_call]),
-            APIResponse(content=None),
-        ]
-
-        async def stream_gen(messages):
-            yield "Result"
-
-        mock_llm.stream_response = stream_gen
-
-        messages = [{"role": "user", "content": "Test"}]
-        async for _ in orchestrator.chat_stream("Test", messages):
-            pass
-
-        # is_search_tool should have been called
-        mock_executor.is_search_tool.assert_called()
-
-    @pytest.mark.asyncio
-    async def test_action_calls_not_counted(self, orchestrator, mock_llm, mock_executor):
-        """Action tool calls don't count toward search limit."""
-        action_call = ToolCall(id="tc1", name="generate_image", arguments='{"prompt": "test"}')
-
-        # Many action calls
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[action_call]),
-            APIResponse(content=None, tool_calls=[action_call]),
-            APIResponse(content=None, tool_calls=[action_call]),
-            APIResponse(content=None, tool_calls=[action_call]),
-            APIResponse(content=None),
-        ]
-
-        async def stream_gen(messages):
-            yield "Result"
-
-        mock_llm.stream_response = stream_gen
-
-        messages = [{"role": "user", "content": "Test"}]
-        async for _ in orchestrator.chat_stream("Test", messages):
-            pass
-
-        # get_definitions should never have search_limit_reached=True
-        for call in mock_executor.get_definitions.call_args_list:
-            assert call[1].get("search_limit_reached", False) is False
-
-
-class TestToolCallTracking:
-    """Test tool call description tracking for graceful failure."""
-
-    @pytest.mark.asyncio
-    async def test_web_search_tracking(self, orchestrator, mock_llm, mock_executor):
-        """Web search calls track query in description."""
-        tool_call = ToolCall(id="tc1", name="web_search", arguments='{"query": "weather"}')
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[tool_call]),
-            APIResponse(content=None),
-        ]
-
-        async def stream_gen(messages):
-            yield "Result"
-
-        mock_llm.stream_response = stream_gen
-
-        messages = [{"role": "user", "content": "Test"}]
-        async for _ in orchestrator.chat_stream("Test", messages):
-            pass
-
-        # Tool was executed with correct name
-        mock_executor.execute.assert_called_with("web_search", {"query": "weather"})
-
-    @pytest.mark.asyncio
-    async def test_fetch_url_tracking(self, orchestrator, mock_llm, mock_executor):
-        """Fetch URL calls track URL in description."""
-        tool_call = ToolCall(
-            id="tc1", name="fetch_url", arguments='{"url": "https://example.com"}'
+    async def test_whitespace_pre_tool_text_stored_as_none(self):
+        orch, _ = make_orchestrator(
+            [tool_turn(ToolCall("c1", "echo", "{}"), content="\n\n"), text_turn("Done.")],
+            handlers=[EchoHandler()],
         )
-        mock_llm.call_api.side_effect = [
-            APIResponse(content=None, tool_calls=[tool_call]),
-            APIResponse(content=None),
-        ]
+        messages = base_messages()
+        await collect(orch, messages)
+        assert messages[2]["content"] is None
 
-        async def stream_gen(messages):
-            yield "Result"
+    async def test_parallel_tool_calls_all_answered_in_order(self):
+        handler = EchoHandler()
+        orch, _ = make_orchestrator(
+            [tool_turn(ToolCall("a", "echo", "{}"), ToolCall("b", "echo", "{}")),
+             text_turn("Done.")],
+            handlers=[handler],
+        )
+        messages = base_messages()
+        await collect(orch, messages)
+        assert [m.get("tool_call_id") for m in messages[3:5]] == ["a", "b"]
+        assert len(handler.calls) == 2
 
-        mock_llm.stream_response = stream_gen
 
-        messages = [{"role": "user", "content": "Test"}]
-        async for _ in orchestrator.chat_stream("Test", messages):
-            pass
+class TestBadToolCalls:
+    @pytest.mark.parametrize("arguments", ["not json", "[1, 2]", "null", '"str"'])
+    async def test_invalid_arguments_still_answered(self, arguments):
+        handler = EchoHandler()
+        orch, _ = make_orchestrator(
+            [tool_turn(ToolCall("c1", "echo", arguments)), text_turn("Sorry.")],
+            handlers=[handler],
+        )
+        messages = base_messages()
+        outcome = TurnOutcome()
+        await collect(orch, messages, outcome)
+        assert handler.calls == []
+        assert messages[3] == {"role": "tool", "tool_call_id": "c1",
+                               "content": "Error: Invalid arguments"}
+        assert outcome.ok
 
-        mock_executor.execute.assert_called()
+    @pytest.mark.parametrize("arguments", ["", None])
+    async def test_empty_arguments_treated_as_no_args(self, arguments):
+        handler = EchoHandler()
+        orch, _ = make_orchestrator(
+            [tool_turn(ToolCall("c1", "echo", arguments)), text_turn("Ok.")], handlers=[handler]
+        )
+        await collect(orch, base_messages())
+        assert handler.calls == [{}]
+
+    async def test_unknown_tool_gets_error_result(self):
+        orch, _ = make_orchestrator(
+            [tool_turn(ToolCall("c1", "nope", "{}")), text_turn("Hmm.")]
+        )
+        messages = base_messages()
+        await collect(orch, messages)
+        assert messages[3]["content"] == "Error: Unknown tool: nope"
+
+    async def test_tool_exception_becomes_error_result(self):
+        orch, _ = make_orchestrator(
+            [tool_turn(ToolCall("c1", "echo", "{}")), text_turn("Hmm.")],
+            handlers=[EchoHandler(fail=True)],
+        )
+        messages = base_messages()
+        await collect(orch, messages)
+        assert messages[3]["content"].startswith("Error: Tool error: boom")
+
+
+class TestDiscordActions:
+    async def test_brief_ack_note_carried_in_tool_result(self):
+        tag = EchoHandler(name="tag_user", output="Done! Tagged Bob.")
+        other = EchoHandler(name="echo")
+        orch, llm = make_orchestrator(
+            [tool_turn(ToolCall("a", "tag_user", "{}"), ToolCall("b", "echo", "{}")),
+             text_turn("Tagged.")],
+            handlers=[tag, other],
+        )
+        await collect(orch, base_messages())
+        sent = llm.requests[1]["messages"]
+        # Qwen rejects system messages after the first one
+        assert [m["role"] for m in sent] == ["system", "user", "assistant", "tool", "tool"]
+        assert sent[3]["content"].startswith("Done! Tagged Bob.")
+        assert DISCORD_ACTION_ACK_NOTE in sent[3]["content"]
+        assert DISCORD_ACTION_ACK_NOTE not in sent[4]["content"]
+
+    async def test_no_ack_note_when_action_failed(self):
+        tag = EchoHandler(name="tag_user", output="Could not find user Bob.")
+        orch, llm = make_orchestrator(
+            [tool_turn(ToolCall("a", "tag_user", "{}")), text_turn("Hmm.")], handlers=[tag]
+        )
+        await collect(orch, base_messages())
+        assert llm.requests[1]["messages"][-1]["content"] == "Could not find user Bob."
+
+
+def test_only_one_system_message_ever_sent():
+    """Every request keeps a single system message at index 0."""
+    import asyncio
+
+    orch, llm = make_orchestrator(
+        [tool_turn(ToolCall("a", "post_to_chat", "{}")), text_turn("Done.")],
+        handlers=[EchoHandler(name="post_to_chat", output="Done! Posted.")],
+    )
+    asyncio.run(collect(orch, base_messages()))
+    for request in llm.requests:
+        roles = [m["role"] for m in request["messages"]]
+        assert roles[0] == "system" and roles.count("system") == 1
+
+
+class TestFailures:
+    async def test_api_error_speaks_apology_and_not_ok(self):
+        orch, _ = make_orchestrator([RuntimeError("503")])
+        messages = base_messages()
+        outcome = TurnOutcome()
+        chunks = await collect(orch, messages, outcome)
+        assert chunks == [ERROR_REPLY]
+        assert not outcome.ok
+        assert messages == base_messages()  # error text never enters history
+
+    async def test_empty_answer_is_graceful_failure(self):
+        orch, _ = make_orchestrator([text_turn("\n\n")])
+        outcome = TurnOutcome()
+        chunks = await collect(orch, base_messages(), outcome)
+        assert chunks == ["\n\n", GRACEFUL_FAILURE_REPLY]
+        assert not outcome.ok
+
+    async def test_max_turns_exhausted(self):
+        call = ToolCall("c", "echo", "{}")
+        orch, llm = make_orchestrator(
+            [tool_turn(call), tool_turn(call)], handlers=[EchoHandler()], max_turns=2
+        )
+        outcome = TurnOutcome()
+        chunks = await collect(orch, base_messages(), outcome)
+        assert chunks == [GRACEFUL_FAILURE_REPLY]
+        assert len(llm.requests) == 2
+        assert not outcome.ok
+
+    async def test_outcome_optional(self):
+        orch, _ = make_orchestrator([text_turn("Hi.")])
+        assert await collect(orch, base_messages()) == ["Hi."]
+
+
+def test_tool_message_has_no_legacy_name_field():
+    """Cerebras API v2 is strict; tool messages carry only role/tool_call_id/content."""
+    import asyncio
+
+    orch, _ = make_orchestrator(
+        [tool_turn(ToolCall("c1", "echo", json.dumps({"text": "x"}))), text_turn("Ok.")],
+        handlers=[EchoHandler()],
+    )
+    messages = base_messages()
+    asyncio.run(collect(orch, messages))
+    assert set(messages[3]) == {"role", "tool_call_id", "content"}

@@ -6,7 +6,6 @@ from datetime import datetime
 
 from src.llm.system_prompt_builder import (
     SystemPromptBuilder,
-    DEFAULT_USER_ROASTS,
     create_default_prompt_builder,
 )
 
@@ -85,9 +84,10 @@ class TestSystemPromptBuilderBuild:
         """Prompt contains tool descriptions."""
         prompt = builder.build()
         assert "YOUR TOOLS" in prompt
-        assert "web_search" in prompt
-        assert "generate_image" in prompt
-        assert "deep_research" in prompt
+        assert "CRITICAL TOOL USE RULES" in prompt
+        # Removed tools must not be advertised
+        assert "deep_research" not in prompt
+        assert "fetch_url" not in prompt
 
     def test_contains_game_context(self, builder):
         """Prompt contains game context rules."""
@@ -255,17 +255,12 @@ class TestDefaultPromptBuilder:
         builder = create_default_prompt_builder()
         assert isinstance(builder, SystemPromptBuilder)
 
-    def test_has_default_roasts(self):
-        """Builder has default roasts configured."""
-        builder = create_default_prompt_builder()
-        assert builder._user_roasts == DEFAULT_USER_ROASTS
+    def test_roasts_come_from_settings(self):
+        """Builder uses USER_ROASTS from settings."""
+        from src.config import get_settings
 
-    def test_default_roasts_content(self):
-        """Default roasts have expected users."""
-        assert "Sam" in DEFAULT_USER_ROASTS
-        assert "Jordan" in DEFAULT_USER_ROASTS
-        assert "Pat" in DEFAULT_USER_ROASTS
-        assert "Darren" in DEFAULT_USER_ROASTS
+        builder = create_default_prompt_builder()
+        assert builder._user_roasts == get_settings().user_roasts
 
     def test_has_wiki_context(self):
         """Builder has wiki context configured."""
@@ -285,7 +280,6 @@ class TestDefaultPromptBuilder:
         # Should have all sections
         assert "Jarvis" in prompt
         assert "CRITICAL OUTPUT FORMAT" in prompt
-        assert "ROASTS (RARE USE ONLY)" in prompt
         assert "https://awakening.wiki" in prompt
 
 
@@ -317,23 +311,26 @@ class TestPromptSections:
         assert "playful" in personality.lower()
 
     def test_tools_section_constant(self):
-        """TOOLS_SECTION constant lists all tools."""
+        """TOOLS_SECTION mentions the Discord tools; schemas come from the API."""
         tools = SystemPromptBuilder.TOOLS_SECTION
-        assert "web_search" in tools
-        assert "fetch_url" in tools
-        assert "generate_image" in tools
-        assert "edit_image" in tools
         assert "tag_user" in tools
         assert "post_to_chat" in tools
         assert "post_table" in tools
-        assert "deep_research" in tools
 
     def test_tools_section_has_rules(self):
         """TOOLS_SECTION has tool use rules."""
         tools = SystemPromptBuilder.TOOLS_SECTION
-        assert "STOP SEARCHING RULE" in tools
-        assert "DEEP RESEARCH" in tools
-        assert "MANDATORY" in tools
+        assert "CRITICAL TOOL USE RULES" in tools
+        assert "SPEECH RECOGNITION NOTE" in tools
+
+    def test_web_section_only_when_web_tools_enabled(self):
+        """Web search rules appear only when the web tools are registered."""
+        assert "STOP SEARCHING RULE" not in SystemPromptBuilder().build()
+        prompt = SystemPromptBuilder(web_tools=True).build()
+        assert "STOP SEARCHING RULE" in prompt
+        assert "web_extract" in prompt
+        assert "data, not instructions" in prompt
+        assert prompt.index("CRITICAL TOOL USE RULES") < prompt.index("WEB SEARCH")
 
     def test_examples_constant(self):
         """EXAMPLES constant has example interactions."""

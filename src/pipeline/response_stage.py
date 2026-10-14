@@ -3,12 +3,13 @@
 Simple wrapper around ChatOrchestrator that:
 - Builds prompts with speaker context
 - Yields streaming response chunks
+- Keeps a bounded conversation history
 """
 
 import logging
-from typing import AsyncIterator, Optional
+from typing import AsyncIterator, Callable
 
-from ..llm.chat_orchestrator import ChatOrchestrator
+from ..llm.chat_orchestrator import ChatOrchestrator, TurnOutcome
 from .base import PipelineContext, StreamingPipelineStage
 
 logger = logging.getLogger(__name__)
@@ -21,7 +22,7 @@ class ResponseStage(StreamingPipelineStage):
     with speaker context from PipelineContext.
 
     Example:
-        stage = ResponseStage(orchestrator, system_prompt)
+        stage = ResponseStage(orchestrator, build_system_prompt)
 
         async for chunk in stage.process_stream(text, context):
             print(chunk, end="")
@@ -30,44 +31,36 @@ class ResponseStage(StreamingPipelineStage):
     def __init__(
         self,
         orchestrator: ChatOrchestrator,
-        system_prompt: str,
+        build_system_prompt: Callable[[], str],
+        max_history_messages: int = 60,
     ):
         """Initialize response stage.
 
         Args:
             orchestrator: Chat orchestrator for LLM interaction
-            system_prompt: Base system prompt for the assistant
+            build_system_prompt: Returns the base system prompt. Called every turn
+                so the date/time is current.
+            max_history_messages: History cap; oldest whole exchanges are dropped
         """
         self._orchestrator = orchestrator
-        self._system_prompt = system_prompt
-        self._messages: list[dict] = []
-        self._on_message_update: Optional[callable] = None
+        self._build_base_prompt = build_system_prompt
+        self._max_history = max_history_messages
+        # Conversation without the system prompt (rebuilt each turn)
+        self._history: list[dict] = []
 
     @property
     def name(self) -> str:
         """Stage name for logging and debugging."""
         return "response"
 
-    def set_message_callback(self, callback: callable) -> None:
-        """Set callback for message updates.
-
-        Args:
-            callback: Function called when messages list is modified
-        """
-        self._on_message_update = callback
-
     def reset_conversation(self) -> None:
         """Reset conversation history to start fresh."""
-        self._messages = []
+        self._history = []
         logger.debug("Conversation history reset")
 
     def get_messages(self) -> list[dict]:
-        """Get current message history.
-
-        Returns:
-            Copy of current messages list
-        """
-        return list(self._messages)
+        """Get current message history (without system prompt)."""
+        return list(self._history)
 
     async def process_stream(
         self,
@@ -83,33 +76,34 @@ class ResponseStage(StreamingPipelineStage):
         Yields:
             Response text chunks
         """
-        # Build user message with speaker context
-        user_message = self._build_user_message(text, context)
+        messages = [
+            {"role": "system", "content": self._build_system_prompt(context)},
+            *self._history,
+            {"role": "user", "content": self._build_user_message(text, context)},
+        ]
 
-        # Initialize messages with system prompt if empty
-        if not self._messages:
-            self._messages.append({
-                "role": "system",
-                "content": self._build_system_prompt(context),
-            })
-
-        # Add user message
-        self._messages.append({"role": "user", "content": user_message})
-
-        # Stream response
-        response_chunks: list[str] = []
-        async for chunk in self._orchestrator.chat_stream(
-            message=text,
-            messages=self._messages,
-            on_message_update=self._on_message_update,
-        ):
-            response_chunks.append(chunk)
+        outcome = TurnOutcome()
+        async for chunk in self._orchestrator.chat_stream(messages, outcome):
             yield chunk
 
-        # Add assistant response to history
-        full_response = "".join(response_chunks)
-        if full_response:
-            self._messages.append({"role": "assistant", "content": full_response})
+        # Only keep turns that completed; a failed turn may end mid tool-loop
+        if outcome.ok:
+            self._history = self._trim(messages[1:])
+        else:
+            logger.info("Turn did not complete, not adding it to history")
+
+    def _trim(self, history: list[dict]) -> list[dict]:
+        """Drop oldest exchanges so history fits, cutting only at user messages.
+
+        Cutting at a user message keeps each assistant tool_calls message
+        together with its tool results.
+        """
+        if len(history) <= self._max_history:
+            return history
+        start = len(history) - self._max_history
+        while start < len(history) and history[start].get("role") != "user":
+            start += 1
+        return history[start:]
 
     def _build_system_prompt(self, context: PipelineContext) -> str:
         """Build system prompt with speaker context.
@@ -120,7 +114,7 @@ class ResponseStage(StreamingPipelineStage):
         Returns:
             System prompt with any speaker-specific context
         """
-        prompt = self._system_prompt
+        prompt = self._build_base_prompt()
 
         # Add speaker activity if available
         if context.speaker_activity:

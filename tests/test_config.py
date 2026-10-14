@@ -8,7 +8,7 @@ class TestUserNamesConfig:
     """Tests for user_names configuration field."""
 
     def test_default_user_names(self, monkeypatch):
-        """Default user_names contains expected users."""
+        """Default user_names is empty (configured per-server via USER_NAMES)."""
         # Clear any existing USER_NAMES env var
         monkeypatch.delenv("USER_NAMES", raising=False)
         # Set required env vars
@@ -20,14 +20,9 @@ class TestUserNamesConfig:
         importlib.reload(src.config)
 
         from src.config import Settings
-        s = Settings()
+        s = Settings(_env_file=None)
 
-        # Check defaults exist
-        assert isinstance(s.user_names, dict)
-        assert len(s.user_names) > 0
-        # Check a known default
-        assert 100000000000000001 in s.user_names
-        assert s.user_names[100000000000000001] == "Darren"
+        assert s.user_names == {}
 
     def test_parse_json_from_env(self, monkeypatch):
         """USER_NAMES env var parses JSON correctly."""
@@ -39,7 +34,7 @@ class TestUserNamesConfig:
         importlib.reload(src.config)
 
         from src.config import Settings
-        s = Settings()
+        s = Settings(_env_file=None)
 
         assert s.user_names == {111: "TestUser", 222: "AnotherUser"}
 
@@ -53,7 +48,7 @@ class TestUserNamesConfig:
         importlib.reload(src.config)
 
         from src.config import Settings
-        s = Settings()
+        s = Settings(_env_file=None)
 
         assert s.user_names == {}
 
@@ -67,7 +62,7 @@ class TestUserNamesConfig:
         importlib.reload(src.config)
 
         from src.config import Settings
-        s = Settings()
+        s = Settings(_env_file=None)
 
         # Keys should be int, not string
         assert 123456789 in s.user_names
@@ -128,10 +123,12 @@ class TestRequiredSettings:
 class TestOptionalSettings:
     """Tests for optional configuration fields with defaults."""
 
-    def test_default_llm_provider(self, monkeypatch, tmp_path):
-        """LLM provider defaults to claude when not set."""
+    def test_default_llm_settings(self, monkeypatch, tmp_path):
+        """Cerebras model, reasoning and feature flags have expected defaults."""
         monkeypatch.setenv("DISCORD_TOKEN", "fake_token")
-        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        for var in ("CEREBRAS_MODEL", "CEREBRAS_REASONING_EFFORT",
+                    "IMAGE_GENERATION_ENABLED", "DEEP_RESEARCH_ENABLED"):
+            monkeypatch.delenv(var, raising=False)
         monkeypatch.chdir(tmp_path)  # Avoid .env leakage
 
         import importlib
@@ -141,7 +138,10 @@ class TestOptionalSettings:
         from src.config import Settings
         s = Settings(_env_file=None)  # Explicitly disable .env file
 
-        assert s.llm_provider == "claude"
+        assert s.cerebras_model == "qwen-3.8-27b"
+        assert s.cerebras_reasoning_effort == "high"
+        assert s.image_generation_enabled is False
+        assert s.deep_research_enabled is False
 
     def test_default_tts_voice(self, monkeypatch):
         """TTS voice has a default."""

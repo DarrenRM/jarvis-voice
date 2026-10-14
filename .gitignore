@@ -72,3 +72,6 @@ uv.lock
 
 # External repos
 firecrawl-repo/
+
+# Claude Code local settings (machine-specific, may hold secrets)
+.claude/settings.local.json

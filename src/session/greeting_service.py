@@ -12,7 +12,7 @@ import numpy as np
 
 if TYPE_CHECKING:
     import discord
-    from ..llm import BaseLLMClient
+    from ..llm import LLMService
     from ..tts import TTSSynthesizer
     from ..config import Settings
 
@@ -31,7 +31,7 @@ class GreetingService:
 
     def __init__(
         self,
-        llm_client: "BaseLLMClient",
+        llm_client: "LLMService",
         tts_synthesizer: "TTSSynthesizer",
         settings: "Settings",
     ):

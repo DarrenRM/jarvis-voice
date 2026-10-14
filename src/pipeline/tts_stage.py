@@ -9,7 +9,7 @@ Extracts patterns from voice_session.py:1066-1145:
 
 import asyncio
 import logging
-from typing import AsyncIterator, Callable, Optional, Protocol
+from typing import AsyncIterator, Awaitable, Callable, Optional, Protocol
 
 import numpy as np
 
@@ -97,7 +97,7 @@ class TTSStage(StreamingPipelineStage):
         self,
         response_stream: AsyncIterator[str],
         context: PipelineContext,
-        playback_callback: Callable[[np.ndarray], asyncio.coroutine],
+        playback_callback: Callable[[np.ndarray], Awaitable[None]],
     ) -> None:
         """Process streaming response through parallel TTS.
 
@@ -224,7 +224,7 @@ class TTSStage(StreamingPipelineStage):
     async def _playback_consumer(
         self,
         queue: OrderedPlaybackQueue,
-        callback: Callable[[np.ndarray], asyncio.coroutine],
+        callback: Callable[[np.ndarray], Awaitable[None]],
     ) -> None:
         """Consume audio from queue and play in order.
 

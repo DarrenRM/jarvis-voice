@@ -1,14 +1,10 @@
 """Tool handlers for LLM function calling."""
 
-from .search import WebSearchHandler, FetchUrlHandler
-from .discord import TagUserHandler, PostMessageHandler, PostTableHandler
-from .image import GenerateImageHandler, EditImageHandler
-from .research import DeepResearchHandler
+from .discord import PostMessageHandler, PostTableHandler, TagUserHandler
+from .image import EditImageHandler, GenerateImageHandler
+from .web import WebExtractHandler, WebSearchHandler
 
 __all__ = [
-    # Search handlers
-    "WebSearchHandler",
-    "FetchUrlHandler",
     # Discord handlers
     "TagUserHandler",
     "PostMessageHandler",
@@ -16,6 +12,7 @@ __all__ = [
     # Image handlers
     "GenerateImageHandler",
     "EditImageHandler",
-    # Research handler
-    "DeepResearchHandler",
+    # Web handlers
+    "WebSearchHandler",
+    "WebExtractHandler",
 ]

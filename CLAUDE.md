@@ -1,141 +1,53 @@
-# Discord Voice Claude Bot
+# Discord Voice Bot
 
-Voice-activated AI assistant for Discord.
+Voice assistant that sits in a Discord voice channel ("hey jarvis" -> spoken answer).
 
-## Quick Start
+```
+Discord voice -> per-user session -> wake word (openwakeword) -> VAD (Silero)
+  -> STT (Groq Whisper) -> LLM (Qwen 3.8 27B on Cerebras, tool loop) -> TTS (Inworld) -> Discord voice
+```
+
+## Commands (Windows, Git Bash)
 
 ```bash
-# Install dependencies
-pip install -e .
-
-# Copy and configure environment (note env is up to date and example might be behind)
-cp .env.example .env
-# Edit .env with your tokens
-
-# Run the bot
-python -m src.main
+uv venv --python 3.12 .venv && VIRTUAL_ENV=.venv uv pip install -e ".[dev]"
+.venv/Scripts/python -m src.main          # run the bot
+.venv/Scripts/python -m pytest -q         # tests (asyncio_mode=auto)
+.venv/Scripts/python -m ruff check src/
 ```
 
-## Configuration
+Known pre-existing test problems: `test_tts_stage.py::test_exclamation_splits` fails, and
+`tests/test_ring_buffer.py` / `tests/test_state_machine.py` import modules that no longer exist.
 
-### Required
+## Layout
 
-```bash
-DISCORD_TOKEN=your_bot_token_here
-```
+- `src/bot/` - Discord client, commands, `voice_session.py` (wires everything per channel)
+- `src/llm/` - `cerebras_client.py` (streaming, reasoning stripped), `chat_orchestrator.py` (tool loop), `service.py`, `llm_factory.py`, `system_prompt_builder.py`
+- `src/pipeline/` - `response_stage.py` (history + speaker context), `tts_stage.py` (sentence splitting, pauses)
+- `src/tools/` - registry, executor, handlers (`web`, `discord`, `image`)
+- `src/web/` - DuckDuckGo search (`ddgs`) and local page reader (httpx + Trafilatura, SSRF-guarded)
+- `src/detection/`, `src/stt/`, `src/tts/`, `src/session/`, `src/sink/` - voice path
+- `src/config.py` - all settings (pydantic-settings, read from `.env`)
+- `docs/project-reference.md` - timing constants and voice-path details (its LLM/search
+  sections predate the Cerebras switch); `docs/known-issues.md`.
+  The `docs/*refactor*` files are historical (they describe the removed Groq/Claude/Firecrawl code).
 
-### LLM Provider Selection
+## Rules
 
-Switch between providers (we use gpt-oss primarily) with a single env var:
-
-```bash
-# Claude (default) - uses Claude Code SDK, no API key needed
-LLM_PROVIDER=claude
-CLAUDE_MODEL=haiku  # haiku, sonnet, or opus
-
-# Llama 3.3 70B via Groq - fast inference
-LLM_PROVIDER=llama
-GROQ_API_KEY=your_groq_api_key_here
-
-# GPT-OSS 120B via Groq - larger context (131K), better reasoning
-LLM_PROVIDER=gpt-oss
-GROQ_API_KEY=your_groq_api_key_here
-```
-
-### STT (Speech-to-Text)
-
-Uses Groq Whisper for fast, accurate transcription.
-
-```bash
-GROQ_API_KEY=your_groq_api_key_here  # Required for STT (shared with LLM if using Groq)
-```
-
-### TTS (Text-to-Speech)
-
-```bash
-INWORLD_API_KEY=your_inworld_api_key
-TTS_VOICE=sarah # alex is default
-```
-
-## Tools (Groq Providers)
-
-When using `LLM_PROVIDER=llama` or `LLM_PROVIDER=gpt-oss`, the bot has tool capabilities:
-
-| Tool | Description | Setup |
-|------|-------------|-------|
-| `web_search` | DuckDuckGo search | Works out of the box | only sees results without firecrawl
-| `fetch_url` | Extract page content | Optional: Firecrawl via `docker-compose.firecrawl.yml` |
-| `generate_image` | Image generation | `NANOBANANA_API_KEY` (Gemini) |
-| `deep_research` | Complex research via Claude | `CLAUDE_DELEGATION_ENABLED=true` (default) |
-| `send_discord_message` | Post to text channel | Automatic |
-| `get_channel_members` | List voice users | Automatic |
-
-Required for Firecrawl setup: `docker compose -f docker-compose.firecrawl.yml up -d`
-
-
-## Voice Interaction
-
-1. Say the wake word (default: "hey jarvis")
-2. Wait for acknowledgment (optional)
-3. Ask your question
-4. Bot responds with TTS
-
-## Architecture
-
-```
-Discord Voice --> [Per-User Session] --> [Wake Word] openwakeword
-                                              |
-                                         [VAD] silero
-                                              |
-                                         [STT] Groq Whisper
-                                              |
-                                         [LLM] Claude / Groq
-                                              |
-                                         [TTS] Inworld --> Discord Voice
-```
-
-**Features:** Auto-join, per-user sessions, speaker isolation, greeting on join, keep-alive, Claude delegation for Groq.
-
-### Keep-Alive
-
-Discord disconnects voice bots after ~1 hour of inactivity. The keep-alive feature generates and speaks a message before this happens.
-
-```bash
-KEEP_ALIVE_ENABLED=true  # Default: true
-KEEP_ALIVE_INTERVAL_SECONDS=3000  # Default: 50 minutes
-KEEP_ALIVE_PROMPT="Your custom prompt here"  # LLM generates response from this
-```
-
-Default prompt instructs the bot to make a slightly annoyed comment about being legally required to speak.
-
-## File Structure
-
-```
-src/
-  audio/         # Audio utilities (ring buffer, resampling)
-  bot/           # Discord bot, commands, voice session
-  core/          # Shared types and interfaces
-  detection/     # Wake word (openwakeword) and VAD (silero)
-  image/         # Image generation (Nano Banana / Gemini)
-  llm/           # LLM providers (Claude SDK, Groq GPT OSS 120B)
-  pipeline/      # Voice processing pipeline orchestration
-  search/        # Web search (DuckDuckGo, Firecrawl)
-  session/       # Per-user voice session state
-  sink/          # Discord audio sink handling
-  stt/           # Speech-to-text (Groq Whisper)
-  tools/         # Tool definitions for Groq providers
-  tts/           # Text-to-speech (Inworld)
-```
-
-## Development
-
-```bash
-# Install with dev dependencies
-pip install -e ".[dev]"
-
-# Run tests
-pytest
-
-# Lint
-ruff check src/
-```
+- **Don't retune the voice feel without asking.** Thinking/affirmation phrases, the dynamic
+  thinking generator, wait-for-silence, TTS sentence splitting and pauses, and the prompt's
+  voice/format rules were tuned by hand. Fix bugs around them; don't change their behavior.
+- **Cerebras reasoning stays at `high`** (~1500 tok/s, so it costs little time). Reasoning text
+  must never reach TTS or history.
+- **Qwen rejects any system message that isn't first.** Put per-turn notes in the first system
+  prompt or in tool results. Cerebras is also strict: no `tool_choice` without `tools`, every
+  tool call gets exactly one tool result, unique call IDs.
+- **Web content is untrusted.** Tool output says so and the prompt tells the model to ignore
+  instructions in it. Keep the reader's private-address check on every redirect hop.
+- **`.env` holds real secrets: never print values.** Unknown keys are silently ignored
+  (`extra="ignore"`), so keep `.env.example` as the canonical key list. Tests construct
+  `Settings(_env_file=None)` to avoid reading the real `.env`.
+- **Line endings are mixed (CRLF and LF).** Preserve each file's existing endings; don't
+  churn whole files.
+- Features off by default: image generation (`IMAGE_GENERATION_ENABLED`), deep research
+  (`DEEP_RESEARCH_ENABLED`, planned: OpenAI via Codex/ChatGPT sign-in, not wired up).

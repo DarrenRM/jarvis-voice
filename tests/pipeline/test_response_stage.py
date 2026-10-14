@@ -1,241 +1,181 @@
 """Tests for ResponseStage.
 
-Tests the wrapper around ChatOrchestrator that adds speaker context.
+Tests the wrapper around ChatOrchestrator that adds speaker context and
+keeps a bounded conversation history.
 """
 
-from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-
+from src.llm.chat_orchestrator import ChatOrchestrator, ToolCall, TurnResult
 from src.pipeline.base import PipelineContext
 from src.pipeline.response_stage import ResponseStage
+from src.tools import ToolDefinition, ToolExecutor, ToolHandler, ToolRegistry, ToolResult
 
 
-@pytest.fixture
-def mock_orchestrator():
-    """Create a mock ChatOrchestrator."""
-    orchestrator = MagicMock()
+class FakeLLM:
+    """Answers every turn with a fixed reply, or plays scripted turns."""
 
-    async def mock_chat_stream(message, messages, on_message_update=None):
-        yield "Hello "
-        yield "world!"
+    def __init__(self, reply=("Hello ", "world!"), script=None):
+        self._reply = reply
+        self._script = list(script or [])
+        self.requests: list[list[dict]] = []
 
-    orchestrator.chat_stream = mock_chat_stream
-    return orchestrator
+    async def stream_turn(self, messages, tools=None):
+        self.requests.append([dict(m) for m in messages])
+        if self._script:
+            turn = self._script.pop(0)
+            if isinstance(turn, Exception):
+                raise turn
+            yield turn
+            return
+        for chunk in self._reply:
+            yield chunk
+        yield TurnResult(content="".join(self._reply), finish_reason="stop")
 
 
-@pytest.fixture
-def stage(mock_orchestrator):
-    """Create a ResponseStage with mock orchestrator."""
-    return ResponseStage(mock_orchestrator, system_prompt="You are a helpful assistant.")
+class Echo(ToolHandler):
+    @property
+    def name(self):
+        return "echo"
+
+    @property
+    def definition(self):
+        return ToolDefinition(name="echo", description="echo", parameters={"type": "object"})
+
+    async def execute(self, args):
+        return ToolResult(success=True, output="echoed")
 
 
-@pytest.fixture
-def context():
-    """Create a pipeline context."""
-    return PipelineContext(speaker_name="Alice")
+def make_stage(llm=None, prompt="You are a helpful assistant.", max_history=60):
+    llm = llm or FakeLLM()
+    registry = ToolRegistry()
+    registry.register(Echo())
+    orchestrator = ChatOrchestrator(llm, ToolExecutor(registry))
+    return ResponseStage(orchestrator, lambda: prompt, max_history_messages=max_history), llm
+
+
+async def run(stage, text, context=None):
+    return [c async for c in stage.process_stream(text, context or PipelineContext())]
 
 
 class TestResponseStage:
-    """Test ResponseStage functionality."""
-
-    def test_name(self, stage):
-        """Stage has correct name."""
+    def test_name(self):
+        stage, _ = make_stage()
         assert stage.name == "response"
 
-    @pytest.mark.asyncio
-    async def test_streams_response(self, stage, context):
-        """Response chunks are streamed."""
-        chunks = []
-        async for chunk in stage.process_stream("hello", context):
-            chunks.append(chunk)
+    async def test_streams_response(self):
+        stage, _ = make_stage()
+        assert await run(stage, "hello") == ["Hello ", "world!"]
 
-        assert chunks == ["Hello ", "world!"]
+    async def test_system_prompt_first_in_request(self):
+        stage, llm = make_stage()
+        await run(stage, "hello")
+        assert llm.requests[0][0] == {"role": "system", "content": "You are a helpful assistant."}
 
-    @pytest.mark.asyncio
-    async def test_initializes_messages_with_system_prompt(self, stage, context):
-        """First call initializes messages with system prompt."""
-        async for _ in stage.process_stream("hello", context):
-            pass
-
-        messages = stage.get_messages()
-        assert messages[0]["role"] == "system"
-        assert "helpful assistant" in messages[0]["content"]
-
-    @pytest.mark.asyncio
-    async def test_adds_user_message(self, stage, context):
-        """User message is added to history."""
-        async for _ in stage.process_stream("hello", context):
-            pass
-
-        messages = stage.get_messages()
-        user_msgs = [m for m in messages if m["role"] == "user"]
-        assert len(user_msgs) == 1
-        assert "hello" in user_msgs[0]["content"]
-
-    @pytest.mark.asyncio
-    async def test_adds_assistant_response(self, stage, context):
-        """Assistant response is added to history."""
-        async for _ in stage.process_stream("hello", context):
-            pass
-
-        messages = stage.get_messages()
-        assistant_msgs = [m for m in messages if m["role"] == "assistant"]
-        assert len(assistant_msgs) == 1
-        assert assistant_msgs[0]["content"] == "Hello world!"
+    async def test_history_excludes_system_prompt(self):
+        stage, _ = make_stage()
+        await run(stage, "hello", PipelineContext(speaker_name="Alice"))
+        assert stage.get_messages() == [
+            {"role": "user", "content": "[Alice]: hello"},
+            {"role": "assistant", "content": "Hello world!"},
+        ]
 
 
 class TestSpeakerContext:
-    """Test speaker context handling."""
+    async def test_speaker_name_prefix(self):
+        stage, llm = make_stage()
+        await run(stage, "hello", PipelineContext(speaker_name="Bob"))
+        assert llm.requests[0][-1] == {"role": "user", "content": "[Bob]: hello"}
 
-    @pytest.mark.asyncio
-    async def test_speaker_name_prefix(self, stage, mock_orchestrator):
-        """Speaker name is added as prefix to user message."""
-        captured_messages = []
+    async def test_no_speaker_name(self):
+        stage, llm = make_stage()
+        await run(stage, "hello")
+        assert llm.requests[0][-1] == {"role": "user", "content": "hello"}
 
-        async def capture_chat_stream(message, messages, on_message_update=None):
-            captured_messages.extend(messages)
-            yield "OK"
+    async def test_speaker_activity_in_system_prompt(self):
+        stage, llm = make_stage()
+        await run(stage, "hello", PipelineContext(speaker_activity="playing Minecraft"))
+        assert "The user is currently: playing Minecraft" in llm.requests[0][0]["content"]
 
-        mock_orchestrator.chat_stream = capture_chat_stream
+    async def test_activity_is_per_turn_not_frozen(self):
+        stage, llm = make_stage()
+        await run(stage, "hi", PipelineContext(speaker_activity="playing Minecraft"))
+        await run(stage, "hi", PipelineContext(speaker_activity="playing Dune"))
+        assert "Dune" in llm.requests[1][0]["content"]
+        assert "Minecraft" not in llm.requests[1][0]["content"]
 
-        context = PipelineContext(speaker_name="Bob")
-        async for _ in stage.process_stream("hello", context):
-            pass
 
-        user_msg = next(m for m in captured_messages if m["role"] == "user")
-        assert "[Bob]: hello" in user_msg["content"]
-
-    @pytest.mark.asyncio
-    async def test_no_speaker_name(self, stage, mock_orchestrator):
-        """No prefix when speaker name is absent."""
-        captured_messages = []
-
-        async def capture_chat_stream(message, messages, on_message_update=None):
-            captured_messages.extend(messages)
-            yield "OK"
-
-        mock_orchestrator.chat_stream = capture_chat_stream
-
-        context = PipelineContext()  # No speaker name
-        async for _ in stage.process_stream("hello", context):
-            pass
-
-        user_msg = next(m for m in captured_messages if m["role"] == "user")
-        assert user_msg["content"] == "hello"
-
-    @pytest.mark.asyncio
-    async def test_speaker_activity_in_system_prompt(self, stage, mock_orchestrator):
-        """Speaker activity is added to system prompt."""
-        captured_messages = []
-
-        async def capture_chat_stream(message, messages, on_message_update=None):
-            captured_messages.extend(messages)
-            yield "OK"
-
-        mock_orchestrator.chat_stream = capture_chat_stream
-
-        context = PipelineContext(speaker_activity="playing Minecraft")
-        async for _ in stage.process_stream("hello", context):
-            pass
-
-        system_msg = next(m for m in captured_messages if m["role"] == "system")
-        assert "playing Minecraft" in system_msg["content"]
+class TestSystemPromptRefresh:
+    async def test_prompt_rebuilt_every_turn(self):
+        prompts = iter(["prompt at 10:00", "prompt at 10:05"])
+        llm = FakeLLM()
+        orchestrator = ChatOrchestrator(llm, ToolExecutor(ToolRegistry()))
+        stage = ResponseStage(orchestrator, lambda: next(prompts))
+        await run(stage, "one")
+        await run(stage, "two")
+        assert llm.requests[1][0]["content"] == "prompt at 10:05"
+        assert sum(m["role"] == "system" for m in llm.requests[1]) == 1
 
 
 class TestConversationHistory:
-    """Test conversation history management."""
+    async def test_history_persists(self):
+        stage, llm = make_stage()
+        await run(stage, "hello")
+        await run(stage, "how are you")
+        roles = [m["role"] for m in llm.requests[1]]
+        assert roles == ["system", "user", "assistant", "user"]
 
-    @pytest.mark.asyncio
-    async def test_history_persists(self, stage, context):
-        """Conversation history persists across calls."""
-        # First message
-        async for _ in stage.process_stream("hello", context):
-            pass
-
-        # Second message
-        async for _ in stage.process_stream("how are you", context):
-            pass
-
-        messages = stage.get_messages()
-        user_msgs = [m for m in messages if m["role"] == "user"]
-        assert len(user_msgs) == 2
-
-    @pytest.mark.asyncio
-    async def test_reset_conversation(self, stage, context):
-        """Reset clears conversation history."""
-        # First message
-        async for _ in stage.process_stream("hello", context):
-            pass
-
+    async def test_reset_conversation(self):
+        stage, _ = make_stage()
+        await run(stage, "hello")
         stage.reset_conversation()
-
         assert stage.get_messages() == []
 
-    @pytest.mark.asyncio
-    async def test_system_prompt_reinitializes_after_reset(self, stage, context):
-        """System prompt is re-added after reset."""
-        # First conversation
-        async for _ in stage.process_stream("hello", context):
-            pass
+    def test_get_messages_returns_copy(self):
+        stage, _ = make_stage()
+        stage.get_messages().append({"role": "test"})
+        assert stage.get_messages() == []
 
-        stage.reset_conversation()
+    async def test_failed_turn_not_added_to_history(self):
+        llm = FakeLLM(script=[RuntimeError("503")])
+        stage, _ = make_stage(llm)
+        chunks = await run(stage, "hello")
+        assert chunks  # apology is still spoken
+        assert stage.get_messages() == []
 
-        # New conversation
-        async for _ in stage.process_stream("hello again", context):
-            pass
-
-        messages = stage.get_messages()
-        assert messages[0]["role"] == "system"
-
-    def test_get_messages_returns_copy(self, stage):
-        """get_messages returns a copy, not the original list."""
-        messages = stage.get_messages()
-        messages.append({"role": "test", "content": "test"})
-
-        assert {"role": "test", "content": "test"} not in stage.get_messages()
-
-
-class TestMessageCallback:
-    """Test message update callback."""
-
-    @pytest.mark.asyncio
-    async def test_callback_passed_to_orchestrator(self, stage, mock_orchestrator, context):
-        """Message callback is passed to orchestrator."""
-        captured_callback = []
-
-        async def capture_chat_stream(message, messages, on_message_update=None):
-            captured_callback.append(on_message_update)
-            yield "OK"
-
-        mock_orchestrator.chat_stream = capture_chat_stream
-
-        callback = MagicMock()
-        stage.set_message_callback(callback)
-
-        async for _ in stage.process_stream("hello", context):
-            pass
-
-        assert captured_callback[0] is callback
+    async def test_tool_turn_kept_together_in_history(self):
+        llm = FakeLLM(script=[
+            TurnResult(tool_calls=[ToolCall("c1", "echo", "{}")], finish_reason="tool_calls"),
+            TurnResult(content="Done.", finish_reason="stop"),
+        ])
+        stage, _ = make_stage(llm)
+        await run(stage, "hello")
+        roles = [m["role"] for m in stage.get_messages()]
+        assert roles == ["user", "assistant", "tool", "assistant"]
 
 
-class TestEmptyResponse:
-    """Test handling of empty responses."""
+class TestHistoryTrim:
+    async def test_trims_oldest_whole_exchanges(self):
+        stage, llm = make_stage(max_history=5)
+        for i in range(4):
+            await run(stage, f"msg {i}")
+        history = stage.get_messages()
+        assert len(history) <= 5
+        assert history[0]["role"] == "user"
+        assert history[-1]["role"] == "assistant"
 
-    @pytest.mark.asyncio
-    async def test_empty_response_not_added_to_history(self, mock_orchestrator):
-        """Empty response is not added to message history."""
-        async def empty_stream(message, messages, on_message_update=None):
-            return
-            yield  # Make it a generator
-
-        mock_orchestrator.chat_stream = empty_stream
-        stage = ResponseStage(mock_orchestrator, system_prompt="Test")
-        context = PipelineContext()
-
-        async for _ in stage.process_stream("hello", context):
-            pass
-
-        messages = stage.get_messages()
-        assistant_msgs = [m for m in messages if m["role"] == "assistant"]
-        assert len(assistant_msgs) == 0
+    async def test_trim_never_starts_on_tool_message(self):
+        script = []
+        for _ in range(3):
+            script += [
+                TurnResult(tool_calls=[ToolCall("c", "echo", "{}")], finish_reason="tool_calls"),
+                TurnResult(content="Done.", finish_reason="stop"),
+            ]
+        stage, _ = make_stage(FakeLLM(script=script), max_history=6)
+        for i in range(3):
+            await run(stage, f"msg {i}")
+        history = stage.get_messages()
+        assert history[0]["role"] == "user"
+        # Every tool message directly follows an assistant tool_calls message or another tool
+        for prev, msg in zip(history, history[1:]):
+            if msg["role"] == "tool":
+                assert prev["role"] == "tool" or prev.get("tool_calls")

@@ -51,7 +51,7 @@ def preload_components(settings: Settings) -> dict:
 
     # LLM client - NOT pre-created here because it needs the image callback
     # which requires access to voice_client (created in VoiceSession)
-    logger.info(f"LLM client ({settings.llm_provider}) will be created when joining voice")
+    logger.info(f"LLM client (Cerebras {settings.cerebras_model}) will be created when joining voice")
 
     # TTS (Inworld)
     logger.info("Loading TTS (Inworld)...")

@@ -12,7 +12,7 @@ from discord.ext import commands
 
 from ..config import Settings
 from ..detection import VAD
-from ..llm import BaseLLMClient
+from ..llm import LLMService
 from ..tts import TTSSynthesizer
 from .voice_session import VoiceSession
 
@@ -33,7 +33,7 @@ class ClaudeBot(commands.Bot):
         settings: Settings,
         *,
         vad: Optional[VAD] = None,
-        llm: Optional[BaseLLMClient] = None,
+        llm: Optional[LLMService] = None,
         tts: Optional[TTSSynthesizer] = None,
     ):
         """Initialize bot.

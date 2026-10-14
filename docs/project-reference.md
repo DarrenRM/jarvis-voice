@@ -35,7 +35,7 @@ The bot listens for a wake word ("hey jarvis"), captures user speech, transcribe
 3. **PTT staleness detection**: Responds 500ms after push-to-talk release (not 3.5s)
 4. **Speaker isolation**: Filters non-wake-word speakers in multi-user channels
 5. **Per-user wake detection**: Each user gets their own wake word detector for accurate speaker attribution
-6. **Personalization**: "One second, Darren..." with Discord activity awareness
+6. **Personalization**: "One second, Alice..." with Discord activity awareness
 
 ---
 

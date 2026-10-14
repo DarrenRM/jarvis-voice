@@ -1,51 +1,43 @@
 [project]
 name = "discord-voice-claude-bot"
 version = "0.1.0"
-description = "Voice-activated AI assistant for Discord using Claude Code"
-requires-python = ">=3.10"
+description = "Voice-activated AI assistant for Discord"
+requires-python = ">=3.11"
 dependencies = [
     # Discord
     "py-cord[voice]>=2.6.0",
 
     # Audio Processing
     "numpy>=1.24.0",
-    "soundfile>=0.12.0",
-    "sounddevice>=0.4.6",
     "pydub>=0.25.0",
     "scipy>=1.12.0",  # Audio resampling for Discord format conversion
 
-    # STT (Speech-to-Text) - Groq Whisper (primary) or Deepgram Flux / Whisper (fallback)
+    # STT (Groq Whisper)
     "groq>=0.4.0",
-    "deepgram-sdk>=5.3.0",
-    # Keep faster-whisper as fallback for offline use
-    "faster-whisper>=1.0.0",
 
-    # VAD (Voice Activity Detection) - for wake word, Flux handles turn detection
-    "onnxruntime-gpu>=1.17.0",
+    # VAD + wake word (CPU inference is plenty for these small models)
+    "onnxruntime>=1.17.0",
     "silero-vad>=5.1",
-
-    # Wake Word Detection
     "openwakeword>=0.6.0",
 
     # TTS (Inworld API)
     "aiohttp>=3.9.0",
     "num2words>=0.5.13",  # Number to words for better TTS pronunciation
 
-    # Claude Code SDK (headless mode - no API key needed)
-    "claude-code-sdk>=0.0.20",
+    # LLM (Cerebras via its OpenAI-compatible API)
+    "openai>=1.40.0",
 
-    # Search Pipeline (for Groq LLM tool use)
-    "ddgs>=7.0.0",
+    # Web lookup: DuckDuckGo search + local page extraction
+    "ddgs>=9.0.0",
+    "httpx>=0.27.0",
+    "trafilatura>=2.0.0",
 
-    # Image Generation (Nano Banana / Gemini)
+    # Image Generation (Nano Banana / Gemini) - disabled by default
     "google-genai>=1.0.0",
 
     # Configuration
     "pydantic-settings>=2.0.0",
     "python-dotenv>=1.0.0",
-
-    # Logging
-    "structlog>=24.0.0",
 ]
 
 [project.optional-dependencies]

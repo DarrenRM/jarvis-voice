@@ -18,7 +18,7 @@ from ..audio import SAMPLE_RATE_PROCESSING, SAMPLE_RATE_TTS
 from ..config import get_settings
 from ..detection import VAD, SpeakingDetector
 from ..stt import GroqWhisperClient
-from ..llm import BaseLLMClient, create_llm_client
+from ..llm import LLMService, create_llm_client
 from ..pipeline import (
     PipelineContext,
     ResponseStage,
@@ -56,7 +56,7 @@ class VoiceSession:
         vad: Optional[VAD] = None,
         speaking_detector: Optional[SpeakingDetector] = None,
         groq_client: Optional[GroqWhisperClient] = None,
-        llm: Optional[BaseLLMClient] = None,
+        llm: Optional[LLMService] = None,
         tts: Optional[TTSSynthesizer] = None,
     ):
         """Initialize voice session.
@@ -229,18 +229,19 @@ class VoiceSession:
 
         # Initialize modular VoicePipeline
         if self._voice_pipeline is None:
-            orchestrator = getattr(self.llm, 'chat_orchestrator', None)
-            if orchestrator is not None:
-                system_prompt = self.llm.get_system_prompt()
-                transcription_stage = TranscriptionStage(self.groq_client)
-                response_stage = ResponseStage(orchestrator, system_prompt)
-                tts_stage = TTSStage(self.tts)
+            transcription_stage = TranscriptionStage(self.groq_client)
+            response_stage = ResponseStage(
+                self.llm.chat_orchestrator,
+                self.llm.build_system_prompt,
+                max_history_messages=self.settings.llm_history_max_messages,
+            )
+            tts_stage = TTSStage(self.tts)
 
-                self._voice_pipeline = VoicePipeline(
-                    transcription=transcription_stage,
-                    response=response_stage,
-                    tts=tts_stage,
-                )
+            self._voice_pipeline = VoicePipeline(
+                transcription=transcription_stage,
+                response=response_stage,
+                tts=tts_stage,
+            )
 
     def _on_wake_word(self):
         """Callback when wake word detected (from sink thread)."""
@@ -411,8 +412,8 @@ class VoiceSession:
                 logger.debug(f"speak(False) failed: {e}")
 
         # Reset image editing context (Gemini chat session)
-        if self.llm and hasattr(self.llm, '_image_service') and self.llm._image_service:
-            self.llm._image_service.reset_chat()
+        if self.llm and self.llm.image_service:
+            self.llm.image_service.reset_chat()
             logger.debug("Reset image chat context on session stop")
 
     async def _run_loop(self):

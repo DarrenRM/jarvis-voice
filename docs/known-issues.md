@@ -103,7 +103,7 @@ self._wake_word_refractory_seconds = 5.0
 22:16:41 | [SINK] stop_listening() called
 22:16:41 | [SINK] Audio resumed after 0.8s gap
 22:16:41 | Wake word detected: hey_jarvis (score: 0.75, inference: 0.0ms)
-22:16:41 | [SINK] Wake word detected! (packet lag: 1ms, user: 100000000000000003)
+22:16:41 | [SINK] Wake word detected! (packet lag: 1ms, user: 111111111111111111)
 22:16:41 | [CALLBACK] _on_wake_word called, state=processing
 22:16:41 | [CALLBACK] NOT setting event - state=processing
 ... (repeats 20+ times with scores increasing to 1.00)
@@ -229,7 +229,7 @@ Observed during multi-speaker testing. Exact trigger unclear.
 ### Reproduction
 
 1. Two people in voice channel
-2. Person A (Pat) says "Hey Jarvis" + something
+2. Person A (Bob) says "Hey Jarvis" + something
 3. Person B talks simultaneously (gets filtered by speaker isolation)
 4. Person A pauses briefly (natural speech gap or waiting for acknowledgment)
 5. System triggers `[SPEECH_END] PTT released / no audio packets` after ~0.5s
@@ -244,7 +244,7 @@ Observed during multi-speaker testing. Exact trigger unclear.
 
 ```
 00:00:15 | Wake word detected: hey_jarvis (score: 0.97)
-00:00:15 | [SINK ISOLATION] Filtering audio from user 100000000000000001 (locked to 100000000000000003)
+00:00:15 | [SINK ISOLATION] Filtering audio from user 222222222222222222 (locked to 111111111111111111)
 00:00:16 | VAD: Speech STARTED at 1.30s
 00:00:17 | [SINK] Audio stopped for 0.58s (PTT released?), buffer=3.1s
 00:00:17 | [SPEECH_END] PTT released / no audio packets (buffer=3.14s)
