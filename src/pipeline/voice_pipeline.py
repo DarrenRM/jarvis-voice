@@ -26,6 +26,62 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+class OpeningPhrase:
+    """A short phrase ("Sure, Sam...") played as soon as speech ends.
+
+    Synthesis and playback start immediately in a background task, so the
+    phrase is heard while transcription is still running instead of after it.
+    """
+
+    def __init__(
+        self,
+        synthesize: Callable[[], Awaitable[np.ndarray]],
+        play_audio: Callable[[np.ndarray], Awaitable[None]],
+        should_play: Optional[Callable[[], Awaitable[bool]]] = None,
+    ):
+        """Start the phrase.
+
+        Args:
+            synthesize: Returns the phrase audio
+            play_audio: Async function to play audio
+            should_play: Optional check (e.g. room is quiet); False skips the phrase
+        """
+        self.playing = False
+        # Set when should_play said no (someone is still talking)
+        self.skipped = False
+        self._task = asyncio.create_task(self._run(synthesize, play_audio, should_play))
+
+    async def _run(self, synthesize, play_audio, should_play) -> None:
+        try:
+            if should_play is not None and not await should_play():
+                self.skipped = True
+                logger.info("Pipeline: Skipping opening phrase - someone still speaking")
+                return
+            audio = await synthesize()
+            if audio is None or len(audio) == 0:
+                return
+            self.playing = True
+            await play_audio(audio)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Pipeline: Opening phrase failed: {e}")
+
+    async def wait(self) -> None:
+        """Wait until the phrase has played (or was skipped)."""
+        await self._task
+
+    def cancel(self) -> None:
+        self._task.cancel()
+
+    def cancel_if_not_playing(self) -> bool:
+        """Cancel unless already audible. Returns True if it was cancelled."""
+        if self.playing or self._task.done():
+            return False
+        self._task.cancel()
+        return True
+
+
 class VoicePipeline:
     """Full voice processing pipeline with thinking phrase support.
 
@@ -72,6 +128,7 @@ class VoicePipeline:
         self._tts = tts
         self._cancelled = False
         self._thinking_task: Optional[asyncio.Task] = None
+        self._opening: Optional[OpeningPhrase] = None
 
     async def process(
         self,
@@ -84,6 +141,7 @@ class VoicePipeline:
         thinking_generator: Optional["ThinkingPhraseGenerator"] = None,
         tts_synthesizer: Optional[TTSSynthesizerProtocol] = None,
         affirmation_audio: Optional[np.ndarray] = None,
+        opening: Optional[OpeningPhrase] = None,
     ) -> Optional[str]:
         """Run full voice pipeline.
 
@@ -97,6 +155,9 @@ class VoicePipeline:
             thinking_generator: Optional generator for dynamic context-aware phrases
             tts_synthesizer: Optional TTS for synthesizing dynamic phrases
             affirmation_audio: Pre-synthesized affirmation (dynamic mode, plays immediately)
+            opening: Phrase already started at speech end (affirmation in dynamic
+                mode, the thinking phrase in static mode). Cancelled on an empty
+                transcription if not yet audible; left to the caller on wake-word-only.
 
         Returns:
             None normally
@@ -106,6 +167,7 @@ class VoicePipeline:
         """
         self._cancelled = False
         self._thinking_task = None
+        self._opening = opening
 
         # Stage 1: Transcription
         logger.debug("Pipeline: Starting transcription")
@@ -113,11 +175,19 @@ class VoicePipeline:
             transcription_result = await self._transcription.process(audio, context)
         except asyncio.CancelledError:
             logger.debug("Pipeline: Transcription cancelled")
+            if opening is not None:
+                opening.cancel()
             return "cancelled"
+        except Exception:
+            if opening is not None:
+                opening.cancel_if_not_playing()
+            raise
 
         # Handle special cases
         if transcription_result.is_empty:
             logger.debug("Pipeline: Empty transcription, skipping")
+            if opening is not None:
+                opening.cancel_if_not_playing()
             return "empty"
 
         if transcription_result.wake_word_only:
@@ -143,9 +213,15 @@ class VoicePipeline:
                     play_audio,
                     thinking_done,
                     affirmation_audio=affirmation_audio,
+                    opening=opening,
                 )
             )
             logger.debug("Pipeline: Started dynamic thinking phrase generation")
+        elif opening is not None:
+            # Static mode: the thinking phrase is already playing
+            self._thinking_task = asyncio.create_task(
+                self._wait_for_opening(opening, thinking_done)
+            )
         elif thinking_audio is not None and len(thinking_audio) > 0:
             # Static mode: use pre-synthesized audio
             self._thinking_task = asyncio.create_task(
@@ -206,6 +282,14 @@ class VoicePipeline:
         finally:
             done_event.set()
 
+    async def _wait_for_opening(self, opening: OpeningPhrase, done_event: asyncio.Event) -> None:
+        try:
+            await opening.wait()
+        except asyncio.CancelledError:
+            logger.debug("Opening phrase cancelled")
+        finally:
+            done_event.set()
+
     async def _generate_and_play_dynamic_thinking(
         self,
         generator: "ThinkingPhraseGenerator",
@@ -214,6 +298,7 @@ class VoicePipeline:
         play_audio: Callable[[np.ndarray], Awaitable[None]],
         done_event: asyncio.Event,
         affirmation_audio: Optional[np.ndarray] = None,
+        opening: Optional[OpeningPhrase] = None,
     ) -> None:
         """Play affirmation while generating dynamic phrase in parallel.
 
@@ -229,13 +314,21 @@ class VoicePipeline:
             play_audio: Async function to play audio
             done_event: Event to signal when done
             affirmation_audio: Pre-synthesized affirmation to play immediately
+            opening: Affirmation already started at speech end (used instead of
+                affirmation_audio)
         """
+        generate_task = None
         try:
             # Start dynamic phrase generation immediately (runs in background)
             generate_task = asyncio.create_task(generator.generate(transcribed_text))
 
             # Play affirmation while generation runs in parallel
-            if affirmation_audio is not None and len(affirmation_audio) > 0:
+            if opening is not None:
+                await opening.wait()
+                if opening.skipped:
+                    # Someone is still talking; no thinking phrase either
+                    return
+            elif affirmation_audio is not None and len(affirmation_audio) > 0:
                 await play_audio(affirmation_audio)
                 logger.debug("Pipeline: Played affirmation phrase")
 
@@ -261,6 +354,8 @@ class VoicePipeline:
         except Exception as e:
             logger.warning(f"Pipeline: Dynamic thinking phrase failed: {e}, skipping")
         finally:
+            if generate_task is not None and not generate_task.done():
+                generate_task.cancel()
             done_event.set()
 
     async def cancel(self) -> None:
@@ -269,6 +364,9 @@ class VoicePipeline:
         Propagates cancellation to all stages.
         """
         self._cancelled = True
+
+        if self._opening is not None:
+            self._opening.cancel()
 
         # Cancel thinking phrase if running
         if self._thinking_task and not self._thinking_task.done():

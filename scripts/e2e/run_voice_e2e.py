@@ -2,6 +2,9 @@
 
     .venv/Scripts/python scripts/e2e/run_voice_e2e.py              # all scenarios
     .venv/Scripts/python scripts/e2e/run_voice_e2e.py basic noisy  # name filter
+    .venv/Scripts/python scripts/e2e/run_voice_e2e.py --no-web --repeat=3
+
+--no-web skips the live web scenarios (web_*); --repeat=N runs each scenario N times.
 
 Writes reports/e2e-<timestamp>/report.md, results.json and one stereo WAV per
 scenario (left = people, right = bot) so timing and pauses can be listened to.
@@ -33,7 +36,8 @@ from scripts.e2e.harness import (  # noqa: E402
 TESTER = FakeMember(700000000000000001, "Tester", activity="Dune: Awakening")
 BYSTANDER = FakeMember(700000000000000002, "Bystander")
 MORGAN = FakeMember(700000000000000003, "Morgan")
-MEMBERS = [TESTER, BYSTANDER, MORGAN]
+RILEY = FakeMember(700000000000000004, "Riley", activity="Enshrouded")
+MEMBERS = [TESTER, BYSTANDER, MORGAN, RILEY]
 
 SPOKEN_TAG_WORDS = {"whispering", "laughing", "happy", "sad", "angry", "surprised", "fearful",
                     "disgusted", "cheerful", "sigh", "laugh", "breathe", "cough", "clear throat"}
@@ -98,6 +102,43 @@ def used_tool(name: str, turn: int = 0) -> Check:
         tools = r.turns[turn].tools if len(r.turns) > turn else []
         return name in tools, f"tools={tools}"
     check.__name__ = f"used_tool[{turn}]({name})"
+    return check
+
+
+def web_searches_at_most(limit: int) -> Check:
+    """Keeps live search load (and tokens) down across the whole scenario."""
+    def check(r):
+        n = sum(t.tools.count("web_search") for t in r.turns)
+        return n <= limit, f"web_search calls={n}"
+    check.__name__ = f"web_searches<={limit}"
+    return check
+
+
+GIVE_UP_PHRASES = ("couldn't find", "could not find", "can't find", "ghosted", "no luck",
+                   "not sure", "don't know", "couldn't get", "no results")
+
+
+def answers_confidently(turn: int = 0) -> Check:
+    """The bot gave an answer rather than a "couldn't find it" apology."""
+    def check(r):
+        if len(r.turns) <= turn:
+            return False, "no turn recorded"
+        answer = r.turns[turn].answer.lower()
+        hit = [p for p in GIVE_UP_PHRASES if p in answer]
+        return not hit, f"{hit or ''} {r.turns[turn].answer!r}"
+    check.__name__ = f"answers_confidently[{turn}]"
+    return check
+
+
+def no_tools(r: RunResult) -> tuple[bool, str]:
+    tools = [t for turn in r.turns for t in turn.tools]
+    return not tools, f"tools={tools}"
+
+
+def turns_at_least(n: int) -> Check:
+    def check(r):
+        return len(r.turns) >= n, f"{len(r.turns)} turns: {[t.user_text for t in r.turns]}"
+    check.__name__ = f"turns>={n}"
     return check
 
 
@@ -195,9 +236,14 @@ SCENARIOS = [
              [silent], answers=False, note="No wake word: the bot must stay silent."),
     Scenario("near_miss", [Speech(TESTER, ["Hey Travis, can you pass me the salt?"])],
              [silent], answers=False, note="Similar-sounding phrase (false-trigger probe)."),
-    Scenario("web_weather", [Speech(TESTER, ["Hey Jarvis, what's the weather in Chicago right now?"])],
-             [used_tool("web_search"), gives_temperature()],
-             note="Live web lookup through the tools."),
+    # The only web scenario: two game questions, at most two searches in the whole run
+    Scenario("web_enshrouded",
+             [Speech(RILEY, ["Hey Jarvis, how many people can play together in Enshrouded?"]),
+              Speech(RILEY, ["Hey Jarvis, what do I need to craft a glider?"])],
+             [used_tool("web_search"), says_any("16", "sixteen"), answers_confidently(),
+              answers_confidently(turn=1), web_searches_at_most(2)], between=1.5,
+             note="Live web lookup for game info (the bot's main use). The second question doesn't "
+                  "name the game, so it has to come from Riley's 'Playing Enshrouded' activity."),
     Scenario("post_to_chat", [Speech(TESTER, ["Hey Jarvis, post pizza at eight in the chat."])],
              [used_tool("post_to_chat"), posted("pizza")],
              note="Discord action; reply should be a brief ack."),
@@ -223,6 +269,32 @@ SCENARIOS = [
              note="Open mic: packets keep flowing after speech, so the VAD must end the turn."),
     Scenario("male_voice", [Speech(TESTER, [f"Hey Jarvis, {Q_CAPITAL}"], voice="dennis")],
              [heard(Q_CAPITAL), says_any("canberra")], note="Different speaker voice."),
+    # Small talk: no tools, short, in character; read the answers in the report
+    Scenario("smalltalk_day", [Speech(TESTER, ["Hey Jarvis, how's your day going?"])],
+             [no_tools, answers_confidently()], note="Chit-chat; should answer without tools."),
+    Scenario("smalltalk_joke", [Speech(TESTER, ["Hey Jarvis, tell me a joke about zombies."])],
+             [no_tools], note="Short joke, no tools."),
+    Scenario("smalltalk_opinion", [Speech(TESTER, ["Hey Jarvis, is pineapple on pizza a crime?"])],
+             [no_tools], note="Opinion question; personality, no tools."),
+    Scenario("smalltalk_thanks", [Speech(TESTER, ["Hey Jarvis, thanks for the help earlier."])],
+             [no_tools], note="Should be a brief reply."),
+    Scenario("arithmetic",
+             [Speech(TESTER, ["Hey Jarvis, if I have three stacks of 64 iron and use 50, "
+                              "how much is left?"])],
+             [no_tools, says_any("142", "hundred forty-two", "hundred and forty-two",
+                                 "hundred forty two")],
+             note="Mental maths with reasoning, no tools."),
+    Scenario("followup_no_wake",
+             [Speech(TESTER, ["Hey Jarvis, what's your favorite color?"]),
+              Speech(TESTER, ["Why that one?"])],
+             [turns_at_least(2), no_tools], between=1.0, expect_fail=True,
+             note="Second question has no wake word. Follow-up mode is switched off "
+                  "(voice_session.py `# await self._followup_loop()`), so it is ignored."),
+    Scenario("quick_second_question",
+             [Speech(TESTER, ["Hey Jarvis, what's two plus two?"]),
+              Speech(TESTER, ["Hey Jarvis, and what's ten times ten?"])],
+             [says_any("four", "4"), says_any("hundred", "100", turn=1)], between=0.3,
+             note="Second question right after the first answer ends."),
     Scenario("barge_in",
              [Speech(TESTER, ["Hey Jarvis, tell me a short story about a dragon."], at=0.5),
               Speech(TESTER, ["Hey Jarvis, stop."], at=9.0)],
@@ -351,7 +423,7 @@ def to_json(r: RunResult) -> dict:
 # ---------------------------------------------------------------- main
 
 
-async def main(filters: list[str]) -> int:
+async def main(args: list[str]) -> int:
     from scripts.e2e.harness import Rig
     from src.config import get_settings
 
@@ -365,12 +437,22 @@ async def main(filters: list[str]) -> int:
     for noisy in ("httpx", "httpcore", "openai", "primp", "ddgs", "discord"):
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
+    filters = [a for a in args if not a.startswith("--")]
+    no_web = "--no-web" in args
+    repeat = next((int(a.split("=", 1)[1]) for a in args if a.startswith("--repeat=")), 1)
+
     rig = Rig(settings, out)
-    selected = [s for s in SCENARIOS if not filters or any(f in s.name for f in filters)]
+    selected = [s for s in SCENARIOS
+                if (not filters or any(f in s.name for f in filters))
+                and not (no_web and s.name.startswith("web_"))]
     results = []
-    for sc in selected:
-        print(f"\n===== {sc.name} =====", flush=True)
-        r = await rig.run(sc.name, sc.speeches, MEMBERS, between=sc.between)
+    scenarios = {}
+    runs = [(sc, rep) for rep in range(repeat) for sc in selected]
+    for sc, rep in runs:
+        run_name = sc.name if repeat == 1 else f"{sc.name}-r{rep + 1}"
+        scenarios[run_name] = sc
+        print(f"\n===== {run_name} =====", flush=True)
+        r = await rig.run(run_name, sc.speeches, MEMBERS, between=sc.between)
         checks = list(sc.checks) + ([no_error, tts_fidelity, no_tags_or_urls_spoken] if sc.answers else [])
         for check in checks:
             try:
@@ -383,13 +465,15 @@ async def main(filters: list[str]) -> int:
         print(f"  -> {'PASS' if all(c[1] for c in r.checks) else 'FAIL'} {r.metrics}", flush=True)
 
     sweep = None
-    if not filters or "sweep" in filters:
+    if not args or "sweep" in filters:
         sweep = await wake_sweep(rig, settings.wake_word_confidence)
+    if rig.tts is not None:
+        await rig.tts.close()
 
-    scenarios = {s.name: s for s in SCENARIOS}
     render_report(results, scenarios, sweep, settings.wake_word_confidence, out)
     (out / "results.json").write_text(
-        json.dumps({"scenarios": [to_json(r) for r in results], "wake_sweep": sweep}, indent=2),
+        json.dumps({"scenarios": [to_json(r) for r in results], "wake_sweep": sweep}, indent=2,
+                   default=float),
         encoding="utf-8")
     print(f"\nReport: {out / 'report.md'}")
     failed = [r.name for r in results

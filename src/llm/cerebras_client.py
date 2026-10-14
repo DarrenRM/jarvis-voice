@@ -15,6 +15,8 @@ from .chat_orchestrator import ToolCall, TurnResult
 logger = logging.getLogger(__name__)
 
 CEREBRAS_BASE_URL = "https://api.cerebras.ai/v1"
+# Longest silence allowed between stream chunks before the turn is abandoned
+STREAM_STALL_SECONDS = 15.0
 
 
 class CerebrasClient:
@@ -40,6 +42,7 @@ class CerebrasClient:
             timeout: Request timeout in seconds
             base_url: API base URL
         """
+        import httpx
         from openai import AsyncOpenAI
 
         self.model = model
@@ -48,7 +51,10 @@ class CerebrasClient:
         self._client = AsyncOpenAI(
             api_key=api_key,
             base_url=base_url,
-            timeout=timeout,
+            # A turn normally streams continuously (reasoning included) and ends in
+            # under 5s. A stream that stalls after its headers must fail fast so the
+            # user hears the error reply instead of silence.
+            timeout=httpx.Timeout(timeout, connect=5.0, read=min(timeout, STREAM_STALL_SECONDS)),
             max_retries=2,
         )
 

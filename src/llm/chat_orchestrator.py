@@ -29,6 +29,12 @@ GRACEFUL_FAILURE_REPLY = (
     "[surprised] I couldn't find a good answer. Could you try asking differently?"
 )
 
+# Text before a tool call is filler ("Let me check that...") that the thinking
+# phrase already covers. Short text is held until the turn ends (Cerebras
+# finishes a turn ~30-70ms after its first text) and dropped if tool calls
+# follow; anything longer is a real answer and streams straight away.
+HOLD_PRE_TOOL_CHARS = 150
+
 
 @dataclass
 class ToolCall:
@@ -121,23 +127,37 @@ class ChatOrchestrator:
             logger.debug(f"Orchestrator turn {turn + 1}/{self._max_turns}")
 
             result: Optional[TurnResult] = None
+            held: list[str] = []
+            streaming = False  # True once text is long enough to be a real answer
             try:
                 async for event in self._llm.stream_turn(messages, tools):
                     if isinstance(event, TurnResult):
                         result = event
-                    else:
+                    elif streaming:
                         yield event
+                    else:
+                        held.append(event)
+                        if sum(len(h) for h in held) > HOLD_PRE_TOOL_CHARS:
+                            streaming = True
+                            yield "".join(held)
+                            held = []
             except Exception as e:
                 logger.error(f"LLM API error: {e}")
+                if held:
+                    yield "".join(held)
                 yield ERROR_REPLY
                 return
 
             if result is None:
                 logger.error("LLM stream ended without a result")
+                if held:
+                    yield "".join(held)
                 yield ERROR_REPLY
                 return
 
             if not result.has_tool_calls:
+                if held:
+                    yield "".join(held)
                 if not result.content.strip():
                     logger.warning(f"LLM returned no text (finish={result.finish_reason})")
                     yield GRACEFUL_FAILURE_REPLY
@@ -148,22 +168,26 @@ class ChatOrchestrator:
 
             logger.debug(f"Tool calls detected: {len(result.tool_calls)}")
 
-            # Flush any pre-tool sentence to TTS before the tool runs
-            if result.content.strip() and not result.content.endswith("\n"):
-                yield "\n"
+            if streaming:
+                # Flush the spoken pre-tool text to TTS before the tool runs
+                if not result.content.endswith("\n"):
+                    yield "\n"
+            elif result.content.strip():
+                logger.info(f"Not speaking pre-tool filler: {result.content.strip()[:80]!r}")
 
-            messages.append(self._build_assistant_tool_message(result))
+            # Unspoken filler is left out of history so it isn't imitated later
+            messages.append(self._build_assistant_tool_message(result, spoken=streaming))
             for tool_call in result.tool_calls:
                 await self._execute_tool(tool_call, messages)
 
         logger.warning(f"Max tool turns ({self._max_turns}) exhausted")
         yield GRACEFUL_FAILURE_REPLY
 
-    def _build_assistant_tool_message(self, result: TurnResult) -> dict:
+    def _build_assistant_tool_message(self, result: TurnResult, spoken: bool = True) -> dict:
         """Build assistant message with tool calls for history."""
         return {
             "role": "assistant",
-            "content": result.content.strip() or None,
+            "content": (result.content.strip() or None) if spoken else None,
             "tool_calls": [
                 {
                     "id": tc.id,

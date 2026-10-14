@@ -215,6 +215,11 @@ async def run_bot(settings: Settings, components: Optional[dict] = None) -> None
             logger.info("Closing bot gracefully...")
             # bot.close() is called by async context manager exit
 
+    # The TTS keeps one HTTP session open for the life of the bot
+    tts = (components or {}).get("tts")
+    if tts is not None:
+        await tts.close()
+
     logger.info("Bot shutdown complete")
 
 

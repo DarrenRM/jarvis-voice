@@ -161,6 +161,30 @@ _GARBAGE_REGEX = [re.compile(p, re.IGNORECASE) for p in GARBAGE_PATTERNS]
 MIN_CONTENT_LENGTH = 5
 
 
+_URL = re.compile(
+    r"(?:https?://|www\.)\S+"  # scheme or www links
+    r"|\b[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:com|org|net|gg|io|co|dev|app|wiki|tv)/\S*",  # domain/path
+    re.IGNORECASE,
+)
+
+
+def strip_urls_for_tts(text: str) -> str:
+    """Replace links with "the link" so they're never read aloud.
+
+    The prompt already says not to speak URLs; this is the backstop. Bare site
+    names without a path ("wiki.gg") are left alone since they're speakable.
+    """
+    def replace(match: re.Match) -> str:
+        url = match.group(0)
+        trail = ""
+        while url and url[-1] in ".,!?;:)]'\"":
+            trail = url[-1] + trail
+            url = url[:-1]
+        return "the link" + trail
+
+    return _URL.sub(replace, text)
+
+
 def _has_word_repetition(text: str, threshold: int = 4) -> bool:
     """Check if text has excessive word repetition.
 

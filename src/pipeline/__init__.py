@@ -9,7 +9,7 @@ from .transcription_stage import (
     TranscriptionStage,
 )
 from .tts_stage import TTSStage, TTSSynthesizerProtocol
-from .voice_pipeline import VoicePipeline
+from .voice_pipeline import OpeningPhrase, VoicePipeline
 
 __all__ = [
     "AudioPipeline",
@@ -22,5 +22,6 @@ __all__ = [
     "TranscriptionStage",
     "TTSStage",
     "TTSSynthesizerProtocol",
+    "OpeningPhrase",
     "VoicePipeline",
 ]

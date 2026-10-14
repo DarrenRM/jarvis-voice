@@ -64,7 +64,7 @@ class TestResponseStage:
 
     async def test_streams_response(self):
         stage, _ = make_stage()
-        assert await run(stage, "hello") == ["Hello ", "world!"]
+        assert "".join(await run(stage, "hello")) == "Hello world!"
 
     async def test_system_prompt_first_in_request(self):
         stage, llm = make_stage()

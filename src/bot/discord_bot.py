@@ -51,6 +51,9 @@ class ClaudeBot(commands.Bot):
         super().__init__(
             command_prefix="!",
             intents=intents,
+            # Text the model writes (or a spoken prompt injection) must never mass-ping:
+            # only direct user mentions (tag_user's <@id>) notify anyone.
+            allowed_mentions=discord.AllowedMentions(everyone=False, roles=False, users=True),
         )
 
         self.settings = settings

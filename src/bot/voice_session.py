@@ -5,6 +5,7 @@ for a single Discord voice channel.
 """
 
 import asyncio
+import contextlib
 import logging
 import random
 import re
@@ -20,6 +21,7 @@ from ..detection import VAD, SpeakingDetector
 from ..stt import GroqWhisperClient
 from ..llm import LLMService, create_llm_client
 from ..pipeline import (
+    OpeningPhrase,
     PipelineContext,
     ResponseStage,
     TranscriptionStage,
@@ -201,6 +203,7 @@ class VoiceSession:
 
         if self.tts is None:
             logger.info("Loading TTS...")
+            self._owns_tts = True
             self.tts = TTSSynthesizer(
                 model=self.settings.tts_model,
                 device=self.settings.tts_device,
@@ -402,6 +405,10 @@ class VoiceSession:
         if self._tts_tasks:
             await asyncio.gather(*self._tts_tasks, return_exceptions=True)
             self._tts_tasks.clear()
+
+        # A shared TTS is closed by its owner (main); close one made here
+        if getattr(self, "_owns_tts", False) and self.tts is not None:
+            await self.tts.close()
 
         # Stop recording (may fail if socket already dead, that's OK)
         if self.voice_client:
@@ -693,7 +700,7 @@ class VoiceSession:
             t0 = time.perf_counter()
             ack_phrase = get_random_ack()
             self._ack_played = True  # Mark early - prevents race with fast transcription
-            ack_audio = await self.tts.synthesize(ack_phrase)
+            ack_audio = await self.tts.synthesize_cached(ack_phrase)
             synth_time = time.perf_counter() - t0
             logger.info(f"[TIMING] Ack TTS '{ack_phrase}': {synth_time:.2f}s")
 
@@ -717,13 +724,21 @@ class VoiceSession:
         except Exception as e:
             logger.warning(f"Failed to play acknowledgment: {e}")
 
-    async def _handle_wake_word_only(self):
+    async def _handle_wake_word_only(self, opening: Optional[OpeningPhrase] = None):
         """Handle case where user only said the wake word.
 
         Plays acknowledgment (if not already played) and listens for follow-up question.
         If user asks something, processes it. If silence, returns to idle.
+
+        Args:
+            opening: Phrase started at speech end; if already audible it serves as the ack
         """
         try:
+            # The affirmation started at speech end may already be playing; let it
+            # stand in for the ack rather than talking over it
+            opening_heard = (opening is not None and not opening.cancel_if_not_playing()
+                             and opening.playing)
+
             # Check how long we were listening - if ack played and user had time to respond, skip follow-up
             listen_duration = time.perf_counter() - self._listen_start
             if self._ack_played and listen_duration > 5.0:
@@ -731,12 +746,16 @@ class VoiceSession:
                 self.state = "idle"
                 return
 
+            if opening_heard:
+                logger.info("[WAKE-ONLY] Opening phrase already playing, using it as the ack")
+                with contextlib.suppress(asyncio.CancelledError):
+                    await opening.wait()
             # Only play ack if one isn't already in progress
             # (_ack_played is set early in _play_ack to prevent race conditions)
-            if not self._ack_played:
+            elif not self._ack_played:
                 ack_phrase = get_random_ack()
                 logger.info(f"[WAKE-ONLY] Playing ack: '{ack_phrase}'")
-                ack_audio = await self.tts.synthesize(ack_phrase)
+                ack_audio = await self.tts.synthesize_cached(ack_phrase)
                 if len(ack_audio) > 0:
                     await self._play_audio(ack_audio)
             else:
@@ -811,7 +830,7 @@ class VoiceSession:
         try:
             t0 = time.perf_counter()
             logger.info(f"[TIMING] Synthesizing thinking phrase: '{phrase}'")
-            thinking_audio = await self.tts.synthesize(phrase)
+            thinking_audio = await self.tts.synthesize_cached(phrase)
             thinking_synth_time = time.perf_counter() - t0
             logger.info(f"[TIMING] Thinking phrase TTS: {thinking_synth_time:.2f}s")
 
@@ -1091,45 +1110,27 @@ class VoiceSession:
             speaker_activity=self._current_speaker_activity,
         )
 
-        # Determine if we should play thinking phrase
-        # Skip if someone is still talking
-        should_play_thinking = True
-        if self.settings.speaking_detection_enabled:
-            silence = await self._wait_for_silence(max_wait=3.0, use_debounce=False)
-            if not silence:
-                logger.info("[PIPELINE] Skipping thinking phrase - someone still speaking")
-                should_play_thinking = False
+        # Opening phrase: dynamic mode says the affirmation ("Sure, {name}...") and
+        # the generator adds a content phrase later; static mode says a full
+        # thinking phrase. Either starts now, while transcription runs, unless
+        # someone is still talking.
+        thinking_generator: Optional[ThinkingPhraseGenerator] = self._thinking_generator
+        if thinking_generator:
+            opening_text = get_affirmation_phrase(self._current_speaker_name)
+        else:
+            opening_text = get_thinking_phrase(self._current_speaker_name)
 
-        # Prepare thinking phrase arguments
-        thinking_phrase: Optional[str] = None
-        thinking_audio: Optional[np.ndarray] = None
-        thinking_generator: Optional[ThinkingPhraseGenerator] = None
-        affirmation_audio: Optional[np.ndarray] = None
+        async def room_is_quiet() -> bool:
+            if not self.settings.speaking_detection_enabled:
+                return True
+            return await self._wait_for_silence(max_wait=3.0, use_debounce=False)
 
-        if should_play_thinking:
-            if self._thinking_generator:
-                # Dynamic mode: pre-synth affirmation, generator creates content phrase
-                thinking_generator = self._thinking_generator
-
-                # Pre-synthesize affirmation ("Sure, {name}...") for immediate playback
-                affirmation_text = get_affirmation_phrase(self._current_speaker_name)
-                try:
-                    affirmation_audio = await self.tts.synthesize(affirmation_text)
-                    logger.debug(f"[PIPELINE] Pre-synthesized affirmation: {affirmation_text}")
-                except Exception as e:
-                    logger.warning(f"[PIPELINE] Failed to synthesize affirmation: {e}")
-                    affirmation_audio = None
-
-                logger.debug("[PIPELINE] Using dynamic thinking phrase generation")
-            else:
-                # Static mode: pre-synthesize full phrase before transcription
-                thinking_phrase = get_thinking_phrase(self._current_speaker_name)
-                try:
-                    thinking_audio = await self.tts.synthesize(thinking_phrase)
-                    logger.debug(f"[PIPELINE] Pre-synthesized static thinking: {thinking_phrase}")
-                except Exception as e:
-                    logger.warning(f"[PIPELINE] Failed to synthesize thinking phrase: {e}")
-                    thinking_audio = None
+        opening = OpeningPhrase(
+            synthesize=lambda: self.tts.synthesize_cached(opening_text),
+            play_audio=self._play_audio,
+            should_play=room_is_quiet,
+        )
+        logger.debug(f"[PIPELINE] Opening phrase started: {opening_text}")
 
         # Run the pipeline
         result = await self._voice_pipeline.process(
@@ -1137,17 +1138,16 @@ class VoiceSession:
             context=context,
             play_audio=self._play_audio,
             wait_for_silence=lambda: self._wait_for_silence(max_wait=3.0, use_debounce=True),
-            thinking_phrase=thinking_phrase,
-            thinking_audio=thinking_audio,
+            thinking_phrase=None if thinking_generator else opening_text,
             thinking_generator=thinking_generator,
             tts_synthesizer=self.tts if thinking_generator else None,
-            affirmation_audio=affirmation_audio,
+            opening=opening,
         )
 
         # Handle special results
         if result == "wake_word_only":
             logger.info("[PIPELINE] Wake word only detected - triggering follow-up flow")
-            await self._handle_wake_word_only()
+            await self._handle_wake_word_only(opening)
         elif result == "cancelled":
             logger.info("[PIPELINE] Processing was cancelled")
         elif result == "empty":

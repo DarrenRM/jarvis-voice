@@ -11,7 +11,7 @@ import pytest
 
 from src.pipeline.base import PipelineContext
 from src.pipeline.transcription_stage import TranscriptionResult
-from src.pipeline.voice_pipeline import VoicePipeline
+from src.pipeline.voice_pipeline import OpeningPhrase, VoicePipeline
 
 
 def make_audio(samples: int = 1000) -> np.ndarray:
@@ -393,3 +393,123 @@ class TestEdgeCases:
 
         # Pipeline continues after thinking phrase error
         # (result depends on whether response playback also fails)
+
+
+class TestOpeningPhrase:
+    """Opening phrase (affirmation) starts at speech end, before transcription finishes."""
+
+    @staticmethod
+    def make_opening(play_audio, audio_len=100, should_play=None, gate=None):
+        async def synthesize():
+            if gate is not None:
+                await gate.wait()
+            return make_audio(audio_len)
+
+        return OpeningPhrase(synthesize, play_audio, should_play)
+
+    @pytest.mark.asyncio
+    async def test_plays_while_transcription_runs(
+        self, pipeline, mock_transcription, context, wait_for_silence
+    ):
+        events = []
+        transcribe_release = asyncio.Event()
+
+        async def slow_transcribe(audio, ctx):
+            events.append("stt_start")
+            await transcribe_release.wait()
+            events.append("stt_done")
+            return TranscriptionResult(text="hello world", raw_text="hey jarvis hello world")
+
+        mock_transcription.process = slow_transcribe
+
+        async def play(audio):
+            events.append("opening" if len(audio) == 100 else "response")
+            if len(audio) == 100:
+                transcribe_release.set()
+
+        opening = self.make_opening(play)
+        await pipeline.process(
+            audio=make_audio(), context=context, play_audio=play,
+            wait_for_silence=wait_for_silence, opening=opening,
+        )
+        assert events.index("opening") < events.index("stt_done")
+        assert events.index("opening") < events.index("response")
+
+    @pytest.mark.asyncio
+    async def test_dynamic_phrase_follows_opening(self, pipeline, context, wait_for_silence):
+        order = []
+
+        async def play(audio):
+            order.append({100: "opening", 50: "dynamic"}.get(len(audio), "response"))
+
+        generator = MagicMock()
+        generator.generate = AsyncMock(return_value="Checking the weather")
+        tts = MagicMock()
+        tts.synthesize = AsyncMock(return_value=make_audio(50))
+
+        opening = self.make_opening(play)
+        await pipeline.process(
+            audio=make_audio(), context=context, play_audio=play,
+            wait_for_silence=wait_for_silence, thinking_generator=generator,
+            tts_synthesizer=tts, opening=opening,
+        )
+        assert order[:2] == ["opening", "dynamic"]
+        assert "response" in order[2:]
+
+    @pytest.mark.asyncio
+    async def test_skipped_opening_skips_dynamic_phrase(self, pipeline, context, wait_for_silence):
+        order = []
+
+        async def play(audio):
+            order.append({100: "opening", 50: "dynamic"}.get(len(audio), "response"))
+
+        generator = MagicMock()
+        generator.generate = AsyncMock(return_value="Checking the weather")
+        tts = MagicMock()
+        tts.synthesize = AsyncMock(return_value=make_audio(50))
+
+        opening = self.make_opening(play, should_play=AsyncMock(return_value=False))
+        await pipeline.process(
+            audio=make_audio(), context=context, play_audio=play,
+            wait_for_silence=wait_for_silence, thinking_generator=generator,
+            tts_synthesizer=tts, opening=opening,
+        )
+        assert opening.skipped
+        assert "opening" not in order and "dynamic" not in order
+        assert "response" in order
+
+    @pytest.mark.asyncio
+    async def test_empty_transcription_cancels_unstarted_opening(
+        self, pipeline, mock_transcription, context, play_audio, wait_for_silence
+    ):
+        mock_transcription.process.return_value = TranscriptionResult.empty()
+        gate = asyncio.Event()
+        opening = self.make_opening(play_audio, gate=gate)
+
+        result = await pipeline.process(
+            audio=make_audio(), context=context, play_audio=play_audio,
+            wait_for_silence=wait_for_silence, opening=opening,
+        )
+        gate.set()
+        await asyncio.sleep(0)
+        assert result == "empty"
+        assert play_audio.played == []
+
+    @pytest.mark.asyncio
+    async def test_static_response_waits_for_opening(self, pipeline, context, wait_for_silence):
+        opening_finished = False
+
+        async def play(audio):
+            nonlocal opening_finished
+            if len(audio) == 100:
+                await asyncio.sleep(0.05)
+                opening_finished = True
+            else:
+                assert opening_finished, "Response started before opening finished"
+
+        opening = self.make_opening(play)
+        await pipeline.process(
+            audio=make_audio(), context=context, play_audio=play,
+            wait_for_silence=wait_for_silence, thinking_phrase="One moment...", opening=opening,
+        )
+        assert opening_finished

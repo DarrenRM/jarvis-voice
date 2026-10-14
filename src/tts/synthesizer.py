@@ -2,16 +2,40 @@
 
 import asyncio
 import base64
+import contextlib
 import logging
 import os
+import re
 import time
+from collections import OrderedDict
 from typing import AsyncIterator, Optional
 import numpy as np
 
 from ..audio import SAMPLE_RATE_TTS
-from .text_filter import normalize_numbers_for_tts
+from .text_filter import normalize_numbers_for_tts, strip_urls_for_tts
 
 logger = logging.getLogger(__name__)
+
+# Repeat guard: Inworld occasionally speaks a sentence twice in one clip. A clip
+# far longer than its text should take is synthesized again (shorter one kept).
+# Calibrated on e2e captures: normal speech ~16 chars/s, short phrases carry fixed
+# overhead, non-verbal tags add time; the observed repeat was ~2.2x expected.
+_CHARS_PER_SECOND = 16.0
+_REPEAT_FACTOR = 1.7
+_REPEAT_SLACK_S = 0.9
+_NONVERBAL_TAG_S = 0.8
+_NONVERBAL_TAGS = re.compile(r"\[(sigh|laugh|laughing|breathe|cough|clear_throat|yawn)\]", re.IGNORECASE)
+_ANY_TAG = re.compile(r"\[[a-z_ ]+\]", re.IGNORECASE)
+
+# Short fixed phrases (acks, affirmations) are cached so they play instantly
+_PHRASE_CACHE_SIZE = 64
+
+
+def _max_plausible_seconds(text: str, speed: float) -> float:
+    spoken = _ANY_TAG.sub("", text)
+    expected = len(spoken.strip()) / _CHARS_PER_SECOND / max(speed, 0.5)
+    expected += _NONVERBAL_TAG_S * len(_NONVERBAL_TAGS.findall(text))
+    return _REPEAT_FACTOR * expected + _REPEAT_SLACK_S
 
 
 class TTSSynthesizer:
@@ -62,6 +86,11 @@ class TTSSynthesizer:
         self._tts_type = None
         self._setup_tts()
 
+        # One HTTP session reused across requests (saves a TLS handshake per clip)
+        self._session = None
+        self._session_loop = None
+        self._phrase_cache: "OrderedDict[str, np.ndarray]" = OrderedDict()
+
     def _setup_tts(self) -> None:
         """Set up TTS engine."""
         if not self.api_key:
@@ -93,14 +122,53 @@ class TTSSynthesizer:
             logger.error("TTS not available - check INWORLD_API_KEY")
             return np.array([], dtype=np.float32)
 
-        # Normalize numbers to words for better pronunciation
-        text = normalize_numbers_for_tts(text)
+        # Never read links aloud; normalize numbers to words for better pronunciation
+        text = normalize_numbers_for_tts(strip_urls_for_tts(text))
 
-        return await self._synthesize_inworld(text)
+        audio = await self._synthesize_inworld(text)
+        limit = _max_plausible_seconds(text, self.speed)
+        duration = len(audio) / self.sample_rate
+        if duration > limit:
+            logger.warning(
+                f"[TTS] Clip is {duration:.1f}s for {len(text)} chars (limit {limit:.1f}s), "
+                f"possible repeat - synthesizing again: {text[:60]!r}"
+            )
+            retry = await self._synthesize_inworld(text)
+            if 0 < len(retry) < len(audio):
+                audio = retry
+        return audio
+
+    async def synthesize_cached(self, text: str) -> np.ndarray:
+        """synthesize() for short fixed phrases (acks, affirmations); repeats are instant."""
+        cached = self._phrase_cache.get(text)
+        if cached is not None:
+            self._phrase_cache.move_to_end(text)
+            return cached
+        audio = await self.synthesize(text)
+        if len(audio) > 0:
+            self._phrase_cache[text] = audio
+            if len(self._phrase_cache) > _PHRASE_CACHE_SIZE:
+                self._phrase_cache.popitem(last=False)
+        return audio
+
+    @contextlib.asynccontextmanager
+    async def _shared_session(self):
+        """Yield the reusable aiohttp session (recreated if closed or on a new loop)."""
+        import aiohttp
+
+        loop = asyncio.get_running_loop()
+        if self._session is None or self._session.closed or self._session_loop is not loop:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=None, connect=10, sock_read=15))
+            self._session_loop = loop
+        yield self._session
+
+    async def close(self) -> None:
+        if self._session is not None and not self._session.closed:
+            await self._session.close()
 
     async def _synthesize_inworld(self, text: str) -> np.ndarray:
         """Synthesize using Inworld TTS streaming API for lower latency."""
-        import aiohttp
         import json
 
         start_time = time.perf_counter()
@@ -136,7 +204,7 @@ class TTSSynthesizer:
         detected_format: Optional[str] = None
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with self._shared_session() as session:
                 async with session.post(url, json=payload, headers=headers) as response:
                     if response.status != 200:
                         error_text = await response.text()
@@ -226,10 +294,9 @@ class TTSSynthesizer:
             logger.error("TTS not available - check INWORLD_API_KEY")
             return
 
-        # Normalize numbers to words for better pronunciation
-        text = normalize_numbers_for_tts(text)
+        # Never read links aloud; normalize numbers to words for better pronunciation
+        text = normalize_numbers_for_tts(strip_urls_for_tts(text))
 
-        import aiohttp
         import json
 
         start_time = time.perf_counter()
@@ -260,7 +327,7 @@ class TTSSynthesizer:
         logger.info(f"[TTS-STREAM] Starting: {text[:80]}...")
 
         try:
-            async with aiohttp.ClientSession() as session:
+            async with self._shared_session() as session:
                 async with session.post(url, json=payload, headers=headers) as response:
                     if response.status != 200:
                         error_text = await response.text()

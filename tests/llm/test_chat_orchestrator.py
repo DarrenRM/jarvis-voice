@@ -13,6 +13,7 @@ from src.llm.chat_orchestrator import (
     DISCORD_ACTION_ACK_NOTE,
     ERROR_REPLY,
     GRACEFUL_FAILURE_REPLY,
+    HOLD_PRE_TOOL_CHARS,
     ChatOrchestrator,
     ToolCall,
     TurnOutcome,
@@ -96,9 +97,15 @@ def text_turn(*chunks):
 
 
 class TestPlainResponse:
-    async def test_streams_text_chunks(self):
+    async def test_short_answer_released_when_turn_ends(self):
         orch, _ = make_orchestrator([text_turn("Hello ", "world!")])
-        assert await collect(orch, base_messages()) == ["Hello ", "world!"]
+        assert await collect(orch, base_messages()) == ["Hello world!"]
+
+    async def test_long_answer_streams_without_waiting_for_turn_end(self):
+        first = "a" * (HOLD_PRE_TOOL_CHARS + 1)
+        orch, _ = make_orchestrator([text_turn("Hi. ", first, " more", " text.")])
+        chunks = await collect(orch, base_messages())
+        assert chunks == ["Hi. " + first, " more", " text."]
 
     async def test_single_llm_call_for_plain_answer(self):
         orch, llm = make_orchestrator([text_turn("Hi.")])
@@ -145,15 +152,28 @@ class TestToolLoop:
         await collect(orch, base_messages())
         assert [t["function"]["name"] for t in llm.requests[0]["tools"]] == ["echo"]
 
-    async def test_pre_tool_text_is_spoken_and_flushed(self):
+    async def test_short_pre_tool_filler_is_not_spoken_or_stored(self):
         orch, _ = make_orchestrator(
-            [tool_turn(ToolCall("c1", "echo", "{}"), content="On it."), text_turn("Done.")],
+            [tool_turn(ToolCall("c1", "echo", "{}"), content="Let me check."),
+             text_turn("Done.")],
             handlers=[EchoHandler()],
         )
         messages = base_messages()
         chunks = await collect(orch, messages)
-        assert chunks == ["On it.", "\n", "Done."]
-        assert messages[2]["content"] == "On it."
+        assert chunks == ["Done."]
+        assert messages[2]["content"] is None
+        assert messages[2]["tool_calls"][0]["id"] == "c1"
+
+    async def test_long_pre_tool_text_is_spoken_and_flushed(self):
+        long_text = "Sure. " + "x" * HOLD_PRE_TOOL_CHARS
+        orch, _ = make_orchestrator(
+            [tool_turn(ToolCall("c1", "echo", "{}"), content=long_text), text_turn("Done.")],
+            handlers=[EchoHandler()],
+        )
+        messages = base_messages()
+        chunks = await collect(orch, messages)
+        assert chunks == [long_text, "\n", "Done."]
+        assert messages[2]["content"] == long_text.strip()
 
     async def test_whitespace_pre_tool_text_stored_as_none(self):
         orch, _ = make_orchestrator(

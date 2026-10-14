@@ -1,8 +1,11 @@
 """Benchmark the voice LLM at each Cerebras reasoning level, plus web search latency.
 
-    .venv/Scripts/python scripts/e2e/bench_llm.py            # everything
-    .venv/Scripts/python scripts/e2e/bench_llm.py llm 3      # LLM only, 3 reps
+    .venv/Scripts/python scripts/e2e/bench_llm.py llm 3      # LLM only, 3 reps, no web
+    .venv/Scripts/python scripts/e2e/bench_llm.py llm 1 web  # include the web prompts
     .venv/Scripts/python scripts/e2e/bench_llm.py search     # ddgs backends only
+
+Web prompts are off by default: each one is a live search plus page reads per
+effort level and rep, which burns tokens and gets this IP throttled.
 
 LLM runs go through the real ResponseStage + tool loop + system prompt (text only,
 Discord actions faked). Writes reports/bench-<timestamp>/report.md and results.json.
@@ -51,10 +54,11 @@ PROMPTS = [
            "reasoning"),
     Prompt("letters", "how many r's are in the word strawberry?", has("three", "3"), "reasoning"),
     Prompt("chitchat", "how are you doing today?", lambda a, t: not t, "plain"),
-    Prompt("weather", "what's the weather in Chicago right now?",
-           lambda a, t: "web_search" in t and bool(re.search(r"\d", a)), "tool"),
+    # kind "web": live lookups, only run when asked for
+    Prompt("enshrouded", "how many people can play together in Enshrouded?",
+           lambda a, t: "web_search" in t and ("16" in a or "sixteen" in a.lower()), "web"),
     Prompt("post", "post pizza at eight in the chat", tool("post_to_chat"), "tool"),
-    Prompt("misheard", "what's the recipe for heavy dirts in dune awakening?", has("dart"), "tool"),
+    Prompt("misheard", "what's the recipe for heavy dirts in dune awakening?", has("dart"), "web"),
 ]
 
 
@@ -86,7 +90,7 @@ def format_issues(answer: str) -> list[str]:
     return issues
 
 
-async def run_llm(settings, reps: int) -> list[dict]:
+async def run_llm(settings, reps: int, web: bool = False) -> list[dict]:
     from src.llm import create_llm_client
     from src.pipeline.base import PipelineContext
     from src.pipeline.response_stage import ResponseStage
@@ -107,6 +111,8 @@ async def run_llm(settings, reps: int) -> list[dict]:
         await svc.warm_up()
         for rep in range(reps):
             for p in PROMPTS:
+                if p.kind == "web" and not web:
+                    continue
                 stage = ResponseStage(svc.chat_orchestrator, svc.build_system_prompt)
                 log.turns.clear()
                 t0 = time.perf_counter()
@@ -190,7 +196,7 @@ def report(llm_rows, search_rows, out: Path):
             if not rs:
                 continue
             fs = [r["first_spoken_s"] for r in rs]
-            plain = [r["first_spoken_s"] for r in rs if r["kind"] != "tool"]
+            plain = [r["first_spoken_s"] for r in rs if r["kind"] not in ("tool", "web")]
             ttft = [t for r in rs for t in r["llm_ttft_s"]]
             issues = sum(bool(r["issues"]) for r in rs)
             lines.append(
@@ -241,7 +247,8 @@ async def main(args):
     logging.getLogger("src.llm.cerebras_client").setLevel(logging.INFO)
 
     search_rows = await run_search() if what in ("all", "search") else []
-    llm_rows = await run_llm(get_settings(), reps) if what in ("all", "llm") else []
+    llm_rows = (await run_llm(get_settings(), reps, web="web" in args)
+                if what in ("all", "llm") else [])
     (out / "results.json").write_text(json.dumps({"llm": llm_rows, "search": search_rows}, indent=2),
                                       encoding="utf-8")
     report(llm_rows, search_rows, out)
