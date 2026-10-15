@@ -8,7 +8,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -30,7 +30,10 @@ class SearchHit:
 
 
 class WebSearcher:
-    """Runs ddgs text searches off the event loop."""
+    """Web search: a hosted backend (TinyFish) when configured, else ddgs off the event loop.
+
+    If the hosted backend fails, the same search falls back to ddgs.
+    """
 
     def __init__(
         self,
@@ -40,7 +43,13 @@ class WebSearcher:
         cap: float = SEARCH_CAP_SECONDS,
         cache_ttl: float = CACHE_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        remote: Optional[Any] = None,
     ):
+        """
+        Args:
+            remote: Hosted backend with `async search(query, max_results)` (TinyFishClient)
+        """
+        self._remote = remote
         self._max_results = max_results
         self._timeout = timeout
         self._region = region
@@ -62,20 +71,34 @@ class WebSearcher:
             logger.info(f"Web search cache hit for {query!r}")
             return list(cached[1])
 
-        # The worker thread can't be killed; on timeout it finishes in the background
-        rows = await asyncio.wait_for(asyncio.to_thread(self._search_sync, query),
-                                      timeout=self._cap)
-        hits = [
-            SearchHit(
-                title=(row.get("title") or "").strip(),
-                url=(row.get("href") or row.get("url") or "").strip(),
-                snippet=(row.get("body") or "").strip(),
-            )
-            for row in rows
-            if row.get("href") or row.get("url")
-        ]
+        hits = await self._search_remote(query) if self._remote is not None else None
+        if hits is None:
+            # The worker thread can't be killed; on timeout it finishes in the background
+            rows = await asyncio.wait_for(asyncio.to_thread(self._search_sync, query),
+                                          timeout=self._cap)
+            hits = [
+                SearchHit(
+                    title=(row.get("title") or "").strip(),
+                    url=(row.get("href") or row.get("url") or "").strip(),
+                    snippet=(row.get("body") or "").strip(),
+                )
+                for row in rows
+                if row.get("href") or row.get("url")
+            ]
         if hits:
             self._remember(key, hits)
+        return hits
+
+    async def _search_remote(self, query: str) -> Optional[list[SearchHit]]:
+        """Hits from the hosted backend, or None to fall back to ddgs."""
+        started = time.monotonic()
+        try:
+            hits = await self._remote.search(query, self._max_results)
+        except Exception as e:
+            logger.warning(f"Hosted search failed ({e}), falling back to ddgs")
+            return None
+        logger.info(f"[TIMING] web_search hosted: {time.monotonic() - started:.2f}s "
+                    f"{len(hits)} hits")
         return hits
 
     def _remember(self, key: str, hits: list[SearchHit]) -> None:

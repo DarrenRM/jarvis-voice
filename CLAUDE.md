@@ -25,7 +25,9 @@ Known pre-existing test problems: `test_tts_stage.py::test_exclamation_splits` f
 - `src/llm/` - `cerebras_client.py` (streaming, reasoning stripped), `chat_orchestrator.py` (tool loop), `service.py`, `llm_factory.py`, `system_prompt_builder.py`
 - `src/pipeline/` - `response_stage.py` (history + speaker context), `tts_stage.py` (sentence splitting, pauses)
 - `src/tools/` - registry, executor, handlers (`web`, `discord`, `image`)
-- `src/web/` - ddgs metasearch and local page reader (httpx + Trafilatura, SSRF-guarded, parallel)
+- `src/web/` - TinyFish hosted search + page reading when `TINYFISH_API_KEY` is set (not
+  throttled by this IP); falls back per request to ddgs metasearch and the local page reader
+  (httpx + Trafilatura, SSRF-guarded, parallel). `WEB_BACKEND=local` forces the local path.
 - `src/detection/`, `src/stt/`, `src/tts/`, `src/session/`, `src/sink/` - voice path
 - `src/config.py` - all settings (pydantic-settings, read from `.env`)
 - `docs/project-reference.md` - timing constants and voice-path details (its LLM/search

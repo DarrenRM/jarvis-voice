@@ -17,7 +17,7 @@ import logging
 import socket
 import time
 from dataclasses import dataclass
-from typing import Awaitable, Callable, Optional
+from typing import Any, Awaitable, Callable, Optional
 
 import httpx
 
@@ -66,13 +66,17 @@ class PageReader:
         max_chars: int = 15000,
         resolver: Optional[Resolver] = None,
         transport: Optional[httpx.AsyncBaseTransport] = None,
+        remote: Optional[Any] = None,
     ):
         """
         Args:
             max_chars: Extracted text longer than this is cut
             resolver: DNS lookup override (tests)
             transport: httpx transport override (tests)
+            remote: Hosted reader with `async fetch(url) -> (final_url, title, text)`
+                (TinyFishClient); pages it can't read are fetched locally instead
         """
+        self._remote = remote
         self._max_chars = max_chars
         self._resolve = resolver or _system_resolver
         self._transport = transport
@@ -83,6 +87,20 @@ class PageReader:
         Raises:
             WebReadError: with a message telling the model what to try next
         """
+        if self._remote is not None:
+            await self._check_url(url)
+            started = time.monotonic()
+            try:
+                final_url, title, text = await self._remote.fetch(url)
+            except Exception as e:
+                logger.warning(f"Hosted page read failed ({e}), reading locally: {url}")
+            else:
+                logger.info(f"[TIMING] web_extract hosted: {time.monotonic() - started:.2f}s "
+                            f"{len(text)} chars {final_url}")
+                if text:
+                    return self._page(final_url, title, text)
+                logger.info(f"Hosted read returned no text, reading locally: {url}")
+
         try:
             async with asyncio.timeout(TOTAL_BUDGET):
                 final_url, mime, source = await self._fetch(url)
@@ -107,7 +125,9 @@ class PageReader:
                 "No readable text on that page (it probably needs JavaScript). "
                 "Try another result or answer from the search snippets."
             )
+        return self._page(final_url, title, text)
 
+    def _page(self, final_url: str, title: str, text: str) -> WebPage:
         truncated = len(text) > self._max_chars
         if truncated:
             text = text[: self._max_chars].rsplit(" ", 1)[0]

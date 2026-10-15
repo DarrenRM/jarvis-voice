@@ -46,10 +46,16 @@ def create_llm_client(
 
     web_searcher = page_reader = None
     if settings.web_tools_enabled:
-        from ..web import PageReader, WebSearcher
+        from ..web import PageReader, TinyFishClient, WebSearcher
 
-        web_searcher = WebSearcher(max_results=settings.web_search_max_results)
-        page_reader = PageReader(max_chars=settings.web_extract_max_chars)
+        remote = None
+        if settings.web_backend != "local" and settings.tinyfish_api_key:
+            logger.info("Web lookup via TinyFish (falls back to ddgs + local reader)")
+            remote = TinyFishClient(settings.tinyfish_api_key)
+        elif settings.web_backend == "tinyfish":
+            logger.warning("WEB_BACKEND=tinyfish but TINYFISH_API_KEY not set, using local web lookup")
+        web_searcher = WebSearcher(max_results=settings.web_search_max_results, remote=remote)
+        page_reader = PageReader(max_chars=settings.web_extract_max_chars, remote=remote)
 
     tool_registry = create_tool_registry(
         image_service=image_service,

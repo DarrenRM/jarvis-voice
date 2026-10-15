@@ -50,8 +50,12 @@ class Settings(BaseSettings):
     # Voice conversation history kept per session (oldest whole exchanges dropped first)
     llm_history_max_messages: int = Field(default=60, alias="LLM_HISTORY_MAX_MESSAGES")
 
-    # Web lookup: ddgs metasearch + local page reader (no keys, no hosted services)
+    # Web lookup. Backend "auto" uses TinyFish (hosted search + page reading, free tier)
+    # when TINYFISH_API_KEY is set, else local ddgs metasearch + Trafilatura reader.
+    # "local" forces the local path. TinyFish failures fall back to local per request.
     web_tools_enabled: bool = Field(default=True, alias="WEB_TOOLS_ENABLED")
+    web_backend: str = Field(default="auto", alias="WEB_BACKEND")
+    tinyfish_api_key: Optional[str] = Field(default=None, alias="TINYFISH_API_KEY")
     web_search_max_results: int = Field(default=5, alias="WEB_SEARCH_MAX_RESULTS")
     # Text handed to the model per page is cut at this length
     web_extract_max_chars: int = Field(default=15000, alias="WEB_EXTRACT_MAX_CHARS")
