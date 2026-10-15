@@ -91,10 +91,6 @@ LOG_RULES = (
      re.compile(r"\[CARRY-ON\] .*kept talking"),
      "The speaker paused long enough that the bot took the question as finished, then kept "
      "talking; the bot started over with everything they said."),
-    ("talked_during_answer", "Speaker talked during the answer",
-     re.compile(r"\[CARRY-ON\] .*talked during the answer"),
-     "The speaker talked while the bot was answering; it was kept for their follow-up "
-     "(or it was the bot's own voice coming back through their mic)."),
 )
 # Explain error/graceful-failure replies rather than being posted separately
 _LLM_EVENTS = re.compile(r"LLM API error|LLM stream ended without a result|LLM returned no text|"

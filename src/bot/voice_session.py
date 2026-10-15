@@ -1260,6 +1260,7 @@ class VoiceSession:
             speaker_id=self._current_speaker_id,
             speaker_name=self._current_speaker_name,
             speaker_activity=self._current_speaker_activity,
+            channel_activities=self._channel_activities(),
         )
 
         # Opening phrase: dynamic mode says the affirmation ("Sure, {name}...") and
@@ -1313,9 +1314,10 @@ class VoiceSession:
         if self.turn_observer:
             self.turn_observer.pipeline_result(result)
         if (result is None and self.sink is not None
-                and self.sink.captured_speech() >= CARRY_ON_MIN_SPEECH_SECONDS
-                and await self._speech_confirmed(while_bot_quiet=False)):
-            logger.warning(
+                and self.sink.captured_speech() >= CARRY_ON_MIN_SPEECH_SECONDS):
+            # Not a problem by itself (often "yeah" while listening): the follow-up
+            # judge decides whether it needs a reply, so the monitor doesn't post it
+            logger.info(
                 f"[CARRY-ON] {self._current_speaker_name} talked during the answer "
                 f"({self.sink.captured_speech():.1f}s); keeping it for their follow-up"
             )
@@ -1376,6 +1378,18 @@ class VoiceSession:
             self.voice_client.stop()
         self._carry_on_audio = await self._hear_the_rest(speaker, said)
         return True
+
+    def _channel_activities(self) -> list[str]:
+        """What the others in the voice channel are doing (for the game notes)."""
+        manager = getattr(self, "speaker_manager", None)
+        if manager is None:
+            return []
+        try:
+            return manager.channel_activities(getattr(self.voice_client, "channel", None),
+                                              self._current_speaker_id)
+        except Exception as e:
+            logger.debug(f"Could not read channel activities: {e}")
+            return []
 
     async def _speech_confirmed(self, while_bot_quiet: bool) -> bool:
         """The capture holds at least CARRY_ON_MIN_SPEECH_SECONDS of speech by Silero.

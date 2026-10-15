@@ -24,7 +24,7 @@ import re
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Optional, Sequence
 
 logger = logging.getLogger(__name__)
 
@@ -97,12 +97,17 @@ class GameNotes:
         """Misheard game name -> real name, for the transcription stage."""
         return {wrong: notes.game for notes in self.sets for wrong in notes.misheard}
 
-    def prompt_block(self, text: str, activity: Optional[str]) -> str:
-        """Notes for games in play this turn ("" if none)."""
+    def prompt_block(self, text: str, activity: Optional[str],
+                     channel_activities: Sequence[str] = ()) -> str:
+        """Notes for games in play this turn ("" if none). channel_activities: what the
+        others in the voice channel are doing (a friend playing it counts too: not
+        everyone shows their game on Discord)."""
         now = self._clock()
         blocks = []
         for notes in self.sets:
             why = ("playing it" if activity and notes.mentioned_in(activity)
+                   else "someone in the channel is playing it"
+                   if any(notes.mentioned_in(a) for a in channel_activities if a)
                    else "named" if notes.mentioned_in(text)
                    else "came up recently"
                    if now - self._last_seen.get(notes.game, -1e9) < STICKY_SECONDS

@@ -181,11 +181,13 @@ class TestLogEvents:
         turn = good_turn(events=[event(message, "WARNING", "src.bot.voice_session")])
         assert detectors(turn) == ["cut_off"]
 
-    def test_talked_during_answer(self):
+    def test_talked_during_answer_is_not_posted(self):
+        # Owner, 2026-10-15: "yeah" while the bot talks is normal; the follow-up
+        # judge decides if it needed a reply
         message = ("[CARRY-ON] Sam talked during the answer (1.2s); "
                    "keeping it for their follow-up")
-        turn = good_turn(events=[event(message, "WARNING", "src.bot.voice_session")])
-        assert detectors(turn) == ["talked_during_answer"]
+        turn = good_turn(events=[event(message, "INFO", "src.bot.voice_session")])
+        assert detectors(turn) == []
 
     def test_unexpected_error(self):
         turn = good_turn(events=[event("Something odd broke", logger="src.bot.voice_session")])

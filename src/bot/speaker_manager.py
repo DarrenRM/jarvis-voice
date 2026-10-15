@@ -114,6 +114,17 @@ class SpeakerManager:
 
         return None
 
+    def channel_activities(self, channel, exclude_id: Optional[int] = None) -> list[str]:
+        """Activities of the people in a voice channel (bots and exclude_id left out)."""
+        out = []
+        for member in getattr(channel, "members", None) or []:
+            if getattr(member, "bot", False) or getattr(member, "id", None) == exclude_id:
+                continue
+            activity = self._get_activity(member)
+            if activity:
+                out.append(activity)
+        return out
+
     def _get_activity(self, member: discord.Member) -> Optional[str]:
         """Get member's current activity as string.
 

@@ -205,7 +205,8 @@ class ResponseStage(StreamingPipelineStage):
             prompt += f"\n\nThe user is currently: {context.speaker_activity}"
 
         if self._game_notes is not None:
-            notes = self._game_notes.prompt_block(text, context.speaker_activity)
+            notes = self._game_notes.prompt_block(text, context.speaker_activity,
+                                                  context.channel_activities)
             if notes:
                 prompt += "\n\n" + notes
 

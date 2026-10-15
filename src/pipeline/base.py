@@ -24,12 +24,14 @@ class PipelineContext:
         speaker_id: Discord user ID of the speaker (if known)
         speaker_name: Display name of the speaker (if known)
         speaker_activity: Current Discord activity (e.g., "playing Minecraft")
+        channel_activities: Activities of the others in the voice channel
         metadata: Additional context for extensibility
     """
 
     speaker_id: Optional[int] = None
     speaker_name: Optional[str] = None
     speaker_activity: Optional[str] = None
+    channel_activities: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def with_metadata(self, **kwargs) -> "PipelineContext":

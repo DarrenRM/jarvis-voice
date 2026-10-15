@@ -29,6 +29,17 @@ def test_playing_the_game(tmp_path):
     assert "notes are right" in block and "amounts from older" in block
 
 
+def test_someone_else_in_the_channel_playing(tmp_path):
+    """2026-10-15: Pat shows no game on Discord; Darren was playing Enshrouded."""
+    notes, _ = make_notes(tmp_path)
+    assert notes.prompt_block("where are the necromancy skills?", None,
+                              ["Listening Spotify", "Playing Enshrouded"])
+    (tmp_path / "fresh").mkdir()
+    notes, _ = make_notes(tmp_path / "fresh")  # no "came up recently"
+    assert notes.prompt_block("where are the necromancy skills?", None,
+                              ["Playing Valheim"]) == ""
+
+
 def test_named_even_misheard(tmp_path):
     notes, _ = make_notes(tmp_path)
     assert notes.prompt_block("max level in Enshrowded?", None)
