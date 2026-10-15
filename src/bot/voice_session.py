@@ -31,6 +31,7 @@ from ..pipeline import (
 from ..tts import TTSSynthesizer
 from .discord_service import DiscordService
 from .speaker_manager import SpeakerManager, SpeakerInfo
+from . import pycord_dave_patch
 from .voice_sink import StreamingSink
 from .voice_source import TTSAudioSource
 
@@ -357,10 +358,13 @@ class VoiceSession:
         # Start recording with the sink
         logger.info("Starting voice recording...")
 
-        # Define a dummy callback since pycord requires one
-        async def _recording_callback(sink: discord.sinks.Sink, *args):
-            logger.debug("Recording callback triggered")
+        # py-cord 2.8 calls this synchronously with the error (if any) when recording stops
+        def _recording_callback(*args):
+            logger.debug(f"Recording stopped: {args}")
 
+        # py-cord 2.8 no longer calls sink.init(); its decoder reads the voice client off the sink
+        self.sink.init(self.voice_client)
+        pycord_dave_patch.apply()
         self.voice_client.start_recording(self.sink, _recording_callback)
 
         # Clear any speaking state that might be set from joining

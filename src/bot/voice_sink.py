@@ -34,6 +34,17 @@ class StreamingSink(discord.sinks.Sink):
     - Emits callbacks for wake word and speech end events
     """
 
+    # py-cord 2.8's receive path (needed for Discord's DAVE encryption) expects these from a
+    # sink, but its own discord.sinks.Sink doesn't define them yet. No event listeners or
+    # child sinks; we want decoded PCM, not opus.
+    __sink_listeners__: tuple = ()
+
+    def walk_children(self, with_self: bool = False):
+        return [self] if with_self else []
+
+    def is_opus(self) -> bool:
+        return False
+
     def __init__(
         self,
         *,
@@ -353,9 +364,14 @@ class StreamingSink(discord.sinks.Sink):
         This is called by pycord for each audio packet received.
 
         Args:
-            data: Raw PCM audio bytes (48kHz stereo s16le)
+            data: Raw PCM audio bytes (48kHz stereo s16le), or py-cord 2.8's VoiceData
+                (PCM in .pcm)
             user: Discord user who sent the audio
         """
+        if not isinstance(data, (bytes, bytearray)) and hasattr(data, "pcm"):
+            data = data.pcm
+            if user is None:
+                return  # py-cord doesn't know whose audio this is yet (no SSRC mapping)
         # Track stats
         self._write_count += 1
         self._total_audio_bytes += len(data) if data else 0
