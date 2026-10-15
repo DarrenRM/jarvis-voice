@@ -125,6 +125,13 @@ def session_with(sink: StreamingSink) -> VoiceSession:
     session._voice_pipeline = FakePipeline()
     session.voice_client = None
     session._carry_on_audio = None
+    session.speech_checks = []
+
+    async def speech_confirmed(while_bot_quiet):  # the tones here stand in for speech
+        session.speech_checks.append(while_bot_quiet)
+        return True
+
+    session._speech_confirmed = speech_confirmed
     return session
 
 
@@ -162,6 +169,25 @@ class TestStartOver:
         process = asyncio.create_task(pipeline())
         assert not await session._carried_on(process, np.zeros(10, dtype=np.float32))
         assert sink.captured_speech() > 0.5  # kept for the follow-up window
+
+    async def test_clicks_do_not_start_over(self):
+        """2026-10-15: clicks through Pat's mic counted as 0.4s of speech (the speaking
+        detector holds each burst for 300ms); Silero found none, so no restart."""
+        sink = make_sink()
+        session = session_with(sink)
+
+        async def not_speech(while_bot_quiet):
+            session.speech_checks.append(while_bot_quiet)
+            return False
+
+        session._speech_confirmed = not_speech
+        loop = asyncio.get_running_loop()
+        loop.call_later(0.15, talk, sink, SPEAKER, 0.6)
+        process = asyncio.create_task(asyncio.sleep(1.2))
+        assert not await session._carried_on(process, np.zeros(10, dtype=np.float32))
+        assert not process.cancelled() and not session._voice_pipeline.cancelled
+        # Checked once it reached 0.4s, then only as it grew (0.6s: one more at most)
+        assert 1 <= len(session.speech_checks) <= 2 and all(session.speech_checks)
 
     async def test_nothing_more_said(self):
         sink = make_sink()

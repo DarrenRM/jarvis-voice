@@ -91,6 +91,22 @@ class VAD:
             logger.error(f"Failed to load Silero VAD: {e}")
             raise
 
+    def speech_seconds(self, audio: np.ndarray) -> Optional[float]:
+        """Seconds of speech in a whole clip, from a fresh model state (None if the
+        model isn't loaded). Resets this VAD before and after: use a separate instance
+        from the one following live audio."""
+        if self._model is None:
+            return None
+        self.reset()
+        try:
+            speech = 0
+            for i in range(0, len(audio) - self._chunk_size + 1, self._chunk_size):
+                is_speech, _ = self.process(audio[i:i + self._chunk_size])
+                speech += is_speech
+            return speech * self._chunk_size / self.sample_rate
+        finally:
+            self.reset()
+
     def reset(self) -> None:
         """Reset VAD state."""
         self._is_speech = False

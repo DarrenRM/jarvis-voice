@@ -135,6 +135,9 @@ class VoiceSession:
         self._wake_from_followup: Optional[int] = None
         # Everything the speaker said when a turn is started over (CARRY_ON)
         self._carry_on_audio: Optional[np.ndarray] = None
+        # Silero for checking captured speech (_speech_confirmed); loaded on first use
+        self._speech_check_vad: Optional[VAD] = None
+        self._speech_check_lock = asyncio.Lock()
         self._followup_others_talked = 0.0  # last follow-up window: others' talk, seconds
         self._late_reply_task: Optional[asyncio.Task] = None
 
@@ -1310,7 +1313,8 @@ class VoiceSession:
         if self.turn_observer:
             self.turn_observer.pipeline_result(result)
         if (result is None and self.sink is not None
-                and self.sink.captured_speech() >= CARRY_ON_MIN_SPEECH_SECONDS):
+                and self.sink.captured_speech() >= CARRY_ON_MIN_SPEECH_SECONDS
+                and await self._speech_confirmed(while_bot_quiet=False)):
             logger.warning(
                 f"[CARRY-ON] {self._current_speaker_name} talked during the answer "
                 f"({self.sink.captured_speech():.1f}s); keeping it for their follow-up"
@@ -1341,12 +1345,18 @@ class VoiceSession:
             await asyncio.wait({process})
             return False
         self.sink.start_capture(speaker)
+        checked = 0.0  # speaking detector's count at the last Silero check
         try:
             while not process.done():
                 await asyncio.wait({process}, timeout=0.1)
                 if process.done() or self._voice_pipeline.answer_started:
                     continue
-                if self.sink.captured_speech(while_bot_quiet=True) >= CARRY_ON_MIN_SPEECH_SECONDS:
+                voiced = self.sink.captured_speech(while_bot_quiet=True)
+                if voiced < max(CARRY_ON_MIN_SPEECH_SECONDS, checked + 0.2):
+                    continue
+                checked = voiced
+                if (await self._speech_confirmed(while_bot_quiet=True)
+                        and not process.done() and not self._voice_pipeline.answer_started):
                     break
             else:
                 return False
@@ -1365,6 +1375,28 @@ class VoiceSession:
         if self.voice_client and self.voice_client.is_playing():
             self.voice_client.stop()
         self._carry_on_audio = await self._hear_the_rest(speaker, said)
+        return True
+
+    async def _speech_confirmed(self, while_bot_quiet: bool) -> bool:
+        """The capture holds at least CARRY_ON_MIN_SPEECH_SECONDS of speech by Silero.
+        The speaking detector's count isn't enough on its own: clicks or game sounds
+        through someone's mic come in short bursts that it holds as speech for 300ms
+        each (2026-10-15: Pat's question restarted twice with no new words)."""
+        audio = self.sink.captured_audio(while_bot_quiet=while_bot_quiet)
+        async with self._speech_check_lock:
+            try:
+                if self._speech_check_vad is None:
+                    self._speech_check_vad = await asyncio.to_thread(VAD)
+                seconds = await asyncio.to_thread(self._speech_check_vad.speech_seconds, audio)
+            except Exception as e:
+                logger.warning(f"[CARRY-ON] Speech check failed, trusting the detector: {e}")
+                return True
+        if seconds is None:
+            return True  # no model: trust the speaking detector
+        if seconds < CARRY_ON_MIN_SPEECH_SECONDS:
+            logger.info(f"[CARRY-ON] Not speech ({seconds:.2f}s by VAD of "
+                        f"{len(audio) / SAMPLE_RATE_PROCESSING:.1f}s captured), ignoring")
+            return False
         return True
 
     async def _hear_the_rest(self, speaker_id: int, said: np.ndarray) -> np.ndarray:
@@ -1412,8 +1444,11 @@ class VoiceSession:
             if not self.sink.is_capturing(speaker_id, fold=False):
                 return  # a new turn started (wake word): not a missed reply
             said = self.sink.captured_speech(while_bot_quiet=True)
-            self.sink.stop_capture()
-            if said < CARRY_ON_MIN_SPEECH_SECONDS:
+            spoke = (said >= CARRY_ON_MIN_SPEECH_SECONDS
+                     and await self._speech_confirmed(while_bot_quiet=True))
+            if self.sink.is_capturing(speaker_id, fold=False):
+                self.sink.stop_capture()
+            if not spoke:
                 return
             note = (
                 f"{name} started talking within {LATE_REPLY_WATCH_SECONDS:.0f}s after the "

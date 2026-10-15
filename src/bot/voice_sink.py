@@ -142,6 +142,7 @@ class StreamingSink(discord.sinks.Sink):
         self._capture_user_id: Optional[int] = None
         self._capture_fold = True  # start_listening() for this speaker starts from it
         self._capture_buffer: list[np.ndarray] = []
+        self._capture_quiet_buffer: list[np.ndarray] = []  # only while the bot was silent
         self._capture_voiced = 0.0  # seconds of it that were speech
         self._capture_voiced_quiet = 0.0  # ...said while the bot wasn't playing anything
         self._capture_last_audio: Optional[float] = None
@@ -319,6 +320,7 @@ class StreamingSink(discord.sinks.Sink):
             self._capture_user_id = user_id
             self._capture_fold = fold
             self._capture_buffer = []
+            self._capture_quiet_buffer = []
             self._capture_voiced = 0.0
             self._capture_voiced_quiet = 0.0
             self._capture_last_audio = None
@@ -341,6 +343,13 @@ class StreamingSink(discord.sinks.Sink):
         which leaves out the bot's own voice echoing through someone's mic)."""
         with self._capture_lock:
             return self._capture_voiced_quiet if while_bot_quiet else self._capture_voiced
+
+    def captured_audio(self, while_bot_quiet: bool = False) -> np.ndarray:
+        """The audio captured so far (optionally only what came while the bot was silent),
+        for checking with a real VAD that it's speech and not clicks or game sounds."""
+        with self._capture_lock:
+            chunks = self._capture_quiet_buffer if while_bot_quiet else self._capture_buffer
+            return np.concatenate(chunks) if chunks else np.array([], dtype=np.float32)
 
     def _end_capture(
         self, user_id: Optional[int]
@@ -368,6 +377,10 @@ class StreamingSink(discord.sinks.Sink):
             self._capture_buffer.append(audio_16k.copy())
             if len(self._capture_buffer) > _CAPTURE_MAX_CHUNKS:
                 self._capture_buffer.pop(0)  # nobody took it; keep the newest only
+            if not bot_playing:
+                self._capture_quiet_buffer.append(self._capture_buffer[-1])
+                if len(self._capture_quiet_buffer) > _CAPTURE_MAX_CHUNKS:
+                    self._capture_quiet_buffer.pop(0)
             self._capture_last_audio = now
             if voiced:
                 self._capture_voiced += seconds

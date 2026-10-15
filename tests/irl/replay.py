@@ -192,6 +192,11 @@ def make_session(sink: StreamingSink, speaker: Speaker, settings: SimpleNamespac
     session._followup_open = False
     session._followup_others_talked = 0.0
     session._late_reply_task = None
+
+    async def speech_confirmed(while_bot_quiet):  # the replay's tones stand in for speech
+        return True
+
+    session._speech_confirmed = speech_confirmed
     return session
 
 
