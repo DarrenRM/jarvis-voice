@@ -30,6 +30,9 @@ class Thresholds:
     gap_s: float = 2.5  # silence between two answer sentences
     hang_s: float = 30.0  # no progress at all
     tts_wer: float = 0.4  # answer text vs Whisper of its audio (MONITOR_RETRANSCRIBE)
+    # The quiet the bot waits for before a question counts as over (MIN_SILENCE_MS). The
+    # limits above are measured from the end of it, not from the speaker's last word.
+    pause_s: float = 0.0
 
     @classmethod
     def from_settings(cls, settings) -> Thresholds:
@@ -39,6 +42,7 @@ class Thresholds:
             answer_web_s=settings.monitor_slow_answer_web_seconds,
             gap_s=settings.monitor_long_gap_seconds,
             hang_s=settings.monitor_hang_seconds,
+            pause_s=settings.min_silence_ms / 1000,
         )
 
 
@@ -83,6 +87,14 @@ LOG_RULES = (
     ("playback_error", "Playback error",
      re.compile(r"Playback error|\[PLAYBACK\] Error"),
      "Discord playback reported an error."),
+    ("cut_off", "Question was cut off",
+     re.compile(r"\[CARRY-ON\] .*kept talking"),
+     "The speaker paused long enough that the bot took the question as finished, then kept "
+     "talking; the bot started over with everything they said."),
+    ("talked_during_answer", "Speaker talked during the answer",
+     re.compile(r"\[CARRY-ON\] .*talked during the answer"),
+     "The speaker talked while the bot was answering; it was kept for their follow-up "
+     "(or it was the bot's own voice coming back through their mic)."),
 )
 # Explain error/graceful-failure replies rather than being posted separately
 _LLM_EVENTS = re.compile(r"LLM API error|LLM stream ended without a result|LLM returned no text|"
@@ -99,6 +111,8 @@ def detect(turn: tr.LiveTurn, th: Thresholds = Thresholds()) -> list[Finding]:
     """All findings for one turn, most important first."""
     if turn.outcome == tr.CANCELLED:
         return []
+    if turn.outcome == tr.LATE_REPLY:
+        return [Finding("late_reply", "Reply came after the window closed", turn.note)]
     if turn.outcome == tr.HUNG:
         return [Finding(
             "hang", "Bot went silent",
@@ -133,7 +147,7 @@ def detect(turn: tr.LiveTurn, th: Thresholds = Thresholds()) -> list[Finding]:
     elif turn.outcome == tr.ANSWERED:
         findings += _answer_findings(turn, th)
 
-    if turn.outcome not in (tr.WAKE_WORD_ONLY, tr.EMPTY):
+    if turn.outcome not in (tr.WAKE_WORD_ONLY, tr.EMPTY, tr.NOT_ADDRESSED):
         findings += _tool_findings(turn)
         if not turn.hang_reported:
             findings += _timing_findings(turn, th)
@@ -211,20 +225,23 @@ def _tool_findings(turn: tr.LiveTurn) -> list[Finding]:
 def _timing_findings(turn: tr.LiveTurn, th: Thresholds) -> list[Finding]:
     out = []
     first, answer = turn.first_audio_s, turn.answer_audio_s
+    pause = th.pause_s
+    # Times below count from the end of the pause that ends a question
+    note = f" ({pause:g}s of it is the pause that ends a question)" if pause else ""
     # When the affirmation was skipped (someone still talking) the answer is the
     # first sound, and only the answer threshold applies
     opening_played = bool(turn.clips) and not turn.clips[0].answer
-    if opening_played and first is not None and first > th.first_audio_s:
+    if opening_played and first is not None and first - pause > th.first_audio_s:
         out.append(Finding(
             "slow_first_audio", "Slow to respond",
-            f"The first sound came {first:.1f}s after they stopped talking "
-            f"(normally under 1s; limit {th.first_audio_s:g}s).",
+            f"The first sound came {first:.1f}s after they stopped talking{note} "
+            f"(normally under 1s after that; limit {th.first_audio_s:g}s).",
         ))
     limit = th.answer_web_s if turn.used_web else th.answer_s
-    if answer is not None and answer > limit:
+    if answer is not None and answer - pause > limit:
         out.append(Finding(
             "slow_answer", "Slow answer",
-            f"The answer started {answer:.1f}s after they stopped talking "
+            f"The answer started {answer:.1f}s after they stopped talking{note} "
             f"(limit {limit:g}s{' with a web lookup' if turn.used_web else ''}). {breakdown(turn)}",
             cause="web" if turn.used_web else "",
         ))

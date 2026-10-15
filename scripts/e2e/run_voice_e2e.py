@@ -4,7 +4,15 @@
     .venv/Scripts/python scripts/e2e/run_voice_e2e.py basic noisy  # name filter
     .venv/Scripts/python scripts/e2e/run_voice_e2e.py --no-web --repeat=3
 
+    .venv/Scripts/python scripts/e2e/run_voice_e2e.py --irl        # only the irl_* group
+    .venv/Scripts/python scripts/e2e/run_voice_e2e.py --irl --list # show, don't run
+
 --no-web skips the live web scenarios (web_*); --repeat=N runs each scenario N times.
+--irl runs only the irl_* scenarios (real interactions from the live bot, no web).
+--list prints the selected scenarios and exits (nothing is called or synthesized).
+--recordings[=DIR] adds one rec_* scenario per question clip the live bot saved in
+DIR/turns (DIR defaults to recordings/), played as recorded (see recording_scenarios),
+and adds DIR/wake clips to the wake word sweep (`--recordings sweep`: sweep only).
 --monitor runs each turn through the live monitor (src/monitor) and lists in the report
 what it would have posted to Discord (nothing is sent).
 --listen plays the run (people and bot) into the voice channel you're in, using the
@@ -30,10 +38,13 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 from scripts.e2e.harness import (  # noqa: E402
+    WEB_TOOLS,
     FakeMember,
+    Recording,
     RunResult,
     Speech,
     overlap,
+    read_sidecar,
     word_error_rate,
 )
 
@@ -44,7 +55,11 @@ TESTER = FakeMember(700000000000000001, "Tester")  # no game: answers stay gener
 BYSTANDER = FakeMember(700000000000000002, "Bystander")
 MORGAN = FakeMember(700000000000000003, "Morgan")
 RILEY = FakeMember(700000000000000004, "Riley", activity="Enshrouded")
-MEMBERS = [TESTER, BYSTANDER, MORGAN, RILEY]
+# The irl_* scenarios: real people, both "Playing Enshrouded" (so the 1.0 notes are in
+# the prompt, as they were live)
+DARREN = FakeMember(700000000000000005, "Darren", activity="Enshrouded")
+SAM = FakeMember(700000000000000006, "Sam", activity="Enshrouded")
+MEMBERS = [TESTER, BYSTANDER, MORGAN, RILEY, DARREN, SAM]
 
 
 # ---------------------------------------------------------------- checks
@@ -178,6 +193,36 @@ def heard_not(*words: str) -> Check:
     return check
 
 
+def heard_includes(*words: str, turn: int = 0) -> Check:
+    """The turn's transcript has every one of words (near-miss spellings allowed)."""
+    def check(r):
+        if len(r.turns) <= turn:
+            return False, "no turn recorded"
+        text = r.turns[turn].user_text.lower()
+        missing = [w for w in words if not _fuzzy_in(w, text)]
+        return not missing, f"heard {r.turns[turn].user_text!r}" + (
+            f" (missing: {missing})" if missing else "")
+    check.__name__ = f"heard_includes[{turn}]({'/'.join(words)})"
+    return check
+
+
+def no_web_lookup(r: RunResult) -> tuple[bool, str]:
+    """No web_search or web_extract call (scenarios with web_limit=0 never go online)."""
+    calls = [t for turn in r.turns for t in turn.tools if t in WEB_TOOLS]
+    return not calls, f"web calls={calls}"
+
+
+def talked_over_bot(speech: int) -> Check:
+    """Setup check: the speech started while the bot was still playing something."""
+    def check(r):
+        start = r.speeches[speech].started_at
+        playing = [s for s in r.segments if s.start <= start < s.end]
+        return bool(playing), (f"started {start:.2f}s, over {playing[0].transcript!r}"
+                               if playing else f"started {start:.2f}s, bot was quiet")
+    check.__name__ = f"talked_over_bot[{speech}]"
+    return check
+
+
 # Applied to every scenario that produces an answer
 
 
@@ -224,6 +269,31 @@ def asked_question(turn: int = 0) -> Check:
         answer = r.turns[turn].answer
         return is_question(re.sub(r"\[[^\]]*\]", "", answer)), f"answer {answer!r}"
     check.__name__ = f"bot_asked[{turn}]"
+    return check
+
+
+def plain_answer(turn: int = 0) -> Check:
+    """Setup check: the bot answered without asking anything back (the short window)."""
+    asked = asked_question(turn)
+
+    def check(r):
+        ok, detail = asked(r)
+        return (not ok and detail != "no turn recorded"), detail
+    check.__name__ = f"plain_answer[{turn}]"
+    return check
+
+
+def old_window_closed(speech: int, window: float) -> Check:
+    """Setup check: the speech started more than `window` seconds after the bot last
+    stopped talking, so the old fixed follow-up window would have closed."""
+    def check(r):
+        start = r.speeches[speech].started_at
+        before = [s.end for s in r.segments if s.end <= start]
+        if not before:
+            return False, "bot never spoke before it"
+        gap = start - max(before)
+        return gap > window, f"started {gap:.1f}s after the bot stopped"
+    check.__name__ = f"old_window_closed[{speech}]({window}s)"
     return check
 
 
@@ -276,6 +346,7 @@ class Scenario:
     between: Optional[float] = None
     note: str = ""
     expect_fail: bool = False  # known limitation: reported, not counted as a regression
+    web_limit: int | None = None  # web lookups allowed; past it the tool errors offline
 
 
 Q_CAPITAL = "what's the capital of Australia?"
@@ -456,24 +527,169 @@ SCENARIOS = [
 ]
 
 
+# ---------------------------------------------------------------- IRL scenarios
+# Real interactions from the live bot (2026-10-15, Darren and Sam playing Enshrouded
+# on 1.0 launch day), replayed with their real timing. Synthesized for now; swap a text
+# part for Recording("recordings/turns/<...>.wav") once the live bot saves the clips.
+# None of them may search: web_limit=0 blocks lookups offline, no_web_lookup flags them.
+
+DULUTH_Q = "What lake is Duluth, Minnesota on again? I always forget."
+TOOL_Q = "Hey Jarvis, what can I use instead of a hammer to hang a picture?"
+CUP_Q = "Hey Jarvis, how many ounces are in a cup?"
+CIRCLE_Q = "Hey Jarvis, what does the circle above an enemy mean in action games?"
+CIRCLE_FIX = ("No, I mean the circle above their head that looks like they're stunned, "
+              "they don't attack at all.")
+SOURDOUGH_Q = "Hey Jarvis, how does a sourdough starter work?"
+# A friend still in the fight while the bot waits for Darren (~9-10 s and ~5 s)
+SAM_LONG = ["Hang on, I'm still fighting this thing.", 0.4,
+               "It keeps doing that spin attack and I can't get behind it.", 0.5,
+               "Okay, okay, it's down. Let me grab the loot before we head back."]
+SAM_SHORT = ["Wait, there's another one behind you.", 0.4,
+                "No, the big one, by the tree. Okay, got it."]
+
+IRL_SCENARIOS = [
+    Scenario("irl_cut_off_duluth",
+             [Speech(SAM, ["Hey Jarvis.", 3.5, "Sup.", 3.0, DULUTH_Q], voice="theodore")],
+             # Whisper can mishear the town name; without web the model may guess the lake, so
+             # this checks the cut-off (one turn, the whole question), not geography.
+             # The cancelled "Sup" answer must not be in history (turns_exactly).
+             [turns_exactly(1), heard_includes("lake", "minnesota")],
+             web_limit=0,
+             note="Real: 2026-10-15 10:26, Sam said 'Hey Jarvis.', waited ~3.5 s while the "
+                  "bot played its ack, said 'Sup.', paused ~3 s, then asked about Duluth, Minnesota "
+                  "(probably the weather; a no-web question of the same shape here). The turn "
+                  "ended after 'Sup', the bot answered that alone and the question was lost. "
+                  "With the 2 s end-of-question pause and the carry-on restart it must be one "
+                  "turn that answers the question."),
+    Scenario("irl_correction_followup",
+             [Speech(DARREN, [CIRCLE_Q], voice="dennis"),
+              Speech(DARREN, [CIRCLE_FIX], after_reply=1.0, voice="dennis")],
+             # 6s: the 2s end-of-question pause, STT, judge, LLM and TTS
+             [plain_answer(0), turns_exactly(2), replied_within(1, 6.0), no_affirmation_after(1),
+              says_any("stun", "daze", "stagger", turn=1)],  # it may try a (blocked) lookup
+             between=1.0, web_limit=0,
+             note="Real: 2026-10-15 12:12, Darren asked a game question (Enshrouded; a no-web "
+                  "question of the same kind here), the answer missed what he meant, and he "
+                  "corrected it 1 s later without the wake word ('No, I mean the circle above "
+                  "their head...'). The bot ignored the correction: the "
+                  "follow-up judge only let new questions through. It now asks whether the "
+                  "speech calls for a reply, so a correction must be answered. (plain_answer "
+                  "is a setup check: if the bot asked something back, the 4 s after-answer path "
+                  "wasn't exercised.)"),
+    Scenario("irl_ack_stays_quiet",
+             [Speech(DARREN, [TOOL_Q], voice="dennis"),
+              Speech(DARREN, ["Well, I guess that works."], after_reply=1.0, voice="dennis")],
+             [turns_exactly(1), quiet_after(1), no_web_lookup], between=1.0, web_limit=0,
+             note="Real: 2026-10-15 10:25, Darren reacted 'Well, I guess that works.' right "
+                  "after an answer. Correctly ignored live; keep it that way (a reaction, not "
+                  "a request)."),
+    Scenario("irl_ack_stays_quiet_okay",
+             [Speech(SAM, [CUP_Q], voice="theodore"),
+              Speech(SAM, ["Okay."], after_reply=1.0, voice="theodore")],
+             [turns_exactly(1), quiet_after(1), no_web_lookup], between=1.0, web_limit=0,
+             note="Real: 2026-10-15 10:26:52, Sam said just 'Okay.' after an answer. "
+                  "Correctly ignored live; keep it that way."),
+    Scenario("irl_others_talk_then_reply",
+             [Speech(DARREN, [TRIVIA], voice="dennis"),
+              Speech(SAM, SAM_LONG, after_reply=0.3, voice="theodore"),
+              Speech(DARREN, ["I'm going to guess Paris."], after_prev=1.0, voice="dennis")],
+             [asked_question(0), old_window_closed(2, 10.0), turns_exactly(2),
+              replied_within(2, 6.0), no_affirmation_after(2), heard_not("spin", "loot"),
+              no_web_lookup],
+             between=1.0, web_limit=0,
+             note="The owner's worry (2026-10-15): the bot asks Darren something, Sam talks "
+                  "~10 s straight away, and Darren answers ~1 s after he stops. The old fixed "
+                  "10 s window (from the end of the bot's speech) had closed by then; the new "
+                  "one pauses while others talk and gives 3 s grace after they stop. Needs "
+                  "SPEAKING_DETECTION_ENABLED (on in the live .env)."),
+    Scenario("irl_others_talk_after_answer",
+             [Speech(DARREN, [TIMES], voice="dennis"),
+              Speech(SAM, SAM_SHORT, after_reply=0.3, voice="theodore"),
+              Speech(DARREN, ["And what's that divided by four?"], after_prev=1.0,
+                     voice="dennis")],
+             [says_any("96", "ninety-six", "ninety six"), old_window_closed(2, 4.0),
+              turns_exactly(2), replied_within(2, 6.0),
+              says_any("24", "twenty-four", "twenty four", turn=1), heard_not("tree"),
+              no_web_lookup],
+             between=1.0, web_limit=0,
+             note="Same worry after a plain answer (old window: 4 s): Sam talks ~5 s, then "
+                  "Darren asks a real follow-up 1 s later. It must still be answered."),
+    Scenario("irl_talk_during_answer",
+             [Speech(DARREN, [SOURDOUGH_Q], voice="dennis"),
+              Speech(DARREN, ["Wait, how often do I have to feed it?"], during_answer=1.5,
+                     voice="dennis")],
+             [talked_over_bot(1), turns_exactly(2), heard_includes("feed", turn=1),
+              says_any("day", "daily", "hours", "twice", "once", turn=1), no_web_lookup],
+             between=1.0, web_limit=0,
+             note="Darren starts a follow-up while the bot is still answering (happens live "
+                  "when answers run long). It must be kept and answered after the bot "
+                  "finishes, not dropped. talked_over_bot is a setup check: if the answer "
+                  "ended within 1.5 s, it was just an ordinary follow-up."),
+]
+SCENARIOS += IRL_SCENARIOS
+
+
+# ---------------------------------------------------------------- recorded turns
+
+
+def recording_scenarios(folder: Path) -> list[Scenario]:
+    """One rec_* scenario per question the live bot saved (folder/*.wav + .json sidecar).
+
+    The clip plays as recorded, as its speaker. If the transcript has no wake word (a
+    follow-up, or it was clipped), a synthesized "Hey Jarvis." goes first so a fresh
+    session listens. Optional sidecar "label" keys:
+      expect: "reply" (the bot should answer) or "quiet" (it shouldn't: false triggers;
+              no wake word is added)
+      heard: the correct transcript (default: the sidecar's "heard")
+      activity: the speaker's game, e.g. "Enshrouded"
+      web_limit: web lookups allowed (default 0, to keep the live search budget)
+      note: shown in the report
+    """
+    scenarios = []
+    for wav in sorted(folder.glob("*.wav")):
+        meta = read_sidecar(wav)
+        label = meta.get("label") if isinstance(meta.get("label"), dict) else {}
+        speaker_id = int(meta.get("speaker_id") or 700000000000000099)
+        user = FakeMember(speaker_id, str(meta.get("speaker_name") or "Speaker"),
+                          activity=label.get("activity") or meta.get("activity"))
+        expect = label.get("expect")
+        parts: list = [Recording(wav)]
+        if expect != "quiet" and "jarvis" not in str(meta.get("raw_heard", "")).lower():
+            parts = ["Hey Jarvis.", 0.4] + parts
+        reference = label.get("heard") or meta.get("heard")
+        checks: list[Check] = [heard(reference)] if reference and expect != "quiet" else []
+        if expect == "reply":
+            checks.append(turns_at_least(1))
+        elif expect == "quiet":
+            checks.append(no_llm_turn)
+        web_limit = int(label.get("web_limit", 0))
+        if web_limit == 0:
+            checks.append(no_web_lookup)
+        scenarios.append(Scenario(
+            f"rec_{wav.stem}", [Speech(user, parts)], checks, answers=expect != "quiet",
+            web_limit=web_limit,
+            note=(label.get("note") or f"Recorded {meta.get('time', wav.stem)}, "
+                  f"{user.display_name}, live outcome {meta.get('outcome', '?')}: "
+                  f"heard {meta.get('raw_heard', '?')!r}, replied {meta.get('reply', '')!r}")))
+    return scenarios
+
+
 # ---------------------------------------------------------------- wake word sweep
 
 
-async def wake_sweep(rig, threshold: float) -> list[dict]:
-    """Offline: max wake score for 'Hey Jarvis' in many voices (and some negatives)."""
+async def wake_sweep(rig, threshold: float, wake_dir: Path | None = None) -> list[dict]:
+    """Offline: max wake score for 'Hey Jarvis' in many voices (and some negatives), plus
+    the live bot's saved wake clips in wake_dir (recordings/wake/*.wav + .json)."""
     import numpy as np
     from openwakeword.model import Model
     from scipy.signal import resample_poly
 
+    from scripts.e2e.harness import load_recording
+
     model = Model(wakeword_models=[rig.settings.wake_word_model], inference_framework="onnx")
-    clips = [("Hey Jarvis, what time is it?", v) for v in
-             ("ashley", "dennis", "olivia", "carter", "priya", "theodore", "hades", "pixie")]
-    clips += [(t, "ashley") for t in ("Hey Travis, what time is it?", "Hey, are you there?",
-                                     "Jarvis is a cool name.", "Hey Casey, what's up?")]
-    rows = []
-    for text, voice in clips:
-        audio = await rig.speech.say(text, voice)
-        audio16 = resample_poly(audio, 2, 3)
+
+    def max_score(audio24) -> float:
+        audio16 = resample_poly(audio24, 2, 3)
         pcm = (np.clip(np.concatenate([np.zeros(8000), audio16, np.zeros(16000)]), -1, 1)
                * 32767).astype(np.int16)
         model.reset()
@@ -481,9 +697,29 @@ async def wake_sweep(rig, threshold: float) -> list[dict]:
         for i in range(0, len(pcm) - 1280, 1280):
             scores = model.predict(pcm[i:i + 1280])
             best = max(best, max(scores.values()))
+        return best
+
+    clips = [("Hey Jarvis, what time is it?", v) for v in
+             ("ashley", "dennis", "olivia", "carter", "priya", "theodore", "hades", "pixie")]
+    clips += [(t, "ashley") for t in ("Hey Travis, what time is it?", "Hey, are you there?",
+                                     "Jarvis is a cool name.", "Hey Casey, what's up?")]
+    rows = []
+    for text, voice in clips:
+        best = max_score(await rig.speech.say(text, voice))
         positive = "jarvis" in text.lower() and text.lower().startswith("hey jarvis")
         rows.append({"text": text, "voice": voice, "score": round(best, 3),
                      "positive": positive, "detected": best >= threshold})
+
+    # Expected: the sidecar label's "wake" (true/false) if someone labeled it, else
+    # whatever the live bot decided ("hit")
+    for wav in sorted(wake_dir.glob("*.wav")) if wake_dir and wake_dir.is_dir() else []:
+        meta = read_sidecar(wav)
+        label = meta.get("label") if isinstance(meta.get("label"), dict) else {}
+        best = max_score(load_recording(Recording(wav)))
+        rows.append({"text": f"{wav.name} (live score {meta.get('score', '?')})",
+                     "voice": "recorded", "score": round(best, 3),
+                     "positive": bool(label.get("wake", meta.get("hit"))),
+                     "detected": best >= threshold})
     return rows
 
 
@@ -595,9 +831,48 @@ def to_json(r: RunResult) -> dict:
 # ---------------------------------------------------------------- main
 
 
+def select_scenarios(args: list[str]) -> tuple[list[Scenario], Path | None]:
+    """Scenarios picked by the command line, and the recordings folder if one was given."""
+    filters = [a for a in args if not a.startswith("--")]
+    no_web = "--no-web" in args
+    rec_arg = next((a for a in args if a == "--recordings" or a.startswith("--recordings=")),
+                   None)
+    rec_dir = None
+    if rec_arg is not None:
+        rec_dir = Path(rec_arg.split("=", 1)[1]) if "=" in rec_arg else ROOT / "recordings"
+    pool = list(SCENARIOS)
+    if rec_dir is not None:
+        pool += recording_scenarios(rec_dir / "turns")
+    if "--irl" in args:
+        pool = [s for s in pool if s.name.startswith("irl_")]
+    selected = [s for s in pool
+                if (not filters or any(f in s.name for f in filters))
+                and not (no_web and s.name.startswith("web_"))]
+    return selected, rec_dir
+
+
+def list_scenarios(selected: list[Scenario]) -> None:
+    for sc in selected:
+        web = "" if sc.web_limit is None else f" [web<={sc.web_limit}]"
+        print(f"{sc.name}{web}")
+        for sp in sc.speeches:
+            when = (f"+{sp.after_reply}s after reply" if sp.after_reply is not None
+                    else f"+{sp.during_answer}s into answer" if sp.during_answer is not None
+                    else f"+{sp.after_prev}s after previous" if sp.after_prev is not None
+                    else f"at {sp.at}s")
+            print(f"    {sp.user.display_name} ({sp.voice}, {when}): {sp.text}")
+        print(f"    checks: {', '.join(c.__name__ for c in sc.checks)}")
+    print(f"{len(selected)} scenario(s)")
+
+
 async def main(args: list[str]) -> int:
     from scripts.e2e.harness import Rig
     from src.config import get_settings
+
+    selected, rec_dir = select_scenarios(args)
+    if "--list" in args:
+        list_scenarios(selected)
+        return 0
 
     settings = get_settings()
     out = ROOT / "reports" / f"e2e-{time.strftime('%Y%m%d-%H%M%S')}"
@@ -610,7 +885,6 @@ async def main(args: list[str]) -> int:
         logging.getLogger(noisy).setLevel(logging.WARNING)
 
     filters = [a for a in args if not a.startswith("--")]
-    no_web = "--no-web" in args
     repeat = next((int(a.split("=", 1)[1]) for a in args if a.startswith("--repeat=")), 1)
 
     # --monitor: feed each turn through the live monitor's recorder and detectors
@@ -626,9 +900,6 @@ async def main(args: list[str]) -> int:
         from scripts.e2e.discord_mirror import DiscordMirror
 
         rig.mirror = await DiscordMirror.join(settings)
-    selected = [s for s in SCENARIOS
-                if (not filters or any(f in s.name for f in filters))
-                and not (no_web and s.name.startswith("web_"))]
     results = []
     scenarios = {}
     runs = [(sc, rep) for rep in range(repeat) for sc in selected]
@@ -636,7 +907,10 @@ async def main(args: list[str]) -> int:
         run_name = sc.name if repeat == 1 else f"{sc.name}-r{rep + 1}"
         scenarios[run_name] = sc
         print(f"\n===== {run_name} =====", flush=True)
-        r = await rig.run(run_name, sc.speeches, MEMBERS, between=sc.between, observer=recorder)
+        members = MEMBERS + list({sp.user.id: sp.user for sp in sc.speeches
+                                  if all(sp.user.id != m.id for m in MEMBERS)}.values())
+        r = await rig.run(run_name, sc.speeches, members, between=sc.between, observer=recorder,
+                          web_limit=sc.web_limit)
         if recorder:
             r.monitor_posts = monitor_posts(live_turns, settings)
             live_turns.clear()
@@ -653,7 +927,8 @@ async def main(args: list[str]) -> int:
 
     sweep = None
     if not args or "sweep" in filters:
-        sweep = await wake_sweep(rig, settings.wake_word_confidence)
+        sweep = await wake_sweep(rig, settings.wake_word_confidence,
+                                 rec_dir / "wake" if rec_dir else None)
     if rig.tts is not None:
         await rig.tts.close()
     if rig.mirror is not None:

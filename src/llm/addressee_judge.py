@@ -5,8 +5,10 @@ moment. But they may just as well turn to someone else in the channel, so each
 follow-up is checked before the bot replies:
 
 - The bot asked them something: a reply that fits ("the regular one") is for the bot.
-- The bot answered them: only a new question or request to the bot counts. Chatting
-  about the answer with friends ("nice, told you") must not get a reply.
+- The bot answered them: only something that calls for a reply counts: a new question
+  or request, or telling the bot it got something wrong ("no, the circle above their
+  head"). Acknowledgements ("okay", "I guess that works") and chatting about the answer
+  with friends ("nice, told you") must not get a reply.
 
 Speaker isolation (only the person the bot answered is heard) is the session's job.
 Anything uncertain (errors, timeouts, unclear answers) counts as not addressed: staying
@@ -65,8 +67,10 @@ QWEN_RULE_ASKED = """Was {speaker} talking to {assistant} (answering its questio
 something else), rather than to someone else in the channel? A short reply that fits the
 question ("the first one", "yeah", "iron") is for {assistant}."""
 
-QWEN_RULE_ANSWERED = """Did {speaker} ask {assistant} a new question or give it a request?
-Answer NO if they were reacting to the answer or talking to someone else in the channel."""
+QWEN_RULE_ANSWERED = """Does what {speaker} said call for {assistant} to respond:
+a new question, a request, or telling {assistant} it got something wrong or misunderstood?
+Answer NO if it was just an acknowledgement or reaction ("ok", "thanks", "nice", "I guess
+that works") or they were talking to someone else in the channel."""
 
 
 class QwenAddresseeJudge:
@@ -129,12 +133,16 @@ class JevAddresseeJudge:
     """Asks TypeSafe's Jev two questions in one call (evaluated in parallel):
 
     - addressee (Choice): was it said to the bot or to someone else?
-    - asks (Noul): is it a question or request for the bot?
+    - wants_reply (Noul): does it call for the bot to respond (a question, a request, or
+      a correction), rather than just acknowledge the answer?
 
     Addressed when Jev puts at least `min_probability` on the bot with at least
-    `min_confidence`; after an answer (not a question) `asks` must also reach
+    `min_confidence`; after an answer (not a question) `wants_reply` must also reach
     `min_probability`. On hand-labelled cases its one false "yes" came with confidence
-    0.44 and the real ones with 0.96+. Docs: https://docs.typesafe.ai
+    0.44 and the real ones with 0.96+. `wants_reply` replaced "is it a question or a
+    request", which missed corrections: on 14 follow-ups it scored 0.93+ on the ones
+    that needed a reply and 0.07 or less on acknowledgements (the old one missed all
+    four corrections). Docs: https://docs.typesafe.ai
     """
 
     URL = "https://api.typesafe.ai/v1/systemone"
@@ -186,10 +194,13 @@ class JevAddresseeJudge:
                         "someone_else": "Another person in the channel, not the assistant",
                     },
                 },
-                "asks": {
+                "wants_reply": {
                     "type": "noul",
                     "instructions": (
-                        f"What {speaker} said last is a question or a request for {bot}"
+                        f"What {speaker} said last calls for {bot} to respond: a question, "
+                        f"a request, or telling {bot} it got something wrong or "
+                        "misunderstood. Not just an acknowledgement, thanks, or a reaction "
+                        "like 'ok', 'nice', 'I guess that works'"
                     ),
                 },
             },
@@ -200,16 +211,16 @@ class JevAddresseeJudge:
             answers = response.json()["answers"]
             p_bot = float(answers["addressee"]["probabilities"]["assistant"])
             confidence = float(answers["addressee"].get("confidence", 0.0))
-            p_asks = float(answers["asks"]["noul"])
+            p_reply = float(answers["wants_reply"]["noul"])
         except Exception as e:
             reason = (f"HTTP {e.response.status_code}" if isinstance(e, httpx.HTTPStatusError)
                       else type(e).__name__)  # never the request (it carries the key)
             return Verdict(False, 0.0, f"check failed: {reason}")
         addressed = p_bot >= self._min_probability and confidence >= self._min_confidence
         if not followup.bot_asked:
-            addressed = addressed and p_asks >= self._min_probability
+            addressed = addressed and p_reply >= self._min_probability
         return Verdict(addressed, confidence,
-                       f"jev: p(bot)={p_bot:.2f} conf={confidence:.2f} p(asks)={p_asks:.2f}")
+                       f"jev: p(bot)={p_bot:.2f} conf={confidence:.2f} p(reply)={p_reply:.2f}")
 
     async def close(self) -> None:
         if self._client is not None and not self._client.is_closed:
@@ -222,5 +233,6 @@ def is_question(reply: Optional[str]) -> bool:
     if not reply:
         return False
     text = re.sub(r"\[[^\]]*\]", " ", reply)  # emotion/non-verbal tags
+    text = re.sub(r"\.{2,}|…", ",", text)  # "I'll wait... eventually." is one sentence
     sentences = [s for s in re.findall(r"[^.?!]+[.?!]*", text) if s.strip(" \"')\n")]
     return any(s.rstrip(" \"')\n").endswith("?") for s in sentences[-3:])

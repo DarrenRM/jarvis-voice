@@ -72,6 +72,8 @@ class ClaudeBot(commands.Bot):
         # Active voice session (single channel at a time)
         self._session: Optional[VoiceSession] = None
         self._session_task: Optional[asyncio.Task] = None
+        self._rejoin_task: Optional[asyncio.Task] = None
+        self._closing = False
 
         # Live monitor (MONITOR_ENABLED): posts problems seen in voice turns to a text
         # channel; the owner approves them with reactions. None when off.
@@ -189,6 +191,31 @@ class ClaudeBot(commands.Bot):
             if vc.is_connected():
                 await vc.disconnect()
 
+    async def _rejoin_after_drop(self, channel: discord.VoiceChannel) -> None:
+        """Discord dropped the voice connection: tear the session down and rejoin."""
+        try:
+            try:
+                await asyncio.wait_for(self._cleanup_session(), timeout=10)
+            except Exception as e:
+                logger.warning(f"[DISCONNECT] Cleanup after drop failed: {e!r}")
+            for attempt, delay in enumerate((2, 5, 15, 30, 60), start=1):
+                await asyncio.sleep(delay)
+                if self._session is not None or self._closing:
+                    return  # someone ran !join meanwhile, or we're shutting down
+                # A half-dead voice client from the drop blocks channel.connect()
+                stale = channel.guild.voice_client
+                if stale:
+                    try:
+                        await stale.disconnect(force=True)
+                    except Exception:
+                        pass
+                logger.info(f"[DISCONNECT] Rejoining {channel.name} (attempt {attempt})")
+                if await self._join_channel(channel):
+                    return
+            logger.error(f"[DISCONNECT] Gave up rejoining {channel.name}; use !join")
+        finally:
+            self._rejoin_task = None
+
     async def _join_channel(
         self,
         channel: discord.VoiceChannel,
@@ -289,9 +316,12 @@ class ClaudeBot(commands.Bot):
         if member.id == self.user.id:
             if before.channel and not after.channel:
                 logger.warning(f"[DISCONNECT] Bot was disconnected from {before.channel.name}")
-                # Clean up session
-                if self._session:
-                    asyncio.create_task(self._cleanup_session())
+                # !leave and _cleanup_session clear _session before disconnecting, so a
+                # live session here means Discord dropped us (e.g. voice socket 1006)
+                if self._session and not self._closing and not self._rejoin_task:
+                    self._rejoin_task = asyncio.create_task(
+                        self._rejoin_after_drop(before.channel)
+                    )
             return
 
         # User left voice channel entirely
@@ -341,6 +371,9 @@ class ClaudeBot(commands.Bot):
     async def close(self) -> None:
         """Clean up on shutdown."""
         logger.info("Bot closing...")
+        self._closing = True
+        if self._rejoin_task:
+            self._rejoin_task.cancel()
 
         if self._monitor:
             await self._monitor.stop()

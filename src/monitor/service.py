@@ -1,9 +1,12 @@
 """Live monitor: detect problems in voice turns, post them to Discord, record approvals.
 
 Flow: TurnRecorder -> handle_turn (optional re-transcription, detectors, dedupe)
--> one post per turn in the monitor channel with check/cross reactions. When the
-owner reacts with a check the issue is appended to the approved-fixes file; a
-cross is only logged.
+-> one post per turn in the monitor channel with check/cross reactions. The owner's
+check means "something went wrong here" (the post's diagnosis is only a guess) and
+appends the post to the approved-fixes file; a cross means "no problem, or it didn't
+disrupt the flow" and appends it to the dismissed-findings file. With
+MONITOR_SAVE_AUDIO each question (and wake word clips) is also kept on disk
+(recordings.py) and the post names the file.
 
 Off unless MONITOR_ENABLED=true.
 """
@@ -23,8 +26,18 @@ from typing import Any
 import numpy as np
 
 from .detectors import Finding, Thresholds, detect
-from .reporting import POST_PREFIX, Redactor, approval_entry, format_post, with_seen_count
-from .turn import LiveTurn, TurnRecorder
+from .recordings import AudioArchive
+from .reporting import (
+    CONFIRMED,
+    DISMISSED,
+    POST_PREFIX,
+    Redactor,
+    approval_entry,
+    format_post,
+    recording_path,
+    with_seen_count,
+)
+from .turn import HUNG, LiveTurn, TurnRecorder
 
 logger = logging.getLogger(__name__)
 
@@ -41,9 +54,20 @@ WATCHDOG_INTERVAL_S = 2.0
 APPROVED_FILE_HEADER = (
     "# Approved fixes\n"
     "\n"
-    "Problems the live monitor (src/monitor) posted to Discord that the owner marked\n"
-    "with a check reaction: agreed to fix. Newest at the bottom; the HTML comment on\n"
-    "each entry keeps the same Discord message from being added twice.\n"
+    "Turns the live monitor (src/monitor) posted to Discord that the owner marked with a\n"
+    "check reaction: something really went wrong there. The \"What went wrong\" text is\n"
+    "the monitor's guess and is sometimes wrong, so confirm the cause from the logs (and\n"
+    "the recording, if there is one) before fixing. Newest at the bottom; the HTML\n"
+    "comment on each entry keeps the same Discord message from being added twice.\n"
+)
+
+DISMISSED_FILE_HEADER = (
+    "# Dismissed findings\n"
+    "\n"
+    "Monitor posts the owner marked with a cross: no problem happened, or it didn't\n"
+    "disrupt the natural flow of the conversation (often just a slow reply). Not\n"
+    "\"ignore\": worth fixing only when the fix has no tradeoffs, side effects or edge\n"
+    "cases. Newest at the bottom.\n"
 )
 
 
@@ -61,8 +85,9 @@ class PostedIssue:
 class ApprovalLog:
     """Append-only markdown file of approved issues, one entry per Discord message."""
 
-    def __init__(self, path: Path):
+    def __init__(self, path: Path, header: str = APPROVED_FILE_HEADER):
         self.path = path
+        self.header = header
 
     @staticmethod
     def marker(message_id: int) -> str:
@@ -84,7 +109,7 @@ class ApprovalLog:
         if self.marker(message_id) in existing:
             return False
         newline = "\r\n" if "\r\n" in existing else "\n"
-        text = existing or APPROVED_FILE_HEADER
+        text = existing or self.header
         if not text.endswith("\n"):
             text += "\n"
         text += "\n" + entry.rstrip("\n") + "\n"
@@ -105,6 +130,7 @@ class MonitorService:
         bot_user_id: Callable[[], int | None] = lambda: None,
         transcriber: Any = None,
         approvals_path: Path | None = None,
+        dismissals_path: Path | None = None,
         clock: Callable[[], float] = time.time,
     ):
         """
@@ -115,6 +141,7 @@ class MonitorService:
             transcriber: STT client with transcribe_audio(16 kHz float32) for
                 MONITOR_RETRANSCRIBE; created from GROQ_API_KEY if not given
             approvals_path: Approved-fixes file (default MONITOR_APPROVED_FILE)
+            dismissals_path: Dismissed-findings file (default MONITOR_DISMISSED_FILE)
             clock: Wall-clock seconds (tests)
         """
         self.settings = settings
@@ -127,10 +154,19 @@ class MonitorService:
         self._transcriber = transcriber
         self._retranscribe = bool(settings.monitor_retranscribe)
         self._clock = clock
-        path = approvals_path or Path(settings.monitor_approved_file)
-        self.approvals = ApprovalLog(path if path.is_absolute() else REPO_ROOT / path)
+        self.approvals = ApprovalLog(_in_repo(approvals_path or settings.monitor_approved_file))
+        self.dismissals = ApprovalLog(
+            _in_repo(dismissals_path or settings.monitor_dismissed_file), DISMISSED_FILE_HEADER)
         self._dedupe_s = settings.monitor_dedupe_minutes * 60
         self.recorder = TurnRecorder(self._on_turn, retain_audio=self._retranscribe)
+        self.archive: AudioArchive | None = None
+        if self.enabled and settings.monitor_save_audio:
+            self.archive = AudioArchive(
+                _in_repo(settings.monitor_audio_dir), max_mb=settings.monitor_audio_max_mb,
+                wake_min_score=settings.monitor_wake_clip_min_score,
+                names=getattr(settings, "user_names", None) or {})
+            self.recorder.keep_question_audio = True
+            self.recorder.on_wake_clip = self.archive.save_wake
         self._recent: dict[str, PostedIssue] = {}  # finding key -> post
         self._posted: dict[int, PostedIssue] = {}  # message id -> post
         self._post_times: collections.deque[float] = collections.deque()
@@ -151,15 +187,20 @@ class MonitorService:
         if self.owner_id is None:
             logger.warning("[MONITOR] MONITOR_OWNER_ID not set: posts can't be approved")
         logger.info(f"[MONITOR] On: posting to #{self.settings.monitor_channel_name}")
+        if self.archive is not None:
+            logger.info(f"[MONITOR] Saving question and wake word audio to {self.archive.root}")
 
     async def stop(self) -> None:
         self.recorder.uninstall()
+        self.recorder.on_wake_clip = None
         tasks = [t for t in [self._watchdog, *self._tasks] if t is not None]
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
         self._watchdog = None
         self._tasks.clear()
+        if self.archive is not None:
+            await asyncio.to_thread(self.archive.close)  # finish pending writes
 
     async def _watch(self) -> None:
         while True:
@@ -187,6 +228,7 @@ class MonitorService:
                 turn.spoken = await self._transcribe(turn.answer_audio)
             turn.answer_audio = []
             findings = detect(turn, self.thresholds)
+            self._save_audio(turn, findings)
             if not findings:
                 return None
             for f in findings:
@@ -196,6 +238,23 @@ class MonitorService:
         except Exception as e:
             logger.warning(f"[MONITOR] Could not handle turn: {e}", exc_info=True)
             return None
+
+    def _save_audio(self, turn: LiveTurn, findings: list[Finding]) -> None:
+        """Keep the question audio (MONITOR_SAVE_AUDIO). A hang report is a snapshot of
+        a turn still running; the finished turn is saved when it ends."""
+        audio, turn.question_audio = turn.question_audio, None
+        if self.archive is None or audio is None or turn.outcome == HUNG:
+            return
+        turn.question_audio = audio
+        try:
+            path = self.archive.save_turn(turn, findings)
+        finally:
+            turn.question_audio = None
+        if path is not None:
+            try:
+                turn.audio_file = path.relative_to(REPO_ROOT).as_posix()
+            except ValueError:
+                turn.audio_file = path.as_posix()
 
     async def _post_findings(self, turn: LiveTurn, findings: list[Finding]) -> Any | None:
         now = self._clock()
@@ -287,7 +346,9 @@ class MonitorService:
     ) -> str | None:
         """Owner reaction on a monitor post.
 
-        Returns "approved", "already_approved", "dismissed", or None if ignored.
+        Check: "something went wrong here" -> approved-fixes file. Cross: "no problem, or
+        it didn't disrupt the flow" -> dismissed-findings file. Returns "approved",
+        "already_approved", "dismissed", "already_dismissed", or None if ignored.
         """
         if not self.enabled or emoji not in (APPROVE, REJECT):
             return None
@@ -313,23 +374,34 @@ class MonitorService:
             if posted is not None:
                 posted = posted.astimezone().replace(tzinfo=None)
 
-        if emoji == REJECT:
-            logger.info(f"[MONITOR] Owner dismissed post {message_id}")
-            return "dismissed"
-
-        if self.approvals.contains(message_id):
-            return "already_approved"
-        entry = approval_entry(message_id, content, getattr(message, "jump_url", "") or "",
-                               posted, datetime.fromtimestamp(self._clock()), self.redact)
-        if not self.approvals.add(message_id, entry):
-            return "already_approved"
-        logger.info(f"[MONITOR] Owner approved post {message_id}; added to {self.approvals.path}")
-        if message is not None and content is not None:
-            content += "\nApproved: added to the fix list."
+        approve = emoji == APPROVE
+        log, done = (self.approvals, "approved") if approve else (self.dismissals, "dismissed")
+        if log.contains(message_id):
+            return f"already_{done}"
+        jump_url = getattr(message, "jump_url", "") or ""
+        entry = approval_entry(message_id, content, jump_url, posted,
+                               datetime.fromtimestamp(self._clock()), self.redact,
+                               CONFIRMED if approve else DISMISSED)
+        if not log.add(message_id, entry):
+            return f"already_{done}"
+        logger.info(f"[MONITOR] Owner {done} post {message_id}; added to {log.path}")
+        self._note_reaction(content, CONFIRMED if approve else DISMISSED, jump_url)
+        if approve and message is not None and content is not None:
+            content += "\nConfirmed: added to the fix list (cause still to be checked)."
             if issue is not None:
                 issue.content = content
             await self._edit(message, content)
-        return "approved"
+        return done
+
+    def _note_reaction(self, content: str | None, verdict: str, jump_url: str) -> None:
+        """Copy the owner's verdict into the recording's sidecar, if the post has one."""
+        rel = recording_path(content or "")
+        if self.archive is None or rel is None:
+            return
+        path = Path(rel)
+        path = path if path.is_absolute() else REPO_ROOT / path
+        if path.resolve().is_relative_to(self.archive.root.resolve()):
+            self.archive.note_reaction(path, verdict, jump_url)
 
     def _is_monitor_post(self, message: Any) -> bool:
         author = getattr(getattr(message, "author", None), "id", None)
@@ -338,6 +410,11 @@ class MonitorService:
         return (bot_id is not None and author == bot_id
                 and (channel is None or channel == self.settings.monitor_channel_name)
                 and (getattr(message, "content", "") or "").startswith(POST_PREFIX))
+
+
+def _in_repo(path: str | Path) -> Path:
+    path = Path(path)
+    return path if path.is_absolute() else REPO_ROOT / path
 
 
 def _no_mentions():

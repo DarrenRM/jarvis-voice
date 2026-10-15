@@ -38,6 +38,8 @@ NO_REPLY = "no_reply"
 WAKE_WORD_ONLY = "wake_word_only"
 EMPTY = "empty"
 CANCELLED = "cancelled"
+NOT_ADDRESSED = "not_addressed"  # follow-up without the wake word, not for the bot
+LATE_REPLY = "late_reply"  # not a turn: a reply that came after its window closed
 CRASHED = "exception"
 HUNG = "hung"
 
@@ -101,7 +103,11 @@ class LiveTurn:
     last_step: str = ""  # hung turns: what it was waiting on
     hang_reported: bool = False
     spoken: str | None = None  # Whisper transcript of the answer audio (MONITOR_RETRANSCRIBE)
+    note: str = ""  # incidents (LATE_REPLY): what happened
     answer_audio: list[np.ndarray] = field(default_factory=list, repr=False)
+    # The question as Whisper got it (16 kHz), kept when MONITOR_SAVE_AUDIO is on
+    question_audio: np.ndarray | None = field(default=None, repr=False)
+    audio_file: str = ""  # where it was saved (shown in the post)
 
     @property
     def first_audio_s(self) -> float | None:
@@ -178,6 +184,9 @@ class TurnRecorder:
         self._answer_next = False
         self._seen_response: Any = None
         self._handler: _TurnLogHandler | None = None
+        # MONITOR_SAVE_AUDIO: keep question audio; wake word clips go to on_wake_clip
+        self.keep_question_audio = False
+        self.on_wake_clip: Callable[[int, np.ndarray, float, bool], None] | None = None
 
     # ------------------------------------------------------------ setup
 
@@ -224,6 +233,19 @@ class TurnRecorder:
             return self._token
 
     @_safe
+    def question_audio(self, audio: np.ndarray) -> None:
+        """The audio of the question being processed (16 kHz mono float32)."""
+        with self._lock:
+            if self._turn is not None and self.keep_question_audio:
+                self._turn.question_audio = audio
+
+    @_safe
+    def wake_clip(self, user_id: int, audio: np.ndarray, score: float, hit: bool) -> None:
+        """Audio around a wake word hit or near miss (called from the audio thread)."""
+        if self.on_wake_clip is not None:
+            self.on_wake_clip(user_id, audio, score, hit)
+
+    @_safe
     def clip_started(self, audio: np.ndarray) -> Clip | None:
         """The bot started playing audio (24 kHz mono). Returns a handle for clip_ended."""
         with self._lock:
@@ -258,6 +280,14 @@ class TurnRecorder:
             turn.duration_s = self._rel()
             turn.outcome = self._outcome(turn, error)
         self._emit(turn)
+
+    @_safe
+    def incident(self, speaker_id: int | None, speaker_name: str | None, outcome: str,
+                 note: str, reply: str = "") -> None:
+        """Something worth reporting that happened outside a turn (LATE_REPLY)."""
+        self._emit(LiveTurn(started=datetime.now(), speaker_id=speaker_id,
+                            speaker_name=speaker_name, reply=reply, outcome=outcome,
+                            note=note))
 
     # ------------------------------------------------------------ hooks (VoicePipeline)
 
@@ -295,7 +325,8 @@ class TurnRecorder:
 
     @_safe
     def pipeline_result(self, result: str | None) -> None:
-        """VoicePipeline.process returned (None, "wake_word_only", "empty", "cancelled")."""
+        """VoicePipeline.process returned (None, "wake_word_only", "empty", "cancelled",
+        "not_addressed")."""
         with self._lock:
             if self._turn is not None:
                 self._pipeline_result = result
@@ -370,7 +401,7 @@ class TurnRecorder:
             turn.error = f"{type(error).__name__}: {error}"[:300]
             return CRASHED
         result = self._pipeline_result
-        if result in (WAKE_WORD_ONLY, EMPTY, CANCELLED):
+        if result in (WAKE_WORD_ONLY, EMPTY, CANCELLED, NOT_ADDRESSED):
             return result
         if ERROR_REPLY in turn.reply:
             return ERROR_REPLY_OUTCOME

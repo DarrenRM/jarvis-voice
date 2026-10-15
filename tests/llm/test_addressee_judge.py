@@ -27,6 +27,9 @@ class TestIsQuestion:
         "Want me to post it? ",
         "[happy] What's the fastest land mammal on earth?\nTake your best shot.",
         "What creature do Fremen fear? Take your time. I'll be here. [breathe]",
+        # e2e 2026-10-15: the ellipsis used to count as two more sentences
+        "[laughing] Easy, I promise. How many continents does Earth have?\n\n"
+        "Take your time. I'll wait... eventually.",
     ])
     def test_questions(self, reply):
         assert is_question(reply)
@@ -38,7 +41,7 @@ class TestIsQuestion:
         assert not is_question(reply)
 
 
-def jev(p_bot=1.0, confidence=1.0, p_asks=0.9, status=200, seen=None):
+def jev(p_bot=1.0, confidence=1.0, p_reply=0.9, status=200, seen=None):
     def handler(request):
         if seen is not None:
             seen["auth"] = request.headers.get("authorization")
@@ -48,7 +51,7 @@ def jev(p_bot=1.0, confidence=1.0, p_asks=0.9, status=200, seen=None):
         return httpx.Response(200, json={"model": "jev-1", "answers": {
             "addressee": {"type": "choice", "choice": "assistant", "confidence": confidence,
                           "probabilities": {"assistant": p_bot, "someone_else": 1 - p_bot}},
-            "asks": {"type": "noul", "noul": p_asks},
+            "wants_reply": {"type": "noul", "noul": p_reply},
         }})
     return JevAddresseeJudge(KEY, transport=httpx.MockTransport(handler))
 
@@ -56,11 +59,11 @@ def jev(p_bot=1.0, confidence=1.0, p_asks=0.9, status=200, seen=None):
 class TestJev:
     async def test_reply_to_question_is_for_the_bot(self):
         seen = {}
-        verdict = await jev(p_asks=0.02, seen=seen).judge(ASKED, "the regular one", "Darren")
+        verdict = await jev(p_reply=0.02, seen=seen).judge(ASKED, "the regular one", "Darren")
         assert verdict.addressed
         assert seen["auth"] == f"Bearer {KEY}"
         assert "asked Darren" in seen["body"]["state"]
-        assert set(seen["body"]["questions"]) == {"addressee", "asks"}
+        assert set(seen["body"]["questions"]) == {"addressee", "wants_reply"}
 
     async def test_talking_to_someone_else(self):
         verdict = await jev(p_bot=0.05).judge(ASKED, "Riley grab the loot", "Darren")
@@ -71,12 +74,12 @@ class TestJev:
         assert not verdict.addressed
 
     async def test_after_answer_needs_a_question_or_request(self):
-        assert not (await jev(p_asks=0.02).judge(ANSWERED, "ok cool thanks", "Darren")).addressed
-        verdict = await jev(p_asks=0.96).judge(ANSWERED, "where do I find shroud wood", "D")
+        assert not (await jev(p_reply=0.02).judge(ANSWERED, "ok cool thanks", "Darren")).addressed
+        verdict = await jev(p_reply=0.96).judge(ANSWERED, "where do I find shroud wood", "D")
         assert verdict.addressed
 
     async def test_after_question_a_plain_reply_is_enough(self):
-        verdict = await jev(p_asks=0.02).judge(ASKED, "ghost", "Darren")
+        verdict = await jev(p_reply=0.02).judge(ASKED, "ghost", "Darren")
         assert verdict.addressed
 
     async def test_http_error_is_not_addressed_and_hides_key(self):
@@ -116,6 +119,7 @@ class TestQwen:
         await judge.judge(ANSWERED, "thanks", "Darren")
         assert "just asked Darren" in fake.prompts[0]
         assert "just answered Darren" in fake.prompts[1] and "new question" in fake.prompts[1]
+        assert "got something wrong" in fake.prompts[1]
 
     async def test_failure_or_garbage_is_not_addressed(self):
         for fake in (FakeQwen(error=RuntimeError("down")), FakeQwen("Maybe")):

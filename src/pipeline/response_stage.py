@@ -78,6 +78,7 @@ class ResponseStage(StreamingPipelineStage):
         self._max_history = max_history_messages
         # Conversation without the system prompt (rebuilt each turn)
         self._history: list[dict] = []
+        self._history_before: list[dict] | None = None  # for forget_last_turn
         self._tool_result_ttl = tool_result_ttl
         self._clock = clock
         # tool_call_id -> when its (large) result entered history
@@ -103,6 +104,14 @@ class ResponseStage(StreamingPipelineStage):
         users = [i for i, m in enumerate(self._history) if m.get("role") == "user"]
         return lookup_results(self._history[:users[-1]]) if users else ""
 
+    def forget_last_turn(self) -> bool:
+        """Drop the latest exchange from history: it was cancelled before anyone heard
+        the answer (the speaker kept talking). True if there was one to drop."""
+        if self._history_before is None:
+            return False
+        self._history, self._history_before = self._history_before, None
+        return True
+
     def get_messages(self) -> list[dict]:
         """Get current message history (without system prompt)."""
         return list(self._history)
@@ -122,6 +131,7 @@ class ResponseStage(StreamingPipelineStage):
             Response text chunks
         """
         self._expire_tool_results()
+        self._history_before = self._history
         messages = [
             {"role": "system", "content": self._build_system_prompt(context, text)},
             *self._history,

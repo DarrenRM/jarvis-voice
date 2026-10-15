@@ -71,18 +71,27 @@ class Settings(BaseSettings):
     # Latency Settings
     vad_sensitivity: float = Field(default=0.5, alias="VAD_SENSITIVITY")
     speech_pad_ms: int = Field(default=300, alias="SPEECH_PAD_MS")
-    min_silence_ms: int = Field(default=500, alias="MIN_SILENCE_MS")  # Silence to trigger speech end
+    # Quiet that ends a question (VAD silence, or Discord no longer sending audio). Long
+    # enough for "um... so..." pauses; speech that comes after it still isn't lost
+    # (VoiceSession starts over when the speaker carries on before the answer plays).
+    min_silence_ms: int = Field(default=2000, alias="MIN_SILENCE_MS")
     max_question_duration: float = Field(default=30.0, alias="MAX_QUESTION_DURATION")
 
     # Follow-up without the wake word: only from the person the bot just answered, and only
     # if a quick check says they're talking to the bot. After the bot asks a question, a
-    # reply counts; after a plain answer, only a new question or request does.
+    # reply counts; after a plain answer, only something that needs a reply does (a new
+    # question or request, or a correction; not "okay" or "thanks").
     followup_enabled: bool = Field(default=True, alias="FOLLOWUP_ENABLED")
     followup_window_seconds: float = Field(default=10.0, alias="FOLLOWUP_WINDOW_SECONDS")
     followup_after_answer: bool = Field(default=True, alias="FOLLOWUP_AFTER_ANSWER")
     followup_after_answer_seconds: float = Field(
         default=4.0, alias="FOLLOWUP_AFTER_ANSWER_SECONDS"
     )
+    # Follow-up windows only count down while the room is quiet. When someone else stops
+    # talking, the speaker gets at least this long to start their reply...
+    followup_grace_seconds: float = Field(default=3.0, alias="FOLLOWUP_GRACE_SECONDS")
+    # ...and a window never stays open longer than this
+    followup_max_wait_seconds: float = Field(default=30.0, alias="FOLLOWUP_MAX_WAIT_SECONDS")
     # TypeSafe Jev makes that check when its key is set (calibrated, ~0.1s); else Qwen
     typesafe_api_key: Optional[str] = Field(default=None, alias="TYPESAFE_API_KEY")
     # Reference answers (recipes, steps, stats) are also posted to IMAGE_CHANNEL_NAME:
@@ -128,8 +137,10 @@ class Settings(BaseSettings):
     user_roasts: Dict[str, str] = Field(default_factory=dict, alias="USER_ROASTS")
 
     # Live monitor (src/monitor): posts problems seen in real voice turns to a text
-    # channel with check/cross reactions; the owner's check adds the issue to
-    # MONITOR_APPROVED_FILE. Off by default.
+    # channel with check/cross reactions. The owner's check means "something went wrong
+    # here" (not that the post's diagnosis is right) and adds the turn to
+    # MONITOR_APPROVED_FILE; a cross means "no problem, or it didn't disrupt the flow"
+    # and adds it to MONITOR_DISMISSED_FILE (fix only if it costs nothing). Off by default.
     monitor_enabled: bool = Field(default=False, alias="MONITOR_ENABLED")
     monitor_channel_name: str = Field(default="bot-monitor", alias="MONITOR_CHANNEL_NAME")
     # Only this Discord user's reactions count (empty = nobody can approve)
@@ -137,6 +148,16 @@ class Settings(BaseSettings):
     monitor_approved_file: str = Field(
         default="docs/approved-fixes.md", alias="MONITOR_APPROVED_FILE"
     )
+    monitor_dismissed_file: str = Field(
+        default="docs/dismissed-findings.md", alias="MONITOR_DISMISSED_FILE"
+    )
+    # Keep real audio for the IRL test set (src/monitor/recordings.py): every question
+    # as Whisper got it, and clips around wake word hits and near misses. Local only.
+    monitor_save_audio: bool = Field(default=False, alias="MONITOR_SAVE_AUDIO")
+    monitor_audio_dir: str = Field(default="recordings", alias="MONITOR_AUDIO_DIR")
+    monitor_audio_max_mb: float = Field(default=1000.0, alias="MONITOR_AUDIO_MAX_MB")
+    # Near misses scoring below this aren't kept (everyday speech scores ~0.05-0.2)
+    monitor_wake_clip_min_score: float = Field(default=0.2, alias="MONITOR_WAKE_CLIP_MIN_SCORE")
     # Re-transcribe the bot's answer audio with Groq Whisper to catch TTS that doesn't
     # match its text (one extra Groq call per answered turn)
     monitor_retranscribe: bool = Field(default=False, alias="MONITOR_RETRANSCRIBE")

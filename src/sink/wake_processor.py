@@ -81,6 +81,21 @@ class WakeWordProcessor:
         # packet arrives between detection and start_listening()
         self._wake_word_user_id: Optional[int] = None
 
+        # (user_id, recent audio, score, hit) for hits and near misses: the monitor
+        # keeps these clips when MONITOR_SAVE_AUDIO is on. Runs on the audio thread.
+        self.on_clip: Optional[Callable[[int, np.ndarray, float, bool], None]] = None
+
+    def report_clip(self, state, hit: bool, score: Optional[float] = None) -> None:
+        """Hand the user's last ~1.5s (their pre-buffer) to on_clip."""
+        if self.on_clip is None:
+            return
+        if score is None:
+            score = getattr(state.detector, "last_score", 0.0)
+        try:
+            self.on_clip(state.user_id, state.get_pre_buffer(), float(score or 0.0), hit)
+        except Exception as e:
+            logger.debug(f"[WAKE_PROCESSOR] on_clip failed: {e}")
+
     @property
     def wake_word_user_id(self) -> Optional[int]:
         """Get the user ID who triggered the wake word.
@@ -121,6 +136,7 @@ class WakeWordProcessor:
             # This is critical for speaker isolation (see refactor-edge-cases.md Section 3.5)
             self._wake_word_user_id = user_id
             logger.info(f"[WAKE_PROCESSOR] Wake word detected from user {user_id}")
+            self.report_clip(state, hit=True)
             return True
 
         return False
@@ -181,6 +197,7 @@ class WakeWordProcessor:
                         f"[WAKE] Near miss from user {state.user_id}: best score {peak:.2f} "
                         f"(needs {getattr(detector, 'threshold', 0):.2f})"
                     )
+                    self.report_clip(state, hit=False, score=peak)
             if detected:
                 # User attribution is 100% accurate - we know which detector fired
                 self._wake_word_user_id = state.user_id
@@ -188,6 +205,7 @@ class WakeWordProcessor:
                     f"[WAKE_PROCESSOR] Wake word detected from silence padding "
                     f"(gap={user_gap:.2f}s, user: {state.user_id})"
                 )
+                self.report_clip(state, hit=True)
                 return state.user_id
 
             # Also try flush in case there's buffered audio
@@ -197,6 +215,7 @@ class WakeWordProcessor:
                     f"[WAKE_PROCESSOR] Wake word detected from flush "
                     f"(gap={user_gap:.2f}s, user: {state.user_id})"
                 )
+                self.report_clip(state, hit=True)
                 return state.user_id
 
         return None

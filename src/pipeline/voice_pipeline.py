@@ -133,6 +133,8 @@ class VoicePipeline:
         self.observer = None
         # Optional src.llm.chat_post.ChatPoster: reference answers also go to chat
         self.poster = None
+        # The reply itself has started playing (not just the opening/thinking phrase)
+        self.answer_started = False
 
     async def process(
         self,
@@ -176,6 +178,7 @@ class VoicePipeline:
         self._cancelled = False
         self._thinking_task = None
         self._opening = opening
+        self.answer_started = False
 
         # Stage 1: Transcription
         logger.debug("Pipeline: Starting transcription")
@@ -262,6 +265,7 @@ class VoicePipeline:
 
                     # Wait for silence before first response sentence
                     await wait_for_silence()
+                    self.answer_started = True
 
                 if self.observer is not None:
                     self.observer.answer_clip_next()
@@ -405,6 +409,11 @@ class VoicePipeline:
             if generate_task is not None and not generate_task.done():
                 generate_task.cancel()
             done_event.set()
+
+    def forget_last_turn(self) -> bool:
+        """Drop the latest exchange from the conversation history (see ResponseStage)."""
+        forget = getattr(self._response, "forget_last_turn", None)
+        return bool(forget and forget())
 
     async def cancel(self) -> None:
         """Cancel all ongoing processing.

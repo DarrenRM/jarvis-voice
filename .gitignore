@@ -78,3 +78,6 @@ firecrawl-repo/
 
 # E2E harness output (audio, logs)
 reports/
+
+# Real voice recordings kept by the live monitor (MONITOR_SAVE_AUDIO): friends' voices
+recordings/

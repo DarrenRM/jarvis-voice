@@ -97,6 +97,16 @@ class TestTiming:
         turn.clips[0] = Clip(4.0, 0.8, 4.8)
         assert "slow_first_audio" in detectors(turn)
 
+    def test_limits_count_from_the_end_of_the_pause(self):
+        # 2s of quiet ends a question: 3.9s after the last word is 1.9s after that
+        th = Thresholds(pause_s=2.0)
+        turn = good_turn(clips=[Clip(3.9, 0.8, 4.7), Clip(9.5, 1.0, 10.5, answer=True)])
+        assert detectors(turn, th) == []
+        turn = good_turn(clips=[Clip(5.5, 0.8, 6.3), Clip(10.5, 1.0, 11.5, answer=True)])
+        found = {f.detector: f for f in detect(turn, th)}
+        assert set(found) == {"slow_first_audio", "slow_answer"}
+        assert "2s of it is the pause" in found["slow_first_audio"].detail
+
     def test_first_audio_ignored_when_answer_is_first(self):
         # Affirmation skipped (someone talking): the answer is the first sound
         turn = good_turn(clips=[Clip(4.0, 1.0, 5.0, answer=True)])
@@ -164,6 +174,18 @@ class TestLogEvents:
                          events=[event("Groq transcription error: 503",
                                        logger="src.stt.groq_whisper")])
         assert detectors(turn) == ["stt_error"]
+
+    def test_question_cut_off(self):
+        message = ("[CARRY-ON] Sam kept talking after the question seemed finished; "
+                   "started over with all of it (9.2s)")
+        turn = good_turn(events=[event(message, "WARNING", "src.bot.voice_session")])
+        assert detectors(turn) == ["cut_off"]
+
+    def test_talked_during_answer(self):
+        message = ("[CARRY-ON] Sam talked during the answer (1.2s); "
+                   "keeping it for their follow-up")
+        turn = good_turn(events=[event(message, "WARNING", "src.bot.voice_session")])
+        assert detectors(turn) == ["talked_during_answer"]
 
     def test_unexpected_error(self):
         turn = good_turn(events=[event("Something odd broke", logger="src.bot.voice_session")])

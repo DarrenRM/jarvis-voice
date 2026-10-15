@@ -130,6 +130,21 @@ class TestConversationHistory:
         stage.reset_conversation()
         assert stage.get_messages() == []
 
+    async def test_forget_last_turn(self):
+        """Carry-on restart: the answer was never played, so it isn't remembered."""
+        stage, _ = make_stage()
+        await run(stage, "hello")
+        kept = stage.get_messages()
+        await run(stage, "sup")
+        assert stage.forget_last_turn()
+        assert stage.get_messages() == kept
+        assert not stage.forget_last_turn()  # only the latest one
+        assert stage.get_messages() == kept
+
+    def test_forget_with_no_turn(self):
+        stage, _ = make_stage()
+        assert not stage.forget_last_turn()
+
     def test_get_messages_returns_copy(self):
         stage, _ = make_stage()
         stage.get_messages().append({"role": "test"})

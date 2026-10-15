@@ -8,6 +8,8 @@ Drives the real VoiceSession (sink -> wake word -> VAD -> Groq Whisper -> Cerebr
   decoder thread).
 - Everything the bot plays is captured frame by frame with timestamps, then
   transcribed with Groq Whisper so each step can be checked from the outside.
+- A speech part can also be a Recording: a real clip the live bot saved
+  (recordings/turns/*.wav), played instead of synthesized speech.
 
 Live APIs are used (Groq, Cerebras, Inworld). Nothing is sent to Discord, unless
 run_voice_e2e --listen sets Rig.mirror to play the run into a voice channel.
@@ -17,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
 import re
 import threading
@@ -179,12 +182,66 @@ class FakeVoiceClient:
 
 # ---------------------------------------------------------------- user speech
 
-Part = Union[str, float]  # text to speak, or seconds of silence
+def read_sidecar(wav_path: Path | str) -> dict:
+    """The .json saved next to a recording ({} if missing or unreadable)."""
+    path = Path(wav_path).with_suffix(".json")
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+
+
+@dataclass(frozen=True)
+class Recording:
+    """A real clip played instead of synthesized speech: recordings/turns/<...>.wav from
+    the live bot (16 kHz mono int16, exactly what went to Whisper; other rates and widths
+    work too). The same-name .json sidecar gives the text shown in reports."""
+
+    path: Path | str
+    trim: bool = False  # cut leading/trailing silence (off: keep the real timing)
+
+    @property
+    def meta(self) -> dict:
+        return read_sidecar(self.path)
+
+    @property
+    def text(self) -> str:
+        meta = self.meta
+        return (meta.get("raw_heard") or meta.get("heard")
+                or f"<recording {Path(self.path).name}>")
+
+
+def load_recording(rec: Recording) -> np.ndarray:
+    """A WAV as 24 kHz mono float32, the format synthesized speech is rendered in."""
+    from math import gcd
+
+    from scipy.io import wavfile
+    from scipy.signal import resample_poly
+
+    rate, data = wavfile.read(str(rec.path))
+    if data.dtype == np.uint8:
+        audio = (data.astype(np.float32) - 128.0) / 128.0
+    elif np.issubdtype(data.dtype, np.integer):
+        audio = data.astype(np.float32) / float(np.iinfo(data.dtype).max + 1)
+    else:
+        audio = data.astype(np.float32)
+    if audio.ndim > 1:
+        audio = audio.mean(axis=1)
+    if rate != TTS_RATE:
+        g = gcd(rate, TTS_RATE)
+        audio = resample_poly(audio, TTS_RATE // g, rate // g)
+    audio = np.clip(audio, -1, 1).astype(np.float32)
+    return _trim_silence(audio) if rec.trim else audio
+
+
+# Text to speak, seconds of silence, or a recorded clip
+Part = Union[str, float, Recording]
 
 
 @dataclass
 class Speech:
-    """One person talking. parts mixes text and pauses: ["Hey Jarvis.", 1.0, "what time is it?"]."""
+    """One person talking. parts mixes text, pauses and recordings:
+    ["Hey Jarvis.", 1.0, "what time is it?"] or [Recording("recordings/turns/x.wav")]."""
 
     user: FakeMember
     parts: list[Part]
@@ -195,12 +252,19 @@ class Speech:
     # Start this many seconds after the bot finishes its previous reply, while it may
     # still be listening for a follow-up (instead of waiting for it to go idle)
     after_reply: Optional[float] = None
+    # Start this many seconds after the bot starts speaking its answer (fillers don't
+    # count), i.e. talk over it. Like after_reply, needs the scenario's `between`.
+    during_answer: float | None = None
+    # Start this many seconds after the previous speech ends (its last packet), in the
+    # same turn: e.g. a friend talks, then the asker replies
+    after_prev: float | None = None
     started_at: float = 0.0  # set when scheduled (scenario clock)
     ended_at: float = 0.0  # time of the last packet sent
 
     @property
     def text(self) -> str:
-        return " ".join(p for p in self.parts if isinstance(p, str))
+        return " ".join(p if isinstance(p, str) else p.text
+                        for p in self.parts if isinstance(p, (str, Recording)))
 
 
 class SpeechFactory:
@@ -240,6 +304,8 @@ class SpeechFactory:
         for part in speech.parts:
             if isinstance(part, str):
                 pieces.append(await self.say(part, speech.voice))
+            elif isinstance(part, Recording):
+                pieces.append(load_recording(part))
             else:
                 pieces.append(np.zeros(int(part * TTS_RATE), dtype=np.float32))
         audio = np.concatenate(pieces)
@@ -373,6 +439,43 @@ def write_wav(path: Path, user_track, segments, duration: float) -> None:
 
 # ---------------------------------------------------------------- scenario run
 
+WEB_TOOLS = ("web_search", "web_extract")
+
+
+def _answer_started(session) -> bool:
+    """The bot has started playing this turn's answer (VoicePipeline resets it per turn)."""
+    return bool(getattr(session._voice_pipeline, "answer_started", False))
+
+
+def _limit_web(limit: int | None) -> Callable[[], None]:
+    """Allow at most `limit` web lookups (None: no limit) until the returned function is
+    called. Past the limit the tool answers with an error instead of going online, so a
+    scenario that shouldn't search can't spend the live search budget."""
+    if limit is None:
+        return lambda: None
+    from src.tools.base import ToolResult
+    from src.tools.executor import ToolExecutor
+
+    original = ToolExecutor.execute
+    used = [0]
+
+    async def execute(self, tool_name: str, args: dict) -> ToolResult:
+        if tool_name in WEB_TOOLS:
+            used[0] += 1
+            if used[0] > limit:
+                logger.warning(f"[E2E] Blocked {tool_name} (web limit {limit} for this scenario)")
+                return ToolResult(success=False, output="",
+                                  error="Web lookup is unavailable right now.",
+                                  metadata={"tool_name": tool_name})
+        return await original(self, tool_name, args)
+
+    ToolExecutor.execute = execute
+
+    def restore() -> None:
+        ToolExecutor.execute = original
+
+    return restore
+
 
 @dataclass
 class TurnRecord:
@@ -431,15 +534,20 @@ class Rig:
 
     async def run(self, name: str, speeches: list[Speech], members: list[FakeMember],
                   settle: float = 3.0, timeout: float = 90.0,
-                  between: Optional[float] = None, observer=None) -> RunResult:
+                  between: Optional[float] = None, observer=None,
+                  web_limit: int | None = None) -> RunResult:
         """Run speeches through a fresh VoiceSession and collect everything it did.
 
         If `between` is set, speeches are played as separate turns: each one starts
-        `between` seconds after the bot has gone quiet from the previous turn.
+        `between` seconds after the bot has gone quiet from the previous turn (a speech
+        with after_prev joins the previous one's turn).
         observer: optional live-monitor TurnRecorder (run_voice_e2e --monitor)
+        web_limit: web lookups (search or page read) allowed; past it the tool returns
+        an error without going online. The call is still in history, so checks see it.
         """
         from src.bot.voice_session import VoiceSession
 
+        restore_web = _limit_web(web_limit)
         t0 = time.perf_counter()
         clock = lambda: time.perf_counter() - t0  # noqa: E731
         guild = FakeGuild(members, self.settings.image_channel_name)
@@ -451,6 +559,7 @@ class Rig:
         session_task = asyncio.create_task(session.start(vc))
         while session.sink is None:
             if session_task.done():
+                restore_web()
                 session_task.result()
             await asyncio.sleep(0.05)
         # share loaded models with later sessions
@@ -459,7 +568,12 @@ class Rig:
         error = None
         injector = Injector(session.sink, clock, tap=self.mirror.user if self.mirror else None)
         try:
-            groups = [speeches] if between is None else [[s] for s in speeches]
+            groups: list[list[Speech]] = []
+            for s in speeches:
+                if groups and (between is None or s.after_prev is not None):
+                    groups[-1].append(s)
+                else:
+                    groups.append([s])
             # Synthesize everything first so it can't eat into a follow-up window
             all_rendered = [[(sp, await self.speech.render(sp, seed=k))
                              for k, sp in enumerate(group)] for group in groups]
@@ -468,16 +582,27 @@ class Rig:
                 # Offsets count from now, after models loaded and speech is synthesized
                 if gi and group[0].after_reply is not None:
                     base = clock() + group[0].after_reply - group[0].at
+                elif gi and group[0].during_answer is not None:
+                    base = clock() + group[0].during_answer - group[0].at
                 else:
                     base = clock() + (between or 0.0) - (group[0].at if gi else 0.0)
                 schedule = []
+                prev: Speech | None = None
                 for sp, audio in rendered:
-                    schedule += build_schedule(sp, to_frames(audio, sp.mode), base)
+                    offset = base
+                    if prev is not None and sp.after_prev is not None:
+                        offset = prev.ended_at + sp.after_prev - sp.at
+                    schedule += build_schedule(sp, to_frames(audio, sp.mode), offset)
+                    prev = sp
+                # An answer flag still set from an earlier turn: not this turn's answer
+                stale = _answer_started(session)
                 await asyncio.to_thread(injector.run, schedule)
                 if injector.error:
                     raise injector.error
                 following = groups[gi + 1][0] if gi + 1 < len(groups) else None
-                if following is not None and following.after_reply is not None:
+                if following is not None and following.during_answer is not None:
+                    await self._wait_answer_started(session, timeout, stale)
+                elif following is not None and following.after_reply is not None:
                     await self._wait_reply_done(session, vc, timeout)
                 else:
                     await self._wait_quiet(session, vc, settle, timeout)
@@ -491,6 +616,7 @@ class Rig:
                 await session_task
             except (asyncio.CancelledError, Exception):
                 pass
+            restore_web()
 
         for seg in vc.segments:
             audio = frames_to_16k(seg.frames)
@@ -525,6 +651,18 @@ class Rig:
                     return
             await asyncio.sleep(0.05)
         raise TimeoutError(f"bot never finished replying within {timeout:.0f}s")
+
+    async def _wait_answer_started(self, session, timeout: float, stale: bool) -> None:
+        """Wait until the bot starts playing its answer (after "Sure, ..." and fillers).
+        stale: the flag was set before this turn's speech, so wait for it to reset first."""
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            if stale:
+                stale = _answer_started(session)
+            elif _answer_started(session):
+                return
+            await asyncio.sleep(0.05)
+        raise TimeoutError(f"bot never started answering within {timeout:.0f}s")
 
     async def _wait_quiet(self, session, vc: FakeVoiceClient, settle: float, timeout: float) -> None:
         """Wait until the session is idle and nothing has played for `settle` seconds."""

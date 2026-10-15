@@ -42,7 +42,7 @@ from ..tts import TTSSynthesizer
 from .discord_service import DiscordService
 from .speaker_manager import SpeakerManager, SpeakerInfo
 from . import pycord_dave_patch
-from .voice_sink import StreamingSink
+from .voice_sink import CARRY_ON_MIN_SPEECH_SECONDS, StreamingSink
 from .voice_source import TTSAudioSource
 
 # Phase 4 imports (conditionally used based on feature flags)
@@ -50,6 +50,11 @@ from ..session.speaker_tracker import SpeakerTracker
 from ..session.greeting_service import GreetingService
 from ..session.phrases import get_random_ack, get_thinking_phrase, get_affirmation_phrase
 from ..session.thinking_phrase_generator import ThinkingPhraseGenerator
+
+# _process_speech_with_pipeline result: the speaker carried on talking, start over
+CARRY_ON = "carry_on"
+# After a question's reply window closes unanswered, how long to watch for a late reply
+LATE_REPLY_WATCH_SECONDS = 5.0
 
 if TYPE_CHECKING:
     from ..monitor import TurnRecorder
@@ -128,6 +133,10 @@ class VoiceSession:
         self._followup_open = False
         # Someone else said the wake word during a follow-up window: their user ID
         self._wake_from_followup: Optional[int] = None
+        # Everything the speaker said when a turn is started over (CARRY_ON)
+        self._carry_on_audio: Optional[np.ndarray] = None
+        self._followup_others_talked = 0.0  # last follow-up window: others' talk, seconds
+        self._late_reply_task: Optional[asyncio.Task] = None
 
         # Events for thread-safe communication
         self._wake_event = asyncio.Event()
@@ -400,6 +409,7 @@ class VoiceSession:
             on_speech_end=self._on_speech_end,
             max_speech_duration=self.settings.max_question_duration,
             speaker_isolation_enabled=self.settings.speaker_isolation_enabled,
+            on_wake_clip=getattr(self.turn_observer, "wake_clip", None),
         )
 
         # Start recording with the sink
@@ -442,6 +452,8 @@ class VoiceSession:
         """Stop the voice session."""
         logger.info("Stopping voice session...")
         self._running = False
+        if self._late_reply_task is not None:
+            self._late_reply_task.cancel()
 
         # Cancel thinking task
         if self._thinking_task and not self._thinking_task.done():
@@ -673,6 +685,8 @@ class VoiceSession:
 
                 # If the bot asked something, the asker can answer without the wake word
                 await self._followup_after(result)
+                # Whatever the speaker said after that isn't part of a turn any more
+                self.sink.stop_capture(only_fold=True)
 
             except asyncio.CancelledError:
                 break
@@ -1184,34 +1198,49 @@ class VoiceSession:
         """
         self.state = "processing"
         total_start = time.perf_counter()
+        restarted = False
 
-        # Log audio stats
-        audio_duration = len(audio) / SAMPLE_RATE_PROCESSING
-        logger.info(f"[TIMING] Audio captured: {audio_duration:.2f}s ({len(audio)} samples)")
+        while True:
+            # Log audio stats
+            audio_duration = len(audio) / SAMPLE_RATE_PROCESSING
+            logger.info(f"[TIMING] Audio captured: {audio_duration:.2f}s ({len(audio)} samples)")
 
-        monitor_token = None
-        if self.turn_observer:
-            monitor_token = self.turn_observer.turn_started(
-                self._current_speaker_id, self._current_speaker_name,
-                speech_end=self.sink.last_audio_time if self.sink else None,
-            )
-        error: Optional[BaseException] = None
-        result: Optional[str] = None
-        try:
-            result = await self._process_speech_with_pipeline(audio, followup)
-        except BaseException as e:
-            error = e
-            raise
-        finally:
+            monitor_token = None
             if self.turn_observer:
-                self.turn_observer.turn_ended(monitor_token, error)
+                monitor_token = self.turn_observer.turn_started(
+                    self._current_speaker_id, self._current_speaker_name,
+                    speech_end=self.sink.last_audio_time if self.sink else None,
+                )
+                question_audio = getattr(self.turn_observer, "question_audio", None)
+                if question_audio is not None:
+                    question_audio(audio)
+            if restarted:
+                # Inside the new turn so the monitor reports it
+                logger.warning(
+                    f"[CARRY-ON] {self._current_speaker_name} kept talking after the question "
+                    f"seemed finished; started over with all of it ({audio_duration:.1f}s)"
+                )
+            error: Optional[BaseException] = None
+            result: Optional[str] = None
+            try:
+                result = await self._process_speech_with_pipeline(audio, followup, restarted)
+            except BaseException as e:
+                error = e
+                raise
+            finally:
+                if self.turn_observer:
+                    self.turn_observer.turn_ended(monitor_token, error)
+            if result != CARRY_ON:
+                break
+            audio, self._carry_on_audio = self._carry_on_audio, None
+            restarted = True
 
         total_time = time.perf_counter() - total_start
         logger.info(f"[TIMING] === TOTAL: {total_time:.2f}s ===")
         return result
 
     async def _process_speech_with_pipeline(
-        self, audio: np.ndarray, followup: Optional[FollowUp] = None
+        self, audio: np.ndarray, followup: Optional[FollowUp] = None, restarted: bool = False
     ) -> Optional[str]:
         """Process speech using the new modular VoicePipeline.
 
@@ -1247,20 +1276,22 @@ class VoiceSession:
 
         opening: Optional[OpeningPhrase] = None
         accept = None
-        if followup is None:
+        if followup is None and not restarted:
             opening = OpeningPhrase(
                 synthesize=lambda: self.tts.synthesize_cached(opening_text),
                 play_audio=self._play_audio,
                 should_play=room_is_quiet,
             )
             logger.debug(f"[PIPELINE] Opening phrase started: {opening_text}")
-        else:
+        elif followup is not None:
             # Carrying on without the wake word: no "Sure, Darren", and only if it was for us
             async def accept(transcription: TranscriptionResult) -> bool:
                 return await self._is_addressed(followup, transcription)
+        # (started over: "Sure, Darren" was already said)
 
-        # Run the pipeline
-        result = await self._voice_pipeline.process(
+        # Run the pipeline, still listening to the speaker: if they carry on before the
+        # answer starts, start over with everything they said
+        process = asyncio.create_task(self._voice_pipeline.process(
             audio=audio,
             context=context,
             play_audio=self._play_audio,
@@ -1270,9 +1301,20 @@ class VoiceSession:
             tts_synthesizer=self.tts if thinking_generator else None,
             opening=opening,
             accept=accept,
-        )
+        ))
+        if await self._carried_on(process, audio):
+            if self.turn_observer:
+                self.turn_observer.pipeline_result("cancelled")
+            return CARRY_ON
+        result = process.result()
         if self.turn_observer:
             self.turn_observer.pipeline_result(result)
+        if (result is None and self.sink is not None
+                and self.sink.captured_speech() >= CARRY_ON_MIN_SPEECH_SECONDS):
+            logger.warning(
+                f"[CARRY-ON] {self._current_speaker_name} talked during the answer "
+                f"({self.sink.captured_speech():.1f}s); keeping it for their follow-up"
+            )
 
         # Handle special results
         if result == "wake_word_only":
@@ -1287,6 +1329,106 @@ class VoiceSession:
         else:
             logger.debug("[PIPELINE] Processing completed normally")
         return result
+
+    async def _carried_on(self, process: asyncio.Task, said: np.ndarray) -> bool:
+        """Wait for the pipeline while keeping the speaker's audio. If they say more
+        before the answer starts playing (an "um... so..." pause ended their turn),
+        cancel it, hear them out, and return True (_carry_on_audio holds all of it).
+        Speech while the bot plays a filler doesn't count: it may be the bot's own
+        voice coming back through their mic."""
+        speaker = self._current_speaker_id
+        if self.sink is None or speaker is None:
+            await asyncio.wait({process})
+            return False
+        self.sink.start_capture(speaker)
+        try:
+            while not process.done():
+                await asyncio.wait({process}, timeout=0.1)
+                if process.done() or self._voice_pipeline.answer_started:
+                    continue
+                if self.sink.captured_speech(while_bot_quiet=True) >= CARRY_ON_MIN_SPEECH_SECONDS:
+                    break
+            else:
+                return False
+        except asyncio.CancelledError:
+            process.cancel()
+            raise
+
+        logger.info(f"[CARRY-ON] {self._current_speaker_name} is still talking, starting over")
+        process.cancel()
+        await asyncio.wait({process})
+        await self._voice_pipeline.cancel()
+        # The LLM may have finished before the answer played: nobody heard it
+        forget = getattr(self._voice_pipeline, "forget_last_turn", None)
+        if forget is not None and forget():
+            logger.info("[CARRY-ON] Dropped the unheard answer from history")
+        if self.voice_client and self.voice_client.is_playing():
+            self.voice_client.stop()
+        self._carry_on_audio = await self._hear_the_rest(speaker, said)
+        return True
+
+    async def _hear_the_rest(self, speaker_id: int, said: np.ndarray) -> np.ndarray:
+        """Listen to the speaker until they finish. Returns all of it, `said` first."""
+        self.state = "listening"
+        self._speech_end_event.clear()
+        self._pending_audio = None
+        self.sink.start_listening(user_id=speaker_id, prefix=said)
+        deadline = time.perf_counter() + self.settings.max_question_duration
+        audio: Optional[np.ndarray] = None
+        while self._running and time.perf_counter() < deadline:
+            try:
+                await asyncio.wait_for(self._speech_end_event.wait(), timeout=0.2)
+                audio = self._pending_audio
+                break
+            except asyncio.TimeoutError:
+                pass
+            if self.sink.check_audio_timeout():
+                break
+        if audio is None:
+            audio = self.sink.get_audio_buffer()
+        self.sink.stop_listening()
+        self.state = "processing"
+        return audio if len(audio) > 0 else said
+
+    def _others_talking(self, speaker_id: Optional[int]) -> bool:
+        """Someone other than speaker_id is talking right now."""
+        detector = self.speaking_detector
+        if detector is None or not self.settings.speaking_detection_enabled:
+            return False
+        return any(user != speaker_id for user in detector.get_speaking_users())
+
+    def _watch_for_late_reply(self, speaker_id: Optional[int], question: str) -> None:
+        """The bot asked a question and the reply window closed unanswered. If the person
+        starts talking within a few seconds anyway, the window was probably too short:
+        tell the monitor. (Measuring only; their next turn doesn't start with this.)"""
+        if self.sink is None or speaker_id is None or self.turn_observer is None:
+            return
+        name = self._current_speaker_name
+        others = self._followup_others_talked
+        self.sink.start_capture(speaker_id, fold=False)
+
+        async def check() -> None:
+            await asyncio.sleep(LATE_REPLY_WATCH_SECONDS)
+            if not self.sink.is_capturing(speaker_id, fold=False):
+                return  # a new turn started (wake word): not a missed reply
+            said = self.sink.captured_speech(while_bot_quiet=True)
+            self.sink.stop_capture()
+            if said < CARRY_ON_MIN_SPEECH_SECONDS:
+                return
+            note = (
+                f"{name} started talking within {LATE_REPLY_WATCH_SECONDS:.0f}s after the "
+                f"window to answer the bot's question closed ({said:.1f}s of speech, no wake "
+                f"word), so it was probably their reply. Others talked {others:.1f}s while "
+                "the window was open."
+            )
+            logger.warning(f"[FOLLOWUP] Late reply: {note}")
+            report = getattr(self.turn_observer, "incident", None)
+            if report is not None:
+                report(speaker_id, name, "late_reply", note, reply=question)
+
+        if self._late_reply_task is not None:
+            self._late_reply_task.cancel()
+        self._late_reply_task = asyncio.create_task(check())
 
     async def _followup_after(self, result: Optional[str]) -> None:
         """After the bot speaks, the person it answered can carry on without the wake
@@ -1308,6 +1450,8 @@ class VoiceSession:
                 return
             audio = await self._listen_for_followup(speaker_id, window, followup.bot_asked)
             if audio is None:
+                if followup.bot_asked and self._wake_from_followup is None:
+                    self._watch_for_late_reply(speaker_id, reply)
                 return
             result = await self._process_speech(audio, followup=followup)
 
@@ -1322,8 +1466,13 @@ class VoiceSession:
     async def _listen_for_followup(
         self, speaker_id: Optional[int], window: float, bot_asked: bool
     ) -> Optional[np.ndarray]:
-        """Listen to one speaker for `window` seconds. Returns their speech, or None if
-        they didn't start talking in time. Speech already under way may finish."""
+        """Listen to one speaker for `window` seconds of quiet. Returns their speech, or
+        None if they didn't start talking in time. Speech already under way may finish
+        (including anything they said during the answer).
+
+        The window only counts down while nobody else is talking, and when someone else
+        stops, the speaker gets at least followup_grace_seconds: people wait for a gap
+        before replying rather than jumping in at the first pause."""
         logger.info(
             f"[FOLLOWUP] Bot {'asked a question' if bot_asked else 'answered'}; listening "
             f"{window:.0f}s for {self._current_speaker_name} without the wake word"
@@ -1335,9 +1484,12 @@ class VoiceSession:
         self._followup_open = True
         self.sink.start_listening(user_id=speaker_id, watch_wake_word=True)
 
-        start = time.perf_counter()
-        deadline = start + window
-        final_deadline = start + self.settings.max_question_duration
+        start = last = time.perf_counter()
+        give_up = start + self.settings.followup_max_wait_seconds
+        quiet_left = window
+        others_talking = False
+        others_talked = 0.0
+        speech_since: Optional[float] = None
         audio: Optional[np.ndarray] = None
         while self._running:
             try:
@@ -1352,12 +1504,28 @@ class VoiceSession:
             if self._wake_from_followup is not None:  # someone else's turn
                 break
             now = time.perf_counter()
+            step, last = now - last, now
             if self.sink.is_speech_active():
-                if now >= final_deadline:
+                speech_since = speech_since or now
+                if now - speech_since >= self.settings.max_question_duration:
                     audio = self.sink.get_audio_buffer()
                     break
-            elif now >= deadline:
+                continue
+            if self._others_talking(speaker_id):
+                others_talking = True
+                others_talked += step
+            else:
+                if others_talking:
+                    # Grace counts from here (this step was mostly them still talking)
+                    others_talking = False
+                    quiet_left = max(quiet_left, self.settings.followup_grace_seconds)
+                else:
+                    quiet_left -= step
+                if quiet_left <= 0:
+                    break
+            if now >= give_up:
                 break
+        self._followup_others_talked = others_talked
 
         self._followup_open = False
         self.sink.stop_listening()
@@ -1365,7 +1533,10 @@ class VoiceSession:
         if self._wake_from_followup is not None:
             return None  # the main loop starts their turn
         if audio is None or len(audio) == 0:
-            logger.info("[FOLLOWUP] No reply, back to waiting for the wake word")
+            logger.info(
+                "[FOLLOWUP] No reply, back to waiting for the wake word"
+                + (f" (others talked {others_talked:.1f}s)" if others_talked else "")
+            )
             return None
         return audio
 

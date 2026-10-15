@@ -5,6 +5,7 @@ for wake word detection and VAD, rather than waiting for recording to stop.
 """
 
 import logging
+import threading
 import time
 from typing import TYPE_CHECKING, Callable, Optional
 
@@ -21,6 +22,11 @@ if TYPE_CHECKING:
     from ..detection import SpeakingDetector, SpeakingState, WakeWordDetector
 
 logger = logging.getLogger(__name__)
+
+# Captured speech shorter than this (a cough, a stray "mm") doesn't count as carrying on
+CARRY_ON_MIN_SPEECH_SECONDS = 0.4
+# Discord packets are 20 ms: about 60 s of capture at most
+_CAPTURE_MAX_CHUNKS = 3000
 
 
 class StreamingSink(discord.sinks.Sink):
@@ -59,6 +65,7 @@ class StreamingSink(discord.sinks.Sink):
         max_speech_duration: float = 30.0,
         speaker_isolation_enabled: bool = True,
         filters=None,
+        on_wake_clip: Optional[Callable[[int, np.ndarray, float, bool], None]] = None,
     ):
         """Initialize streaming sink.
 
@@ -74,6 +81,8 @@ class StreamingSink(discord.sinks.Sink):
             max_speech_duration: Max seconds of speech before forced end (default 30s)
             speaker_isolation_enabled: Filter audio from non-wake-word speakers (default True)
             filters: Optional pycord audio filters
+            on_wake_clip: Gets (user_id, last ~1.5s of audio, score, hit) for wake word
+                hits and near misses (audio thread; the monitor saves them)
         """
         super().__init__(filters=filters)
 
@@ -111,7 +120,8 @@ class StreamingSink(discord.sinks.Sink):
 
         # Push-to-talk detection: track last audio received
         self._last_audio_time: Optional[float] = None
-        self._silence_timeout = 0.5  # Seconds of no audio = speech end (for PTT)
+        # Seconds of no audio = speech end (PTT released, or Discord's voice gate closed)
+        self._silence_timeout = get_settings().min_silence_ms / 1000
         self._audio_timeout_detected = False  # Once detected, commit to it
 
         # Track if we've already flushed wake detector for current gap
@@ -124,6 +134,22 @@ class StreamingSink(discord.sinks.Sink):
         # This prevents premature truncation when Discord packet timing is unreliable
         self._pending_speech_end_time: Optional[float] = None
         self._multi_speaker_silence_extension_ms = 500  # Extra silence required when others speaking
+
+        # Carry-on capture: while the session works on a turn (sink idle), keep the
+        # speaker's audio so whatever they add isn't lost. start_listening() for the same
+        # speaker picks it up; VoiceSession also checks it to start a turn over.
+        self._capture_lock = threading.Lock()
+        self._capture_user_id: Optional[int] = None
+        self._capture_fold = True  # start_listening() for this speaker starts from it
+        self._capture_buffer: list[np.ndarray] = []
+        self._capture_voiced = 0.0  # seconds of it that were speech
+        self._capture_voiced_quiet = 0.0  # ...said while the bot wasn't playing anything
+        self._capture_last_audio: Optional[float] = None
+        self._capture_last_voiced: Optional[float] = None
+        # Listening that started from captured speech: ends once the speaker has been
+        # quiet for _silence_timeout even if Discord keeps sending (VAD never restarted)
+        self._seeded = False
+        self._last_voiced_time: Optional[float] = None
 
         # Wake word refractory period: after detection, suppress further detections
         # This prevents the same "hey jarvis" audio from triggering multiple times
@@ -138,6 +164,7 @@ class StreamingSink(discord.sinks.Sink):
             wake_sample_rate=wake_sample_rate,
         )
         self._wake_processor = WakeWordProcessor(self._user_manager)
+        self._wake_processor.on_clip = on_wake_clip
 
     @property
     def state(self) -> str:
@@ -191,7 +218,12 @@ class StreamingSink(discord.sinks.Sink):
         self._user_manager.cleanup_user(user_id)
         logger.debug(f"[WAKE] Removed user {user_id}")
 
-    def start_listening(self, user_id: Optional[int] = None, watch_wake_word: bool = False):
+    def start_listening(
+        self,
+        user_id: Optional[int] = None,
+        watch_wake_word: bool = False,
+        prefix: Optional[np.ndarray] = None,
+    ):
         """Transition to listening state.
 
         Args:
@@ -199,6 +231,7 @@ class StreamingSink(discord.sinks.Sink):
                 Default: the wake word speaker.
             watch_wake_word: Keep detecting the wake word from everyone else; a hit
                 calls on_wake_word (lets someone else cut a follow-up window short)
+            prefix: Audio that goes first in the buffer (a turn being started over)
         """
         logger.info("[SINK] start_listening() called")
 
@@ -206,10 +239,22 @@ class StreamingSink(discord.sinks.Sink):
         # This prevents race conditions where another user's packet arrives between detection and start_listening
         wake_user = user_id or self._wake_processor.wake_word_user_id or self._last_user_id
 
-        # Include ONLY the wake word speaker's pre-buffer (speaker isolation)
-        # This captures the start of questions when user speaks continuously
+        # What the speaker said while the bot was busy (carry-on capture) comes first;
+        # otherwise ONLY the wake word speaker's pre-buffer (speaker isolation), which
+        # captures the start of questions when the user speaks continuously
+        captured, captured_last, captured_voiced, captured_last_voiced = (
+            self._end_capture(wake_user)
+        )
+        seeded = prefix is not None or captured_voiced >= CARRY_ON_MIN_SPEECH_SECONDS
         state = self._user_manager.get(wake_user) if wake_user else None
-        if state:
+        if seeded:
+            parts = [a for a in (prefix, captured) if a is not None and len(a) > 0]
+            logger.info(
+                f"[SINK] Starting from {sum(len(a) for a in parts) / SAMPLE_RATE_PROCESSING:.2f}s "
+                f"already said by user {wake_user} ({captured_voiced:.1f}s while the bot was busy)"
+            )
+            self._audio_buffer = parts
+        elif state:
             pre_buffer = state.get_pre_buffer()
             pre_duration = len(pre_buffer) / SAMPLE_RATE_PROCESSING
             logger.info(f"[SINK] Including {pre_duration:.2f}s pre-buffer from user {wake_user}")
@@ -227,9 +272,13 @@ class StreamingSink(discord.sinks.Sink):
         # Reset filtered user tracking
         self._filtered_users.clear()
 
-        self._speech_started = False
+        self._speech_started = seeded
+        self._seeded = seeded
         self._pending_speech_end_time = None  # Reset multi-speaker tolerance
-        self._last_audio_time = None  # Reset PTT tracking
+        # PTT tracking: seeded listening counts from the speaker's last audio
+        now = time.perf_counter()
+        self._last_audio_time = (captured_last or now) if seeded else None
+        self._last_voiced_time = (captured_last_voiced or now) if seeded else None
         self._audio_timeout_detected = False  # Reset timeout flag
 
         # NOTE: Removed skip logic - pre-buffer replaces it
@@ -260,6 +309,86 @@ class StreamingSink(discord.sinks.Sink):
             return np.array([], dtype=np.float32)
         return np.concatenate(self._audio_buffer)
 
+    def start_capture(self, user_id: Optional[int], fold: bool = True) -> None:
+        """Keep this speaker's audio while the sink is idle (see _capture_user_id).
+
+        fold: start_listening() for this speaker begins with it. False only measures
+        (how much they said), so a later wake word turn doesn't start with old chatter.
+        """
+        with self._capture_lock:
+            self._capture_user_id = user_id
+            self._capture_fold = fold
+            self._capture_buffer = []
+            self._capture_voiced = 0.0
+            self._capture_voiced_quiet = 0.0
+            self._capture_last_audio = None
+            self._capture_last_voiced = None
+
+    def stop_capture(self, only_fold: bool = False) -> None:
+        """Stop capturing (only_fold: leave a measuring-only capture running)."""
+        with self._capture_lock:
+            if only_fold and not self._capture_fold:
+                return
+        self.start_capture(None)
+
+    def is_capturing(self, user_id: Optional[int], fold: bool) -> bool:
+        """This capture is still running (nothing has started listening since)."""
+        with self._capture_lock:
+            return self._capture_user_id == user_id and self._capture_fold == fold
+
+    def captured_speech(self, while_bot_quiet: bool = False) -> float:
+        """Seconds of speech captured so far (optionally only while the bot was silent,
+        which leaves out the bot's own voice echoing through someone's mic)."""
+        with self._capture_lock:
+            return self._capture_voiced_quiet if while_bot_quiet else self._capture_voiced
+
+    def _end_capture(
+        self, user_id: Optional[int]
+    ) -> tuple[Optional[np.ndarray], Optional[float], float, Optional[float]]:
+        """Stop capturing. Returns (audio, last audio time, seconds of speech, last speech
+        time) if the capture was for user_id, else (None, None, 0, None)."""
+        with self._capture_lock:
+            mine = (user_id is not None and self._capture_user_id == user_id
+                    and self._capture_fold)
+            audio = np.concatenate(self._capture_buffer) if mine and self._capture_buffer else None
+            result = (audio, self._capture_last_audio, self._capture_voiced,
+                      self._capture_last_voiced) if mine else (None, None, 0.0, None)
+        self.stop_capture()
+        return result
+
+    def _capture(self, user_id: int, audio_16k: np.ndarray, now: float) -> None:
+        if user_id != self._capture_user_id:
+            return
+        voiced = self._user_is_speaking(user_id, audio_16k)
+        seconds = len(audio_16k) / SAMPLE_RATE_PROCESSING
+        bot_playing = self._bot_is_playing()
+        with self._capture_lock:
+            if user_id != self._capture_user_id:
+                return
+            self._capture_buffer.append(audio_16k.copy())
+            if len(self._capture_buffer) > _CAPTURE_MAX_CHUNKS:
+                self._capture_buffer.pop(0)  # nobody took it; keep the newest only
+            self._capture_last_audio = now
+            if voiced:
+                self._capture_voiced += seconds
+                self._capture_last_voiced = now
+                if not bot_playing:
+                    self._capture_voiced_quiet += seconds
+
+    def _user_is_speaking(self, user_id: int, audio_16k: np.ndarray) -> bool:
+        """This packet is speech (speaking detector's per-user state, else energy)."""
+        if self.speaking_detector:
+            user = self.speaking_detector.get_user_state(user_id)
+            return bool(user and user.is_speaking)
+        return float(np.sqrt(np.mean(audio_16k**2))) >= 0.01
+
+    def _bot_is_playing(self) -> bool:
+        vc = getattr(self, "vc", None)
+        try:
+            return bool(vc and vc.is_playing())
+        except Exception:
+            return False
+
     def check_audio_timeout(self) -> bool:
         """Check if audio has stopped arriving (push-to-talk released).
 
@@ -277,6 +406,10 @@ class StreamingSink(discord.sinks.Sink):
             return False
 
         silence_duration = time.perf_counter() - self._last_audio_time
+        if self._seeded and self._last_voiced_time is not None:
+            # Started from captured speech: Discord may keep sending (noise) with no
+            # VAD restart, so quiet from the speaker also counts
+            silence_duration = max(silence_duration, time.perf_counter() - self._last_voiced_time)
         if silence_duration >= self._silence_timeout:
             buffer_samples = sum(len(a) for a in self._audio_buffer)
             buffer_duration = buffer_samples / SAMPLE_RATE_PROCESSING
@@ -467,6 +600,7 @@ class StreamingSink(discord.sinks.Sink):
                             self._wake_processor._wake_word_user_id = attributed_user
                             self._wake_word_refractory_until = time.perf_counter() + self._wake_word_refractory_seconds
                             logger.info(f"[SINK] Wake word detected from flushed buffer! (user: {attributed_user})")
+                            self._wake_processor.report_clip(state, hit=True)
                             if self._on_wake_word:
                                 self._on_wake_word()
                                 return  # Don't process current audio if wake word found
@@ -518,6 +652,7 @@ class StreamingSink(discord.sinks.Sink):
             state = self._user_manager.get_or_create(user_id)
             state.add_to_pre_buffer(audio_16k)
             state.update_last_seen()
+            self._capture(user_id, audio_16k, now)
 
             # Check for wake word using wake processor (skip if in refractory)
             if not in_refractory and self._wake_processor.process_audio(user_id, audio_16k):
@@ -551,6 +686,8 @@ class StreamingSink(discord.sinks.Sink):
             # Buffer audio and check VAD
             # NOTE: Skip logic removed - pre-buffer handles wake word audio
             self._audio_buffer.append(audio_16k.copy())
+            if self._seeded and self._user_is_speaking(user_id, audio_16k):
+                self._last_voiced_time = now
             buffer_samples = sum(len(a) for a in self._audio_buffer)
 
             if self.vad:
@@ -565,7 +702,11 @@ class StreamingSink(discord.sinks.Sink):
                         f"vad.is_speech={self.vad.is_speech}"
                     )
 
-                if endpoint == "start" and not self._speech_started:
+                if endpoint == "start" and self._seeded:
+                    self._seeded = False  # VAD follows the speech from here
+                    self._pending_speech_end_time = None
+                    logger.info("[SINK] VAD detected speech START (continuing)")
+                elif endpoint == "start" and not self._speech_started:
                     self._speech_started = True
                     self._pending_speech_end_time = None  # Cancel any pending end
                     logger.info("[SINK] VAD detected speech START")

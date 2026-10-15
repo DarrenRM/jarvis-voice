@@ -10,8 +10,13 @@ from .detectors import Finding
 from .turn import LiveTurn
 
 POST_PREFIX = "**Bot monitor:"
-REACTION_HINT = "React ✅ if this should be fixed, ❌ to ignore."
+REACTION_HINT = "React ✅ if something went wrong, ❌ if it was fine or didn't disrupt the flow."
+# Posts made before the wording changed can still be reacted to
+_HINTS = (REACTION_HINT, "React ✅ if this should be fixed, ❌ to ignore.")
 SEEN_PREFIX = "Seen "
+RECORDING_PREFIX = "Recording: "
+CONFIRMED = "confirmed"
+DISMISSED = "dismissed"
 DISCORD_LIMIT = 2000
 
 # Shapes of API keys and tokens, in case one ever shows up in an error message
@@ -98,6 +103,8 @@ def format_post(turn: LiveTurn, findings: list[Finding], redact: Redactor) -> st
     lines.append(f"Timings: {timing_line(turn)}")
     if turn.tools:
         lines.append(f"Tools: {tools_line(turn)}")
+    if turn.audio_file:
+        lines.append(f"{RECORDING_PREFIX}{turn.audio_file}")
     lines.append(REACTION_HINT)
     return _fit(redact("\n".join(lines)))
 
@@ -106,11 +113,19 @@ def with_seen_count(content: str, count: int, last_seen: datetime) -> str:
     """The post with a 'Seen N times' line (replacing any earlier one)."""
     lines = [ln for ln in content.split("\n") if not ln.startswith(SEEN_PREFIX)]
     seen = f"{SEEN_PREFIX}{count} times, last at {last_seen:%H:%M}."
-    if lines and lines[-1] == REACTION_HINT:
+    if lines and lines[-1] in _HINTS:
         lines.insert(len(lines) - 1, seen)
     else:
         lines.append(seen)
     return _fit("\n".join(lines))
+
+
+def recording_path(content: str) -> str | None:
+    """The repo-relative recording path from a post's Recording line, if any."""
+    for ln in (content or "").split("\n"):
+        if ln.startswith(RECORDING_PREFIX):
+            return ln[len(RECORDING_PREFIX):].strip() or None
+    return None
 
 
 def _fit(text: str) -> str:
@@ -128,17 +143,23 @@ def approval_entry(
     posted: datetime | None,
     approved: datetime,
     redact: Redactor,
+    verdict: str = CONFIRMED,
 ) -> str:
-    """Markdown entry for docs/approved-fixes.md, built from the Discord post."""
-    lines = [ln for ln in content.split("\n") if ln and ln != REACTION_HINT]
+    """Markdown entry for the approved-fixes (check) or dismissed-findings (cross) file,
+    built from the Discord post."""
+    lines = [ln for ln in content.split("\n") if ln and ln not in _HINTS]
     title = lines[0] if lines else "Monitor finding"
     title = title.replace(POST_PREFIX, "").replace("**", "").strip() or "Monitor finding"
     out = [
         f"## {(posted or approved):%Y-%m-%d %H:%M} - {title}",
         "",
         f"<!-- discord-message:{message_id} -->",
-        f"Status: approved by the owner on {approved:%Y-%m-%d %H:%M} "
-        "(agrees this should be fixed).",
+        (f"Status: the owner confirmed something went wrong ({approved:%Y-%m-%d %H:%M}). "
+         "The diagnosis below is the monitor's guess: check the logs and recording for "
+         "what actually happened before fixing.")
+        if verdict == CONFIRMED else
+        (f"Status: the owner dismissed this ({approved:%Y-%m-%d %H:%M}): no problem, or it "
+         "didn't disrupt the flow. Fix only if the fix has no tradeoffs or edge cases."),
     ]
     if jump_url:
         out.append(f"Discord: {jump_url}")

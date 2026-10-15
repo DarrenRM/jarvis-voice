@@ -114,6 +114,9 @@ class TTSStage(StreamingPipelineStage):
         self._tasks = []
         queue = OrderedPlaybackQueue()
         buffer = ""
+        # A chunk ending in "1." may be the start of "1.0": where the sentence ends
+        # if the next chunk doesn't continue the number
+        number_end: Optional[int] = None
         sentences_queued = 1  # 1-based to match OrderedPlaybackQueue
 
         # Start playback consumer
@@ -129,6 +132,13 @@ class TTSStage(StreamingPipelineStage):
 
                 buffer += chunk
 
+                if number_end is not None:
+                    if not buffer[number_end:number_end + 1].isdigit():
+                        sentence, buffer = buffer[:number_end], buffer[number_end:]
+                        self._spawn_synthesis_task(sentence, sentences_queued, queue)
+                        sentences_queued += 1
+                    number_end = None
+
                 # Primary: Split on newlines (from voice_session.py:1096)
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
@@ -140,7 +150,9 @@ class TTSStage(StreamingPipelineStage):
                 # Secondary: Split on sentence-ending punctuation
                 # (from voice_session.py:1118-1122)
                 buffer = buffer.strip()
-                if buffer and buffer[-1] in ".!?":
+                if buffer.endswith(".") and buffer[-2:-1].isdigit():
+                    number_end = len(buffer)
+                elif buffer and buffer[-1] in ".!?":
                     self._spawn_synthesis_task(buffer, sentences_queued, queue)
                     sentences_queued += 1
                     buffer = ""

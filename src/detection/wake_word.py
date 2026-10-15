@@ -47,6 +47,7 @@ class WakeWordDetector:
         self._min_samples = int(sample_rate * 0.02)  # 20ms minimum (was 80ms)
         # Highest score since take_peak(): how close a missed wake word came
         self.peak = 0.0
+        self.last_score = 0.0  # score of the latest hit
 
         self._load_model(model_path, model_name)
 
@@ -133,6 +134,8 @@ class WakeWordDetector:
             self.peak = max(self.peak, float(score))
 
             if score >= self.threshold:
+                self.peak = 0.0  # a hit isn't a near miss
+                self.last_score = float(score)
                 logger.info(
                     f"Wake word detected: {wakeword} (score: {score:.2f}, "
                     f"inference: {inference_ms:.1f}ms, chunk: {len(audio_int16)} samples)"
@@ -151,6 +154,7 @@ class WakeWordDetector:
     def reset(self) -> None:
         """Reset detector state."""
         self._buffer = np.array([], dtype=np.float32)
+        self.peak = 0.0
         if self._model is not None:
             self._model.reset()
 
@@ -185,6 +189,7 @@ class WakeWordDetector:
                 score = scores
 
             if score >= self.threshold:
+                self.last_score = float(score)
                 logger.info(f"Wake word detected (flush): {wakeword} (score: {score:.2f})")
                 if self._on_detected:
                     self._on_detected()

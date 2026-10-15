@@ -9,6 +9,7 @@ import pytest
 
 from src.llm.chat_orchestrator import ERROR_REPLY, TurnOutcome
 from src.monitor import turn as tr
+from src.monitor.detectors import detect
 from src.monitor.turn import TurnRecorder, tools_from_messages
 from src.pipeline.base import PipelineContext
 from src.pipeline.response_stage import ResponseStage, ResponseTurn
@@ -105,6 +106,22 @@ class TestTurnFlow:
         recorder.pipeline_result("empty")
         recorder.turn_ended(token)
         assert turns[0].outcome == tr.EMPTY
+
+    def test_followup_not_for_the_bot_is_not_a_missing_reply(self, setup):
+        recorder, turns, _ = setup
+        token = recorder.turn_started(1, "Sam")
+        recorder.pipeline_result("not_addressed")
+        recorder.turn_ended(token)
+        assert turns[0].outcome == tr.NOT_ADDRESSED
+
+    def test_late_reply_is_reported_outside_a_turn(self, setup):
+        recorder, turns, _ = setup
+        recorder.incident(1, "Sam", tr.LATE_REPLY, "Sam started talking 2s after...",
+                          reply="Want the recipe?")
+        [turn] = turns
+        assert turn.outcome == tr.LATE_REPLY and turn.reply == "Want the recipe?"
+        assert [f.detector for f in detect(turn)] == ["late_reply"]
+        assert not recorder.turn_open
 
     def test_exception_and_cancel(self, setup):
         recorder, turns, _ = setup

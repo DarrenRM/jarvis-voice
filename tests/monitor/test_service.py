@@ -2,6 +2,7 @@
 
 from src.llm.chat_orchestrator import ERROR_REPLY
 from src.monitor import turn as tr
+from src.monitor.reporting import REACTION_HINT
 from src.monitor.service import (
     APPROVE,
     MAX_POSTS_PER_HOUR,
@@ -37,6 +38,7 @@ def make_service(tmp_path, channel=None, clock=None, **settings):
         get_channel=lambda: channel,
         bot_user_id=lambda: BOT_ID,
         approvals_path=tmp_path / "approved-fixes.md",
+        dismissals_path=tmp_path / "dismissed-findings.md",
         clock=clock or FakeClock(),
     )
     return service, channel
@@ -128,7 +130,7 @@ class TestDedupe:
         again = await service.handle_turn(error_turn("LLM API error: Request timed out after 16s"))
         assert again is None and len(channel.sent) == 1
         assert "Seen 2 times" in first.content
-        assert first.content.endswith("React ✅ if this should be fixed, ❌ to ignore.")
+        assert first.content.endswith(REACTION_HINT)
         clock.advance(60)
         await service.handle_turn(error_turn("LLM API error: Request timed out after 9.5s"))
         assert "Seen 3 times" in first.content and "Seen 2 times" not in first.content
@@ -170,15 +172,23 @@ class TestApprovals:
         assert "Error reply spoken" in text and "Request timed out" in text
         assert message.jump_url in text
         assert "  - The LLM call failed" in text
-        assert "Approved: added to the fix list." in message.content
+        # A check confirms something went wrong; the diagnosis still needs checking
+        assert "confirmed something went wrong" in text and "monitor's guess" in text
+        assert "Confirmed: added to the fix list" in message.content
         # Re-running (a second reaction event, a restart) adds nothing
         assert await service.handle_reaction(message.id, OWNER_ID, APPROVE) == "already_approved"
         assert service.approvals.path.read_text(encoding="utf-8") == text
 
-    async def test_cross_is_ignored(self, tmp_path):
+    async def test_cross_is_recorded_as_dismissed(self, tmp_path):
         service, message = await self.posted(tmp_path)
         assert await service.handle_reaction(message.id, OWNER_ID, REJECT) == "dismissed"
         assert not service.approvals.path.exists()
+        text = service.dismissals.path.read_text(encoding="utf-8")
+        assert text.startswith("# Dismissed findings")
+        assert f"<!-- discord-message:{message.id} -->" in text
+        assert "didn't disrupt the flow" in text and "Error reply spoken" in text
+        assert await service.handle_reaction(message.id, OWNER_ID, REJECT) == "already_dismissed"
+        assert service.dismissals.path.read_text(encoding="utf-8") == text
 
     async def test_only_owner_counts(self, tmp_path):
         service, message = await self.posted(tmp_path)
