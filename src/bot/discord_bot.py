@@ -13,6 +13,7 @@ from discord.ext import commands
 from ..config import Settings
 from ..detection import VAD
 from ..llm import LLMService
+from ..monitor import create_monitor
 from ..tts import TTSSynthesizer
 from .voice_session import VoiceSession
 
@@ -67,6 +68,14 @@ class ClaudeBot(commands.Bot):
         # Active voice session (single channel at a time)
         self._session: Optional[VoiceSession] = None
         self._session_task: Optional[asyncio.Task] = None
+
+        # Live monitor (MONITOR_ENABLED): posts problems seen in voice turns to a text
+        # channel; the owner approves them with reactions. None when off.
+        self._monitor = create_monitor(
+            settings,
+            get_channel=self._monitor_channel,
+            bot_user_id=lambda: self.user.id if self.user else None,
+        )
 
         self._register_commands()
 
@@ -200,6 +209,7 @@ class ClaudeBot(commands.Bot):
             self._session = VoiceSession(
                 vad=self._vad,
                 tts=self._tts,
+                turn_observer=self._monitor.recorder if self._monitor else None,
             )
 
             # Initialize any remaining components
@@ -250,6 +260,9 @@ class ClaudeBot(commands.Bot):
         logger.info(f"Connected to {len(self.guilds)} guilds")
         logger.info(f"Wake word: {self.settings.wake_word_model.replace('_', ' ')}")
 
+        if self._monitor:
+            self._monitor.start()
+
         # Auto-join voice channel if enabled
         if self.settings.auto_join_voice:
             await self._auto_join()
@@ -295,9 +308,38 @@ class ClaudeBot(commands.Bot):
             if before.channel != after.channel:
                 asyncio.create_task(self._session.greet_user(member))
 
+    def _monitor_channel(self) -> Optional[discord.TextChannel]:
+        """The monitor's text channel (MONITOR_CHANNEL_NAME), if the bot can see it."""
+        for guild in self.guilds:
+            if self.settings.discord_guild_id and str(guild.id) != self.settings.discord_guild_id:
+                continue
+            name = self.settings.monitor_channel_name
+            channel = discord.utils.get(guild.text_channels, name=name)
+            if channel:
+                return channel
+        return None
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent) -> None:
+        """Owner check/cross reactions on monitor posts (raw: works after a restart too)."""
+        if not self._monitor:
+            return
+
+        async def fetch_message() -> discord.Message:
+            channel = self.get_channel(payload.channel_id)
+            if channel is None:
+                channel = await self.fetch_channel(payload.channel_id)
+            return await channel.fetch_message(payload.message_id)
+
+        await self._monitor.handle_reaction(
+            payload.message_id, payload.user_id, str(payload.emoji), fetch_message=fetch_message
+        )
+
     async def close(self) -> None:
         """Clean up on shutdown."""
         logger.info("Bot closing...")
+
+        if self._monitor:
+            await self._monitor.stop()
 
         # Stop active session
         if self._session:

@@ -1,7 +1,7 @@
 """Configuration management using Pydantic Settings."""
 
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, field_validator
 from typing import Dict, Optional
 
 
@@ -111,6 +111,38 @@ class Settings(BaseSettings):
     # Optional per-user roasts the assistant may rarely work into answers.
     # Set via USER_ROASTS env var as JSON: '{"Name": "is always late."}'
     user_roasts: Dict[str, str] = Field(default_factory=dict, alias="USER_ROASTS")
+
+    # Live monitor (src/monitor): posts problems seen in real voice turns to a text
+    # channel with check/cross reactions; the owner's check adds the issue to
+    # MONITOR_APPROVED_FILE. Off by default.
+    monitor_enabled: bool = Field(default=False, alias="MONITOR_ENABLED")
+    monitor_channel_name: str = Field(default="bot-monitor", alias="MONITOR_CHANNEL_NAME")
+    # Only this Discord user's reactions count (empty = nobody can approve)
+    monitor_owner_id: Optional[int] = Field(default=None, alias="MONITOR_OWNER_ID")
+    monitor_approved_file: str = Field(
+        default="docs/approved-fixes.md", alias="MONITOR_APPROVED_FILE"
+    )
+    # Re-transcribe the bot's answer audio with Groq Whisper to catch TTS that doesn't
+    # match its text (one extra Groq call per answered turn)
+    monitor_retranscribe: bool = Field(default=False, alias="MONITOR_RETRANSCRIBE")
+    # Same problem again within this many minutes: the existing post's count goes up
+    monitor_dedupe_minutes: float = Field(default=30.0, alias="MONITOR_DEDUPE_MINUTES")
+    # Thresholds, seconds after the speaker stops talking (good turns: ~0.6-0.9s to
+    # first audio, ~3-4s to the answer, ~0.3s between sentences)
+    monitor_slow_first_audio_seconds: float = Field(
+        default=3.0, alias="MONITOR_SLOW_FIRST_AUDIO_SECONDS"
+    )
+    monitor_slow_answer_seconds: float = Field(default=8.0, alias="MONITOR_SLOW_ANSWER_SECONDS")
+    monitor_slow_answer_web_seconds: float = Field(
+        default=20.0, alias="MONITOR_SLOW_ANSWER_WEB_SECONDS"
+    )
+    monitor_long_gap_seconds: float = Field(default=2.5, alias="MONITOR_LONG_GAP_SECONDS")
+    monitor_hang_seconds: float = Field(default=30.0, alias="MONITOR_HANG_SECONDS")
+
+    @field_validator("monitor_owner_id", mode="before")
+    @classmethod
+    def _blank_owner_is_none(cls, value):
+        return None if isinstance(value, str) and not value.strip() else value
 
     # Audio
     sample_rate: int = Field(default=16000, alias="SAMPLE_RATE")

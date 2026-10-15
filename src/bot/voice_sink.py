@@ -154,6 +154,11 @@ class StreamingSink(discord.sinks.Sink):
                 self._wake_processor.on_idle_transition()
 
     @property
+    def last_audio_time(self) -> Optional[float]:
+        """perf_counter time of the last audio packet tracked (end of the question)."""
+        return self._last_audio_time
+
+    @property
     def wake_user_id(self) -> Optional[int]:
         """Get the user who triggered the wake word, falling back to last audio sender.
 

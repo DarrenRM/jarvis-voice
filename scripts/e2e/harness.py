@@ -28,6 +28,9 @@ import numpy as np
 
 from src.audio import resample_24k_mono_to_48k_stereo, resample_48k_stereo_to_16k_mono
 
+# Shared with the live monitor (src/monitor); re-exported for run_voice_e2e
+from src.monitor.text_checks import normalize_words, overlap, word_error_rate  # noqa: F401
+
 logger = logging.getLogger("e2e")
 
 FRAME_BYTES = 3840  # 20 ms of 48 kHz stereo s16le
@@ -327,37 +330,6 @@ def frames_to_16k(frames: list[bytes]) -> np.ndarray:
     return resample_48k_stereo_to_16k_mono(b"".join(frames))
 
 
-_TAG = re.compile(r"\[[a-z ]+\]", re.IGNORECASE)
-
-
-def normalize_words(text: str) -> list[str]:
-    from num2words import num2words
-
-    text = _TAG.sub(" ", text.lower())
-    text = re.sub(r"(\d+)", lambda m: " " + num2words(int(m.group(1))) + " ", text)
-    text = re.sub(r"[^a-z' ]+", " ", text.replace("-", " "))
-    return [w.strip("'") for w in text.split() if w.strip("'")]
-
-
-def word_error_rate(reference: str, hypothesis: str) -> float:
-    ref, hyp = normalize_words(reference), normalize_words(hypothesis)
-    if not ref:
-        return 0.0 if not hyp else 1.0
-    d = list(range(len(hyp) + 1))
-    for i, r in enumerate(ref, 1):
-        prev, d[0] = d[0], i
-        for j, h in enumerate(hyp, 1):
-            cur = min(d[j] + 1, d[j - 1] + 1, prev + (r != h))
-            prev, d[j] = d[j], cur
-    return d[len(hyp)] / len(ref)
-
-
-def overlap(a: str, b: str) -> float:
-    """Share of a's words found in b."""
-    wa, wb = normalize_words(a), set(normalize_words(b))
-    return sum(w in wb for w in wa) / len(wa) if wa else 0.0
-
-
 def write_wav(path: Path, user_track, segments, duration: float) -> None:
     """Stereo 48 kHz WAV: left = everyone talking to the bot, right = the bot."""
     from scipy.io import wavfile
@@ -403,6 +375,7 @@ class RunResult:
     error: Optional[str] = None
     checks: list[tuple[str, bool, str]] = field(default_factory=list)
     metrics: dict = field(default_factory=dict)
+    monitor_posts: list[str] = field(default_factory=list)  # --monitor: what would be posted
 
     @property
     def bot_transcript(self) -> str:
@@ -439,11 +412,12 @@ class Rig:
 
     async def run(self, name: str, speeches: list[Speech], members: list[FakeMember],
                   settle: float = 3.0, timeout: float = 90.0,
-                  between: Optional[float] = None) -> RunResult:
+                  between: Optional[float] = None, observer=None) -> RunResult:
         """Run speeches through a fresh VoiceSession and collect everything it did.
 
         If `between` is set, speeches are played as separate turns: each one starts
         `between` seconds after the bot has gone quiet from the previous turn.
+        observer: optional live-monitor TurnRecorder (run_voice_e2e --monitor)
         """
         from src.bot.voice_session import VoiceSession
 
@@ -451,7 +425,8 @@ class Rig:
         clock = lambda: time.perf_counter() - t0  # noqa: E731
         guild = FakeGuild(members, self.settings.image_channel_name)
         vc = FakeVoiceClient(guild, clock)
-        session = VoiceSession(vad=self.vad, groq_client=self.whisper, tts=self.tts)
+        session = VoiceSession(vad=self.vad, groq_client=self.whisper, tts=self.tts,
+                               turn_observer=observer)
         session_task = asyncio.create_task(session.start(vc))
         while session.sink is None:
             if session_task.done():

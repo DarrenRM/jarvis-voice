@@ -129,6 +129,8 @@ class VoicePipeline:
         self._cancelled = False
         self._thinking_task: Optional[asyncio.Task] = None
         self._opening: Optional[OpeningPhrase] = None
+        # Optional turn monitor (src.monitor.TurnRecorder); only notified, never awaited
+        self.observer = None
 
     async def process(
         self,
@@ -182,6 +184,9 @@ class VoicePipeline:
             if opening is not None:
                 opening.cancel_if_not_playing()
             raise
+
+        if self.observer is not None:
+            self.observer.transcribed(transcription_result.raw_text, transcription_result.text)
 
         # Handle special cases
         if transcription_result.is_empty:
@@ -247,6 +252,8 @@ class VoicePipeline:
                     # Wait for silence before first response sentence
                     await wait_for_silence()
 
+                if self.observer is not None:
+                    self.observer.answer_clip_next()
                 await play_audio(audio_chunk)
 
             # Stream response through TTS
@@ -257,6 +264,9 @@ class VoicePipeline:
             logger.debug("Pipeline: Response/TTS cancelled")
             await self.cancel()
             return "cancelled"
+        finally:
+            if self.observer is not None:
+                self.observer.replied(getattr(self._response, "last_turn", None))
 
         return None
 

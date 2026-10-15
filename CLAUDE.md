@@ -28,6 +28,9 @@ Known pre-existing test problems: `test_tts_stage.py::test_exclamation_splits` f
 - `src/web/` - TinyFish hosted search + page reading when `TINYFISH_API_KEY` is set (not
   throttled by this IP); falls back per request to ddgs metasearch and the local page reader
   (httpx + Trafilatura, SSRF-guarded, parallel). `WEB_BACKEND=local` forces the local path.
+- `src/monitor/` - live monitor: per-turn records (hooks in VoiceSession/VoicePipeline + a log
+  handler), detectors, posts to `MONITOR_CHANNEL_NAME`; owner's check reaction appends to
+  `docs/approved-fixes.md`. Text checks are shared with `scripts/e2e` (`--monitor` dry-runs it)
 - `src/detection/`, `src/stt/`, `src/tts/`, `src/session/`, `src/sink/` - voice path
 - `src/config.py` - all settings (pydantic-settings, read from `.env`)
 - `docs/project-reference.md` - timing constants and voice-path details (its LLM/search
@@ -52,4 +55,5 @@ Known pre-existing test problems: `test_tts_stage.py::test_exclamation_splits` f
 - **Line endings are mixed (CRLF and LF).** Preserve each file's existing endings; don't
   churn whole files.
 - Features off by default: image generation (`IMAGE_GENERATION_ENABLED`), deep research
-  (`DEEP_RESEARCH_ENABLED`, planned: OpenAI via Codex/ChatGPT sign-in, not wired up).
+  (`DEEP_RESEARCH_ENABLED`, planned: OpenAI via Codex/ChatGPT sign-in, not wired up),
+  live monitor (`MONITOR_ENABLED`).

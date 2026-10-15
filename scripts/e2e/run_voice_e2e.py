@@ -5,6 +5,8 @@
     .venv/Scripts/python scripts/e2e/run_voice_e2e.py --no-web --repeat=3
 
 --no-web skips the live web scenarios (web_*); --repeat=N runs each scenario N times.
+--monitor runs each turn through the live monitor (src/monitor) and lists in the report
+what it would have posted to Discord (nothing is sent).
 
 Writes reports/e2e-<timestamp>/report.md, results.json and one stereo WAV per
 scenario (left = people, right = bot) so timing and pauses can be listened to.
@@ -33,14 +35,14 @@ from scripts.e2e.harness import (  # noqa: E402
     word_error_rate,
 )
 
+# Shared with the live monitor (src/monitor)
+from src.monitor.text_checks import give_up_phrases, spoken_artifacts  # noqa: E402
+
 TESTER = FakeMember(700000000000000001, "Tester", activity="Dune: Awakening")
 BYSTANDER = FakeMember(700000000000000002, "Bystander")
 MORGAN = FakeMember(700000000000000003, "Morgan")
 RILEY = FakeMember(700000000000000004, "Riley", activity="Enshrouded")
 MEMBERS = [TESTER, BYSTANDER, MORGAN, RILEY]
-
-SPOKEN_TAG_WORDS = {"whispering", "laughing", "happy", "sad", "angry", "surprised", "fearful",
-                    "disgusted", "cheerful", "sigh", "laugh", "breathe", "cough", "clear throat"}
 
 
 # ---------------------------------------------------------------- checks
@@ -114,17 +116,12 @@ def web_searches_at_most(limit: int) -> Check:
     return check
 
 
-GIVE_UP_PHRASES = ("couldn't find", "could not find", "can't find", "ghosted", "no luck",
-                   "not sure", "don't know", "couldn't get", "no results")
-
-
 def answers_confidently(turn: int = 0) -> Check:
     """The bot gave an answer rather than a "couldn't find it" apology."""
     def check(r):
         if len(r.turns) <= turn:
             return False, "no turn recorded"
-        answer = r.turns[turn].answer.lower()
-        hit = [p for p in GIVE_UP_PHRASES if p in answer]
+        hit = give_up_phrases(r.turns[turn].answer)
         return not hit, f"{hit or ''} {r.turns[turn].answer!r}"
     check.__name__ = f"answers_confidently[{turn}]"
     return check
@@ -188,11 +185,7 @@ def tts_fidelity(r: RunResult) -> tuple[bool, str]:
 
 
 def no_tags_or_urls_spoken(r: RunResult) -> tuple[bool, str]:
-    spoken = r.bot_transcript.lower()
-    said = " ".join(re.sub(r"\[[^\]]+\]", " ", t.answer) for t in r.turns).lower()
-    problems = [w for w in SPOKEN_TAG_WORDS if re.search(rf"\b{w}\b", spoken)
-                and not re.search(rf"\b{w}\b", said)]
-    problems += [u for u in ("http", "www", "dot com", ".com") if u in spoken]
+    problems = spoken_artifacts(r.bot_transcript, " ".join(t.answer for t in r.turns))
     return not problems, f"spoken artifacts: {problems}" if problems else "clean"
 
 
@@ -405,8 +398,26 @@ def render_report(results: list[RunResult], scenarios: dict, sweep, threshold, o
             lines.append(f"  - {'PASS' if ok else 'FAIL'} {name}: {detail}")
         if r.error:
             lines.append(f"- Error: {r.error}")
+        if r.monitor_posts:
+            lines.append("- Live monitor would post (not sent):")
+            for post in r.monitor_posts:
+                first, *rest = post.splitlines()
+                lines += [f"  - {first}"] + [f"    {ln}" for ln in rest]
         lines.append("")
     (out / "report.md").write_text("\n".join(lines), encoding="utf-8")
+
+
+def monitor_posts(turns: list, settings) -> list[str]:
+    """What the live monitor (src/monitor) would post for these turns. Nothing is sent."""
+    from src.monitor import Redactor, Thresholds, detect, format_post
+
+    thresholds, redact = Thresholds.from_settings(settings), Redactor(settings)
+    posts = []
+    for turn in turns:
+        findings = detect(turn, thresholds)
+        if findings:
+            posts.append(format_post(turn, findings, redact))
+    return posts
 
 
 def to_json(r: RunResult) -> dict:
@@ -417,6 +428,7 @@ def to_json(r: RunResult) -> dict:
         "turns": [t.__dict__ for t in r.turns], "posts": r.posts,
         "segments": [{"start": round(s.start, 2), "duration": round(s.duration, 2),
                       "interrupted": s.interrupted, "transcript": s.transcript} for s in r.segments],
+        "monitor_posts": r.monitor_posts,
     }
 
 
@@ -441,6 +453,14 @@ async def main(args: list[str]) -> int:
     no_web = "--no-web" in args
     repeat = next((int(a.split("=", 1)[1]) for a in args if a.startswith("--repeat=")), 1)
 
+    # --monitor: feed each turn through the live monitor's recorder and detectors
+    recorder, live_turns = None, []
+    if "--monitor" in args:
+        from src.monitor import TurnRecorder
+
+        recorder = TurnRecorder(live_turns.append)
+        recorder.install()
+
     rig = Rig(settings, out)
     selected = [s for s in SCENARIOS
                 if (not filters or any(f in s.name for f in filters))
@@ -452,8 +472,11 @@ async def main(args: list[str]) -> int:
         run_name = sc.name if repeat == 1 else f"{sc.name}-r{rep + 1}"
         scenarios[run_name] = sc
         print(f"\n===== {run_name} =====", flush=True)
-        r = await rig.run(run_name, sc.speeches, MEMBERS, between=sc.between)
-        checks = list(sc.checks) + ([no_error, tts_fidelity, no_tags_or_urls_spoken] if sc.answers else [])
+        r = await rig.run(run_name, sc.speeches, MEMBERS, between=sc.between, observer=recorder)
+        if recorder:
+            r.monitor_posts = monitor_posts(live_turns, settings)
+            live_turns.clear()
+        checks =list(sc.checks) + ([no_error, tts_fidelity, no_tags_or_urls_spoken] if sc.answers else [])
         for check in checks:
             try:
                 ok, detail = check(r)

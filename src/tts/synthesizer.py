@@ -269,7 +269,8 @@ class TTSSynthesizer:
                 audio = audio_int16.astype(np.float32) / 32768.0
 
             elapsed = time.perf_counter() - start_time
-            logger.info(f"Inworld TTS generated {len(text)} chars in {elapsed:.2f}s ({len(text)/elapsed:.1f} chars/s)")
+            logger.info(f"Inworld TTS generated {len(text)} chars in {elapsed:.2f}s ({len(text)/elapsed:.1f} chars/s)",
+                        extra={"tts_seconds": elapsed})  # read by the live monitor
             return audio
 
         except Exception as e:

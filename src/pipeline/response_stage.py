@@ -8,7 +8,8 @@ Simple wrapper around ChatOrchestrator that:
 
 import logging
 import time
-from typing import AsyncIterator, Callable
+from dataclasses import dataclass, field
+from typing import AsyncIterator, Callable, Optional
 
 from ..llm.chat_orchestrator import ChatOrchestrator, TurnOutcome
 from .base import PipelineContext, StreamingPipelineStage
@@ -27,6 +28,15 @@ def _expired_note(tool_name: str, content: str) -> str:
     first_line = content.strip().splitlines()[0][:150] if content.strip() else ""
     return (f"[Earlier {tool_name} result removed to save space. It began: {first_line!r}. "
             f"Call {tool_name} again if you need the details.]")
+
+
+@dataclass
+class ResponseTurn:
+    """What the latest process_stream call produced (read by the turn monitor)."""
+
+    text: str = ""  # everything yielded to TTS, error replies included
+    ok: bool = False  # the orchestrator finished the turn normally
+    messages: list[dict] = field(default_factory=list)  # assistant/tool messages it added
 
 
 class ResponseStage(StreamingPipelineStage):
@@ -69,6 +79,7 @@ class ResponseStage(StreamingPipelineStage):
         self._clock = clock
         # tool_call_id -> when its (large) result entered history
         self._tool_result_times: dict[str, float] = {}
+        self.last_turn: Optional[ResponseTurn] = None
 
     @property
     def name(self) -> str:
@@ -107,8 +118,12 @@ class ResponseStage(StreamingPipelineStage):
         ]
 
         outcome = TurnOutcome()
+        turn = self.last_turn = ResponseTurn()
         async for chunk in self._orchestrator.chat_stream(messages, outcome):
+            turn.text += chunk
             yield chunk
+        turn.ok = outcome.ok
+        turn.messages = messages[len(self._history) + 2:]  # after system, history, user
 
         # Only keep turns that completed; a failed turn may end mid tool-loop
         if outcome.ok:
