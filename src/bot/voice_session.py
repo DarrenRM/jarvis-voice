@@ -20,10 +20,20 @@ from ..config import get_settings
 from ..detection import VAD, SpeakingDetector
 from ..stt import GroqWhisperClient
 from ..llm import LLMService, create_llm_client
+from ..llm.chat_post import ChatPoster, JevPostJudge, QwenPostWriter
+from ..llm.game_notes import GameNotes
+from ..llm.addressee_judge import (
+    AddresseeJudge,
+    FollowUp,
+    JevAddresseeJudge,
+    QwenAddresseeJudge,
+    is_question,
+)
 from ..pipeline import (
     OpeningPhrase,
     PipelineContext,
     ResponseStage,
+    TranscriptionResult,
     TranscriptionStage,
     TTSStage,
     VoicePipeline,
@@ -113,7 +123,11 @@ class VoiceSession:
         self._loop: Optional[asyncio.AbstractEventLoop] = None
         self._audio_buffer: list[np.ndarray] = []
         self._speech_started = False
-        self._followup_window = 6.0  # Seconds to wait for follow-up
+        self._addressee_judge: Optional[AddresseeJudge] = None  # Follow-up gate
+        self._chat_poster: Optional[ChatPoster] = None  # Reference answers to chat
+        self._followup_open = False
+        # Someone else said the wake word during a follow-up window: their user ID
+        self._wake_from_followup: Optional[int] = None
 
         # Events for thread-safe communication
         self._wake_event = asyncio.Event()
@@ -240,13 +254,41 @@ class VoiceSession:
             else:
                 logger.warning("DYNAMIC_THINKING_ENABLED but CEREBRAS_API_KEY not set, disabling")
 
+        # Follow-ups without the wake word need a check that the speech was for the bot
+        if self._addressee_judge is None and self.settings.followup_enabled:
+            if self.settings.typesafe_api_key:
+                self._addressee_judge = JevAddresseeJudge(self.settings.typesafe_api_key)
+                logger.info("Follow-up check: TypeSafe Jev")
+            elif self.settings.cerebras_api_key:
+                self._addressee_judge = QwenAddresseeJudge(
+                    self.settings.cerebras_api_key, self.settings.cerebras_model
+                )
+                logger.info("Follow-up check: Qwen on Cerebras")
+
+        # Recipes, steps and stats also get posted to chat (Jev decides, Qwen writes)
+        if self._chat_poster is None and self.settings.chat_posts_enabled:
+            if self.settings.typesafe_api_key and self.settings.cerebras_api_key:
+                self._chat_poster = ChatPoster(
+                    JevPostJudge(self.settings.typesafe_api_key),
+                    QwenPostWriter(self.settings.cerebras_api_key, self.settings.cerebras_model),
+                    post=self._post_message_to_discord,
+                    speak=self.tts.synthesize_cached,
+                )
+                logger.info("Chat posts: on (TypeSafe Jev + Qwen)")
+            else:
+                logger.info("Chat posts: off (needs TYPESAFE_API_KEY and CEREBRAS_API_KEY)")
+
         # Initialize modular VoicePipeline
         if self._voice_pipeline is None:
-            transcription_stage = TranscriptionStage(self.groq_client)
+            game_notes = GameNotes.load()
+            transcription_stage = TranscriptionStage(
+                self.groq_client, corrections=game_notes.corrections()
+            )
             response_stage = ResponseStage(
                 self.llm.chat_orchestrator,
                 self.llm.build_system_prompt,
                 max_history_messages=self.settings.llm_history_max_messages,
+                game_notes=game_notes,
             )
             tts_stage = TTSStage(self.tts)
 
@@ -256,6 +298,7 @@ class VoiceSession:
                 tts=tts_stage,
             )
             self._voice_pipeline.observer = self.turn_observer
+            self._voice_pipeline.poster = self._chat_poster
 
     def _on_wake_word(self):
         """Callback when wake word detected (from sink thread)."""
@@ -263,6 +306,10 @@ class VoiceSession:
         if self._state == "idle" and self._loop:
             logger.info("[CALLBACK] Setting wake_event")
             self._loop.call_soon_threadsafe(self._wake_event.set)
+        elif self._followup_open and self.sink is not None:
+            # Read now: going idle clears the wake word user
+            self._wake_from_followup = self.sink.wake_user_id
+            logger.info(f"[CALLBACK] Wake word from {self._wake_from_followup} ends the follow-up window")
         else:
             logger.warning(f"[CALLBACK] NOT setting event - state={self._state}, loop={self._loop is not None}")
 
@@ -373,6 +420,7 @@ class VoiceSession:
             await self.voice_client.ws.speak(False)
         except Exception:
             pass  # May fail if websocket not ready
+        self._reset_speaking_ring()
 
         # Run the main loop
         await self._run_loop()
@@ -383,6 +431,9 @@ class VoiceSession:
             jobs = [self.groq_client.warm_up(), self.llm.warm_up()]
             if self._thinking_generator:
                 jobs.append(self._thinking_generator.warm_up())
+            if self._chat_poster:
+                # Cache "I'll post this in chat too!" so it plays without a TTS round trip
+                jobs.append(self._chat_poster.announcement())
             await asyncio.gather(*jobs, return_exceptions=True)
         except Exception as e:
             logger.warning(f"[WARMUP] Skipped: {e}")
@@ -446,9 +497,33 @@ class VoiceSession:
                 logger.debug(f"speak(False) failed: {e}")
 
         # Reset image editing context (Gemini chat session)
+        # Let posts still being written land, then close the checker's connection
+        if self._chat_poster is not None:
+            try:
+                await asyncio.wait_for(self._chat_poster.close(), 25)
+            except Exception as e:
+                logger.debug(f"Chat poster close failed: {e}")
+
         if self.llm and self.llm.image_service:
             self.llm.image_service.reset_chat()
             logger.debug("Reset image chat context on session stop")
+
+    def _reset_speaking_ring(self) -> None:
+        """Play 0.1 s of silence on a real voice connection.
+
+        A connection that dropped while speaking (killed process, a test client) can
+        leave the bot's green ring on, and a bare speak(False) from the new connection
+        doesn't clear it. py-cord's player sends speaking on, then off, which does.
+        """
+        import io
+
+        if not isinstance(self.voice_client, discord.VoiceClient):
+            return  # test doubles
+        try:
+            if not self.voice_client.is_playing():
+                self.voice_client.play(discord.PCMAudio(io.BytesIO(b"\x00" * 3840 * 5)))
+        except Exception as e:
+            logger.debug(f"Speaking ring reset failed: {e}")
 
     async def _run_loop(self):
         """Main session loop."""
@@ -466,6 +541,11 @@ class VoiceSession:
                 self._wake_event.clear()
                 self._speech_end_event.clear()
                 self.sink.state = "idle"
+                # Someone said the wake word during a follow-up window: their turn now
+                wake_user = self._wake_from_followup
+                self._wake_from_followup = None
+                if wake_user is not None:
+                    self._wake_event.set()
 
                 # Wait for wake word with periodic flush check
                 # This handles the PTT edge case where user says wake word and stops
@@ -506,7 +586,7 @@ class VoiceSession:
                 self.state = "listening"
                 self._speech_started = False
                 self._ack_played = False  # Reset for new session
-                self.sink.start_listening()
+                self.sink.start_listening(user_id=wake_user)
                 logger.info("[STATE] Now LISTENING for user speech (extends while speaking, 30s max)")
 
                 # Play acknowledgment in background - waits for silence then plays
@@ -589,10 +669,10 @@ class VoiceSession:
                     continue
 
                 # Process the speech
-                await self._process_speech(audio)
+                result = await self._process_speech(audio)
 
-                # Skip follow-up - require wake word each time
-                # await self._followup_loop()
+                # If the bot asked something, the asker can answer without the wake word
+                await self._followup_after(result)
 
             except asyncio.CancelledError:
                 break
@@ -1089,11 +1169,18 @@ class VoiceSession:
             logger.info(f"User said: {text}")
             return text
 
-    async def _process_speech(self, audio: np.ndarray):
+    async def _process_speech(
+        self, audio: np.ndarray, followup: Optional[FollowUp] = None
+    ) -> Optional[str]:
         """Process captured speech using the modular VoicePipeline.
 
         Args:
             audio: Audio as float32 numpy array (16kHz mono)
+            followup: Set when this speech came without the wake word right after the
+                bot spoke (no opening phrase; dropped unless it was for the bot)
+
+        Returns:
+            The pipeline result (None for a normal reply)
         """
         self.state = "processing"
         total_start = time.perf_counter()
@@ -1109,8 +1196,9 @@ class VoiceSession:
                 speech_end=self.sink.last_audio_time if self.sink else None,
             )
         error: Optional[BaseException] = None
+        result: Optional[str] = None
         try:
-            await self._process_speech_with_pipeline(audio)
+            result = await self._process_speech_with_pipeline(audio, followup)
         except BaseException as e:
             error = e
             raise
@@ -1120,8 +1208,11 @@ class VoiceSession:
 
         total_time = time.perf_counter() - total_start
         logger.info(f"[TIMING] === TOTAL: {total_time:.2f}s ===")
+        return result
 
-    async def _process_speech_with_pipeline(self, audio: np.ndarray) -> None:
+    async def _process_speech_with_pipeline(
+        self, audio: np.ndarray, followup: Optional[FollowUp] = None
+    ) -> Optional[str]:
         """Process speech using the new modular VoicePipeline.
 
         This method delegates to the VoicePipeline which handles:
@@ -1154,12 +1245,19 @@ class VoiceSession:
                 return True
             return await self._wait_for_silence(max_wait=3.0, use_debounce=False)
 
-        opening = OpeningPhrase(
-            synthesize=lambda: self.tts.synthesize_cached(opening_text),
-            play_audio=self._play_audio,
-            should_play=room_is_quiet,
-        )
-        logger.debug(f"[PIPELINE] Opening phrase started: {opening_text}")
+        opening: Optional[OpeningPhrase] = None
+        accept = None
+        if followup is None:
+            opening = OpeningPhrase(
+                synthesize=lambda: self.tts.synthesize_cached(opening_text),
+                play_audio=self._play_audio,
+                should_play=room_is_quiet,
+            )
+            logger.debug(f"[PIPELINE] Opening phrase started: {opening_text}")
+        else:
+            # Carrying on without the wake word: no "Sure, Darren", and only if it was for us
+            async def accept(transcription: TranscriptionResult) -> bool:
+                return await self._is_addressed(followup, transcription)
 
         # Run the pipeline
         result = await self._voice_pipeline.process(
@@ -1171,6 +1269,7 @@ class VoiceSession:
             thinking_generator=thinking_generator,
             tts_synthesizer=self.tts if thinking_generator else None,
             opening=opening,
+            accept=accept,
         )
         if self.turn_observer:
             self.turn_observer.pipeline_result(result)
@@ -1183,50 +1282,102 @@ class VoiceSession:
             logger.info("[PIPELINE] Processing was cancelled")
         elif result == "empty":
             logger.info("[PIPELINE] No speech detected")
+        elif result == "not_addressed":
+            logger.info("[PIPELINE] Follow-up wasn't for the bot, staying quiet")
         else:
             logger.debug("[PIPELINE] Processing completed normally")
+        return result
 
-    async def _followup_loop(self):
-        """Handle follow-up questions without wake word."""
+    async def _followup_after(self, result: Optional[str]) -> None:
+        """After the bot speaks, the person it answered can carry on without the wake
+        word: a short window, only their audio, and only if the addressee check says
+        they were talking to the bot (after a plain answer: asking it something new)."""
+        if not self.settings.followup_enabled or self._addressee_judge is None:
+            return
+        speaker_id = self._current_speaker_id
+        while self._running and result is None:
+            reply = self._last_reply()
+            if not reply:
+                return
+            followup = FollowUp(bot_said=reply, bot_asked=is_question(reply))
+            if followup.bot_asked:
+                window = self.settings.followup_window_seconds
+            elif self.settings.followup_after_answer:
+                window = self.settings.followup_after_answer_seconds
+            else:
+                return
+            audio = await self._listen_for_followup(speaker_id, window, followup.bot_asked)
+            if audio is None:
+                return
+            result = await self._process_speech(audio, followup=followup)
+
+    def _last_reply(self) -> Optional[str]:
+        """What the bot just said (tags removed), if the turn finished normally."""
+        response = getattr(self._voice_pipeline, "_response", None)
+        turn = getattr(response, "last_turn", None)
+        if turn is None or not turn.ok:
+            return None
+        return re.sub(r"\[[^\]]*\]\s*", "", turn.text).strip()
+
+    async def _listen_for_followup(
+        self, speaker_id: Optional[int], window: float, bot_asked: bool
+    ) -> Optional[np.ndarray]:
+        """Listen to one speaker for `window` seconds. Returns their speech, or None if
+        they didn't start talking in time. Speech already under way may finish."""
+        logger.info(
+            f"[FOLLOWUP] Bot {'asked a question' if bot_asked else 'answered'}; listening "
+            f"{window:.0f}s for {self._current_speaker_name} without the wake word"
+        )
+        self.state = "listening"
+        self._speech_end_event.clear()
+        self._pending_audio = None
+        self._wake_from_followup = None
+        self._followup_open = True
+        self.sink.start_listening(user_id=speaker_id, watch_wake_word=True)
+
+        start = time.perf_counter()
+        deadline = start + window
+        final_deadline = start + self.settings.max_question_duration
+        audio: Optional[np.ndarray] = None
         while self._running:
-            logger.info(f"Listening for follow-up ({self._followup_window}s window)...")
-
-            # Reset for follow-up listening
-            self.state = "listening"
-            self._speech_end_event.clear()
-            self._pending_audio = None
-            self.sink.start_listening()
-
-            # Wait for speech with follow-up timeout (poll for PTT too)
-            deadline = time.perf_counter() + self._followup_window
-            got_speech = False
-            while time.perf_counter() < deadline:
-                try:
-                    await asyncio.wait_for(
-                        self._speech_end_event.wait(),
-                        timeout=0.2
-                    )
-                    got_speech = True
+            try:
+                await asyncio.wait_for(self._speech_end_event.wait(), timeout=0.2)
+                audio = self._pending_audio
+                break
+            except asyncio.TimeoutError:
+                pass
+            if self.sink.check_audio_timeout():  # push-to-talk released
+                audio = self.sink.get_audio_buffer()
+                break
+            if self._wake_from_followup is not None:  # someone else's turn
+                break
+            now = time.perf_counter()
+            if self.sink.is_speech_active():
+                if now >= final_deadline:
+                    audio = self.sink.get_audio_buffer()
                     break
-                except asyncio.TimeoutError:
-                    pass
-
-                # Check for PTT release
-                if self.sink.check_audio_timeout():
-                    logger.info("[STATE] Audio stopped in follow-up (PTT released)")
-                    self._pending_audio = self.sink.get_audio_buffer()
-                    got_speech = True
-                    break
-
-            if not got_speech:
-                logger.info("No follow-up detected, returning to wake word mode")
+            elif now >= deadline:
                 break
 
-            # Get the audio
-            audio = self._pending_audio
-            if audio is None or len(audio) == 0:
-                logger.info("No audio in follow-up")
-                break
+        self._followup_open = False
+        self.sink.stop_listening()
+        self.state = "idle"
+        if self._wake_from_followup is not None:
+            return None  # the main loop starts their turn
+        if audio is None or len(audio) == 0:
+            logger.info("[FOLLOWUP] No reply, back to waiting for the wake word")
+            return None
+        return audio
 
-            # Process follow-up
-            await self._process_speech(audio)
+    async def _is_addressed(
+        self, followup: FollowUp, transcription: TranscriptionResult
+    ) -> bool:
+        """Follow-up gate: was this speech meant for the bot?"""
+        started = time.perf_counter()
+        said = (transcription.raw_text or transcription.text).strip()
+        verdict = await self._addressee_judge.judge(followup, said, self._current_speaker_name)
+        logger.info(
+            f"[FOLLOWUP] {'For the bot' if verdict.addressed else 'Not for the bot'} "
+            f"({verdict.reason}, {time.perf_counter() - started:.2f}s): {said[:80]}"
+        )
+        return verdict.addressed

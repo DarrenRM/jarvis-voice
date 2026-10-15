@@ -96,6 +96,7 @@ class TranscriptionStage(PipelineStage):
         stt_client: STTClient,
         wake_pattern: Optional[re.Pattern] = None,
         min_text_length: int = MIN_TEXT_LENGTH,
+        corrections: Optional[dict[str, str]] = None,
     ):
         """Initialize transcription stage.
 
@@ -103,10 +104,17 @@ class TranscriptionStage(PipelineStage):
             stt_client: Speech-to-text client (e.g., GroqWhisperClient)
             wake_pattern: Optional custom wake word pattern (default: "hey jarvis")
             min_text_length: Minimum text length after wake word stripping
+            corrections: Misheard phrase -> right one ("in shrouded" -> "Enshrouded"),
+                whole words, any case, spaces or hyphens between words
         """
         self._stt = stt_client
         self._wake_pattern = wake_pattern or self.DEFAULT_WAKE_PATTERN
         self._min_text_length = min_text_length
+        self._corrections = [
+            (re.compile(r"\b" + r"[\s-]+".join(map(re.escape, wrong.split())) + r"\b",
+                        re.IGNORECASE), right)
+            for wrong, right in (corrections or {}).items()
+        ]
 
     @property
     def name(self) -> str:
@@ -142,6 +150,9 @@ class TranscriptionStage(PipelineStage):
         if processed is None:
             logger.info("[TRANSCRIPTION] Wake word only detected")
             return TranscriptionResult.wake_only(raw_text)
+
+        for pattern, right in self._corrections:
+            processed = pattern.sub(right, processed)
 
         logger.info(f"[TRANSCRIPTION] Processed: '{processed}'")
         return TranscriptionResult(text=processed, raw_text=raw_text)

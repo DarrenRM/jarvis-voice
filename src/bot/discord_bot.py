@@ -48,6 +48,10 @@ class ClaudeBot(commands.Bot):
         intents = discord.Intents.default()
         intents.message_content = True
         intents.voice_states = True
+        # Privileged (enabled in the developer portal): presences carry the game a
+        # speaker is playing; members keeps them cached so the activity can be looked up
+        intents.presences = True
+        intents.members = True
 
         super().__init__(
             command_prefix="!",

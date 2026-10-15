@@ -33,7 +33,7 @@ class Settings(BaseSettings):
 
     # TTS (Inworld)
     inworld_api_key: Optional[str] = Field(default=None, alias="INWORLD_API_KEY")
-    tts_model: str = Field(default="inworld-tts-1-max", alias="TTS_MODEL")
+    tts_model: str = Field(default="inworld-tts-2-flash", alias="TTS_MODEL")
     tts_device: str = Field(default="cuda:0", alias="TTS_DEVICE")
     tts_voice: str = Field(default="alex", alias="TTS_VOICE")
     tts_temperature: float = Field(default=1.1, alias="TTS_TEMPERATURE")  # 0.0-2.0, higher = more expressive
@@ -73,6 +73,21 @@ class Settings(BaseSettings):
     speech_pad_ms: int = Field(default=300, alias="SPEECH_PAD_MS")
     min_silence_ms: int = Field(default=500, alias="MIN_SILENCE_MS")  # Silence to trigger speech end
     max_question_duration: float = Field(default=30.0, alias="MAX_QUESTION_DURATION")
+
+    # Follow-up without the wake word: only from the person the bot just answered, and only
+    # if a quick check says they're talking to the bot. After the bot asks a question, a
+    # reply counts; after a plain answer, only a new question or request does.
+    followup_enabled: bool = Field(default=True, alias="FOLLOWUP_ENABLED")
+    followup_window_seconds: float = Field(default=10.0, alias="FOLLOWUP_WINDOW_SECONDS")
+    followup_after_answer: bool = Field(default=True, alias="FOLLOWUP_AFTER_ANSWER")
+    followup_after_answer_seconds: float = Field(
+        default=4.0, alias="FOLLOWUP_AFTER_ANSWER_SECONDS"
+    )
+    # TypeSafe Jev makes that check when its key is set (calibrated, ~0.1s); else Qwen
+    typesafe_api_key: Optional[str] = Field(default=None, alias="TYPESAFE_API_KEY")
+    # Reference answers (recipes, steps, stats) are also posted to IMAGE_CHANNEL_NAME:
+    # Jev decides, Qwen writes the post. Needs TYPESAFE_API_KEY and CEREBRAS_API_KEY.
+    chat_posts_enabled: bool = Field(default=True, alias="CHAT_POSTS_ENABLED")
 
     # Speaking Detection (multi-user awareness)
     speaking_detection_enabled: bool = Field(default=False, alias="SPEAKING_DETECTION_ENABLED")

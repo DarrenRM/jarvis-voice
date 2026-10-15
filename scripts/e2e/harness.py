@@ -9,7 +9,8 @@ Drives the real VoiceSession (sink -> wake word -> VAD -> Groq Whisper -> Cerebr
 - Everything the bot plays is captured frame by frame with timestamps, then
   transcribed with Groq Whisper so each step can be checked from the outside.
 
-Live APIs are used (Groq, Cerebras, Inworld). Nothing is sent to Discord.
+Live APIs are used (Groq, Cerebras, Inworld). Nothing is sent to Discord, unless
+run_voice_e2e --listen sets Rig.mirror to play the run into a voice channel.
 """
 
 from __future__ import annotations
@@ -58,9 +59,15 @@ class FakeChannel:
     def __init__(self, name: str):
         self.name = name
         self.sent: list[str] = []
+        self.forward = None  # --listen: async callable that posts to the real channel
 
     async def send(self, content=None, **kwargs):
         self.sent.append(content if content is not None else str(kwargs))
+        if self.forward is not None and content:
+            try:
+                await self.forward(content)
+            except Exception as e:
+                logger.warning(f"Forwarding the post to Discord failed: {e}")
 
 
 class FakeGuild:
@@ -102,8 +109,10 @@ class FakeVoiceClient:
     and records every frame.
     """
 
-    def __init__(self, guild: FakeGuild, clock: Callable[[], float]):
+    def __init__(self, guild: FakeGuild, clock: Callable[[], float],
+                 tap: Optional[Callable[[bytes], None]] = None):
         self.guild = guild
+        self._tap = tap  # gets every played frame (--listen)
         self.user = FakeMember(BOT_USER_ID, "Jarvis")
         self.ws = _FakeWS()
         self.recording = False
@@ -151,6 +160,8 @@ class FakeVoiceClient:
                     if not data:
                         break
                     segment.frames.append(data)
+                    if self._tap:
+                        self._tap(data)
                     next_at += FRAME_SEC
                     delay = next_at - time.perf_counter()
                     if delay > 0:
@@ -181,6 +192,9 @@ class Speech:
     voice: str = "ashley"
     noise_snr_db: Optional[float] = None  # add background noise at this SNR
     mode: str = "vad"  # "vad": frames stop in silence (Discord voice activity); "open": open mic
+    # Start this many seconds after the bot finishes its previous reply, while it may
+    # still be listening for a follow-up (instead of waiting for it to go idle)
+    after_reply: Optional[float] = None
     started_at: float = 0.0  # set when scheduled (scenario clock)
     ended_at: float = 0.0  # time of the last packet sent
 
@@ -203,7 +217,7 @@ class SpeechFactory:
 
         if voice not in self._synths:
             self._synths[voice] = TTSSynthesizer(
-                model="inworld-tts-1.5-mini", device="cpu", voice=voice, api_key=self._api_key,
+                model="inworld-tts-2-flash", device="cpu", voice=voice, api_key=self._api_key,
                 temperature=0.8, speed=1.0,
             )
         return self._synths[voice]
@@ -289,9 +303,11 @@ def to_frames(audio_24k: np.ndarray, mode: str, hangover: float = 0.3,
 class Injector:
     """Writes every speaker's frames into the sink at real-time pace from one thread."""
 
-    def __init__(self, sink, clock: Callable[[], float]):
+    def __init__(self, sink, clock: Callable[[], float],
+                 tap: Optional[Callable[[bytes], None]] = None):
         self._sink = sink
         self._clock = clock
+        self._tap = tap  # gets every injected frame (--listen)
         self.user_track: list[tuple[float, int, bytes]] = []  # (time, user_id, frame)
         self.last_frame_time: dict[int, float] = {}
         self.error: Optional[BaseException] = None
@@ -304,6 +320,8 @@ class Injector:
                 if delay > 0:
                     time.sleep(delay)
                 self._sink.write(frame, user_id)
+                if self._tap:
+                    self._tap(frame)
                 now = self._clock()
                 self.user_track.append((now, user_id, frame))
                 self.last_frame_time[user_id] = now
@@ -409,6 +427,7 @@ class Rig:
                                          model="whisper-large-v3-turbo", language="en")
         self.vad = None
         self.tts = None
+        self.mirror = None  # discord_mirror.DiscordMirror (--listen)
 
     async def run(self, name: str, speeches: list[Speech], members: list[FakeMember],
                   settle: float = 3.0, timeout: float = 90.0,
@@ -424,7 +443,9 @@ class Rig:
         t0 = time.perf_counter()
         clock = lambda: time.perf_counter() - t0  # noqa: E731
         guild = FakeGuild(members, self.settings.image_channel_name)
-        vc = FakeVoiceClient(guild, clock)
+        vc = FakeVoiceClient(guild, clock, tap=self.mirror.bot if self.mirror else None)
+        if self.mirror:
+            guild.channel.forward = self.mirror.post
         session = VoiceSession(vad=self.vad, groq_client=self.whisper, tts=self.tts,
                                turn_observer=observer)
         session_task = asyncio.create_task(session.start(vc))
@@ -436,20 +457,30 @@ class Rig:
         self.vad, self.tts = session.vad, session.tts
 
         error = None
-        injector = Injector(session.sink, clock)
+        injector = Injector(session.sink, clock, tap=self.mirror.user if self.mirror else None)
         try:
             groups = [speeches] if between is None else [[s] for s in speeches]
-            for gi, group in enumerate(groups):
-                rendered = [(sp, await self.speech.render(sp, seed=k)) for k, sp in enumerate(group)]
+            # Synthesize everything first so it can't eat into a follow-up window
+            all_rendered = [[(sp, await self.speech.render(sp, seed=k))
+                             for k, sp in enumerate(group)] for group in groups]
+            for gi, rendered in enumerate(all_rendered):
+                group = groups[gi]
                 # Offsets count from now, after models loaded and speech is synthesized
-                base = clock() + (between or 0.0) - (group[0].at if gi else 0.0)
+                if gi and group[0].after_reply is not None:
+                    base = clock() + group[0].after_reply - group[0].at
+                else:
+                    base = clock() + (between or 0.0) - (group[0].at if gi else 0.0)
                 schedule = []
                 for sp, audio in rendered:
                     schedule += build_schedule(sp, to_frames(audio, sp.mode), base)
                 await asyncio.to_thread(injector.run, schedule)
                 if injector.error:
                     raise injector.error
-                await self._wait_quiet(session, vc, settle, timeout)
+                following = groups[gi + 1][0] if gi + 1 < len(groups) else None
+                if following is not None and following.after_reply is not None:
+                    await self._wait_reply_done(session, vc, timeout)
+                else:
+                    await self._wait_quiet(session, vc, settle, timeout)
         except Exception as e:
             error = f"{type(e).__name__}: {e}"
             logger.exception(f"[{name}] failed")
@@ -477,6 +508,23 @@ class Rig:
         )
         write_wav(self.report_dir / f"{name}.wav", injector.user_track, vc.segments, result.duration)
         return result
+
+    async def _wait_reply_done(self, session, vc: FakeVoiceClient, timeout: float) -> None:
+        """Wait until the bot has handled the speech and stopped talking. It may still be
+        listening for a follow-up, which is the point."""
+        deadline = time.perf_counter() + timeout
+        handled = False
+        quiet_since = None
+        while time.perf_counter() < deadline:
+            if session.state == "processing" or vc.is_playing():
+                handled, quiet_since = True, None
+            elif handled:
+                if quiet_since is None:
+                    quiet_since = time.perf_counter()
+                elif time.perf_counter() - quiet_since >= 0.3:
+                    return
+            await asyncio.sleep(0.05)
+        raise TimeoutError(f"bot never finished replying within {timeout:.0f}s")
 
     async def _wait_quiet(self, session, vc: FakeVoiceClient, settle: float, timeout: float) -> None:
         """Wait until the session is idle and nothing has played for `settle` seconds."""

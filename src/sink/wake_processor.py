@@ -35,6 +35,7 @@ MAX_GAP_SECONDS = 2.5   # 2.5s maximum gap
 
 # Max silence attempts per user per gap
 MAX_SILENCE_ATTEMPTS = 5
+NEAR_MISS_SCORE = 0.05  # log speech bursts whose best wake score reached this
 
 
 class WakeWordProcessor:
@@ -171,7 +172,16 @@ class WakeWordProcessor:
             )
 
             # Feed silence to complete any pending detection
-            if detector.process(silence):
+            detected = detector.process(silence)
+            if attempts == 0 and not detected and hasattr(detector, "take_peak"):
+                # First look at this gap: report how close a missed wake word came
+                peak = detector.take_peak()
+                if isinstance(peak, float) and peak >= NEAR_MISS_SCORE:
+                    logger.info(
+                        f"[WAKE] Near miss from user {state.user_id}: best score {peak:.2f} "
+                        f"(needs {getattr(detector, 'threshold', 0):.2f})"
+                    )
+            if detected:
                 # User attribution is 100% accurate - we know which detector fired
                 self._wake_word_user_id = state.user_id
                 logger.info(

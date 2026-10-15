@@ -85,3 +85,23 @@ class TestUrlsNeverSpoken:
         tts, calls = make_tts([2.0])
         await tts.synthesize("Read it at https://example.com/page now.")
         assert "http" not in calls[0] and "the link" in calls[0]
+
+
+class TestFlashLaughing:
+    async def test_flash_drops_laughing_style_keeps_laugh(self):
+        tts, calls = make_tts([1.0])
+        tts.model_name = "inworld-tts-2-flash"
+        await tts.synthesize("[laughing] Oh sure. [laugh] Fine.")
+        assert calls == ["Oh sure. [laugh] Fine."]
+
+    async def test_other_models_keep_laughing_style(self):
+        tts, calls = make_tts([1.0])
+        tts.model_name = "inworld-tts-1.5-mini"
+        await tts.synthesize("[laughing] Oh sure.")
+        assert calls == ["[laughing] Oh sure."]
+
+    async def test_flash_tag_only_text_is_silent(self):
+        tts, calls = make_tts([1.0])
+        tts.model_name = "inworld-tts-2-flash"
+        assert len(await tts.synthesize("[laughing]")) == 0
+        assert calls == []

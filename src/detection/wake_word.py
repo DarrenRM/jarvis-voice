@@ -45,6 +45,8 @@ class WakeWordDetector:
         # Using smaller minimum to avoid stalls when audio stops mid-buffer
         self._buffer = np.array([], dtype=np.float32)
         self._min_samples = int(sample_rate * 0.02)  # 20ms minimum (was 80ms)
+        # Highest score since take_peak(): how close a missed wake word came
+        self.peak = 0.0
 
         self._load_model(model_path, model_name)
 
@@ -128,6 +130,7 @@ class WakeWordDetector:
                 score = scores[-1] if len(scores) > 0 else 0
             else:
                 score = scores
+            self.peak = max(self.peak, float(score))
 
             if score >= self.threshold:
                 logger.info(
@@ -139,6 +142,11 @@ class WakeWordDetector:
                 return True
 
         return False
+
+    def take_peak(self) -> float:
+        """Highest score since the last call (then starts over)."""
+        peak, self.peak = self.peak, 0.0
+        return peak
 
     def reset(self) -> None:
         """Reset detector state."""

@@ -59,6 +59,7 @@ class ResponseStage(StreamingPipelineStage):
         max_history_messages: int = 60,
         tool_result_ttl: float = TOOL_RESULT_TTL_SECONDS,
         clock: Callable[[], float] = time.monotonic,
+        game_notes=None,
     ):
         """Initialize response stage.
 
@@ -69,6 +70,8 @@ class ResponseStage(StreamingPipelineStage):
             max_history_messages: History cap; oldest whole exchanges are dropped
             tool_result_ttl: Seconds a large tool result stays whole in history
             clock: Time source (tests)
+            game_notes: Optional src.llm.game_notes.GameNotes; official notes for a
+                game in play are added to the system prompt
         """
         self._orchestrator = orchestrator
         self._build_base_prompt = build_system_prompt
@@ -80,6 +83,7 @@ class ResponseStage(StreamingPipelineStage):
         # tool_call_id -> when its (large) result entered history
         self._tool_result_times: dict[str, float] = {}
         self.last_turn: Optional[ResponseTurn] = None
+        self._game_notes = game_notes
 
     @property
     def name(self) -> str:
@@ -91,6 +95,13 @@ class ResponseStage(StreamingPipelineStage):
         self._history = []
         self._tool_result_times = {}
         logger.debug("Conversation history reset")
+
+    def earlier_lookups(self) -> str:
+        """Web lookup results still whole in history from turns before the latest one."""
+        from ..llm.chat_post import lookup_results
+
+        users = [i for i, m in enumerate(self._history) if m.get("role") == "user"]
+        return lookup_results(self._history[:users[-1]]) if users else ""
 
     def get_messages(self) -> list[dict]:
         """Get current message history (without system prompt)."""
@@ -112,7 +123,7 @@ class ResponseStage(StreamingPipelineStage):
         """
         self._expire_tool_results()
         messages = [
-            {"role": "system", "content": self._build_system_prompt(context)},
+            {"role": "system", "content": self._build_system_prompt(context, text)},
             *self._history,
             {"role": "user", "content": self._build_user_message(text, context)},
         ]
@@ -167,11 +178,12 @@ class ResponseStage(StreamingPipelineStage):
             start += 1
         return history[start:]
 
-    def _build_system_prompt(self, context: PipelineContext) -> str:
+    def _build_system_prompt(self, context: PipelineContext, text: str = "") -> str:
         """Build system prompt with speaker context.
 
         Args:
             context: Pipeline context with speaker info
+            text: The user's words (a named game brings in its notes)
 
         Returns:
             System prompt with any speaker-specific context
@@ -181,6 +193,11 @@ class ResponseStage(StreamingPipelineStage):
         # Add speaker activity if available
         if context.speaker_activity:
             prompt += f"\n\nThe user is currently: {context.speaker_activity}"
+
+        if self._game_notes is not None:
+            notes = self._game_notes.prompt_block(text, context.speaker_activity)
+            if notes:
+                prompt += "\n\n" + notes
 
         return prompt
 

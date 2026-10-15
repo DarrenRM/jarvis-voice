@@ -26,6 +26,10 @@ _REPEAT_SLACK_S = 0.9
 _NONVERBAL_TAG_S = 0.8
 _NONVERBAL_TAGS = re.compile(r"\[(sigh|laugh|laughing|breathe|cough|clear_throat|yawn)\]", re.IGNORECASE)
 _ANY_TAG = re.compile(r"\[[a-z_ ]+\]", re.IGNORECASE)
+# [laughing] is a delivery style (a laughing tone). TTS-2 Flash has no delivery styles
+# and plays a full laugh for it instead, which on nearly every reply is too much.
+# Explicit [laugh] non-verbals are kept.
+_LAUGHING_STYLE = re.compile(r"\[laughing\]\s*", re.IGNORECASE)
 
 # Short fixed phrases (acks, affirmations) are cached so they play instantly
 _PHRASE_CACHE_SIZE = 64
@@ -124,6 +128,10 @@ class TTSSynthesizer:
 
         # Never read links aloud; normalize numbers to words for better pronunciation
         text = normalize_numbers_for_tts(strip_urls_for_tts(text))
+        if "flash" in self.model_name:
+            text = _LAUGHING_STYLE.sub("", text)
+            if not _ANY_TAG.sub("", text).strip():
+                return np.array([], dtype=np.float32)
 
         audio = await self._synthesize_inworld(text)
         limit = _max_plausible_seconds(text, self.speed)

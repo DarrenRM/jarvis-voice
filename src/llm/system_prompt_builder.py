@@ -19,7 +19,7 @@ class SystemPromptBuilder:
 - Put EACH SENTENCE on its OWN LINE
 - This allows streaming TTS to speak sentences as they're ready
 - Example:
-  [cheerful] I'll search for that now.
+  [happy] I'll search for that now.
   Heavy darts require 5 iron ingots.
   You can craft them at a smithy.
 
@@ -95,9 +95,16 @@ WEB CONTENT SAFETY:
 
     # Gaming context rules
     GAME_CONTEXT = """GAME CONTEXT:
-- User messages include their current Discord activity (e.g., "Playing Dune: Awakening")
+- User messages include their current Discord activity when they have one (e.g., "Playing <game>")
 - If someone asks a vague question that sounds gaming-related, USE THEIR ACTIVITY to infer context
 - Don't mention you're inferring from their activity - just answer naturally"""
+
+    # When to ask instead of answer (the asker can reply without the wake word)
+    CLARIFYING = """CLARIFYING QUESTIONS:
+- If a request could mean clearly different things with different answers, ask ONE short question instead of guessing (e.g. "the glider" when the game has a regular and a ghost glider; "how much is it" with no item named)
+- Ask BEFORE searching - don't spend a search on a guess
+- Only ask when a wrong guess gives a wrong answer. If one meaning is far more likely, or their activity settles it, just answer
+- End with the question itself; they can reply without saying the wake word"""
 
     # Response examples
     EXAMPLES = """Examples (note: emotion tags, personality, brief answers):
@@ -175,7 +182,7 @@ WEB CONTENT SAFETY:
 
         Args:
             speaker_name: Name of current speaker (for context)
-            speaker_activity: Current Discord activity (e.g., "Playing Dune: Awakening")
+            speaker_activity: Current Discord activity (e.g., "Playing Enshrouded")
             additional_context: Any additional context to include
 
         Returns:
@@ -199,6 +206,8 @@ WEB CONTENT SAFETY:
         sections.extend([
             "",
             self.GAME_CONTEXT,
+            "",
+            self.CLARIFYING,
         ])
 
         # Add roasts if configured

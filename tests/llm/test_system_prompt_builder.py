@@ -339,3 +339,13 @@ class TestPromptSections:
         assert "What's the weather?" in examples
         assert "Tell me about quantum computing" in examples
         assert "Can you do my homework?" in examples
+
+
+class TestClarifyingQuestions:
+    """The model may ask one short question when a request is ambiguous."""
+
+    def test_prompt_allows_one_clarifying_question(self):
+        prompt = SystemPromptBuilder().build()
+        assert "CLARIFYING QUESTIONS" in prompt
+        assert "ONE short question" in prompt
+        assert "BEFORE searching" in prompt

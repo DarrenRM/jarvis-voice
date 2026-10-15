@@ -11,6 +11,8 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
+TRANSCRIBE_TIMEOUT_SECONDS = 6.0  # per try; the SDK retries once
+
 
 class GroqWhisperClient:
     """STT client using Groq's Whisper API.
@@ -48,7 +50,12 @@ class GroqWhisperClient:
         try:
             from groq import Groq
 
-            self._client = Groq(api_key=self.api_key)
+            # The SDK default waits 60s per try. A transcription takes ~0.5s, and one
+            # stalled request left a speaker in silence for a minute: give up fast and
+            # retry once instead.
+            self._client = Groq(
+                api_key=self.api_key, timeout=TRANSCRIBE_TIMEOUT_SECONDS, max_retries=1
+            )
             logger.info(f"Groq Whisper client initialized (model: {self.model})")
 
         except ImportError:
@@ -112,6 +119,8 @@ class GroqWhisperClient:
                 )
 
             transcript = await loop.run_in_executor(None, do_transcribe)
+            # The SDK JSON-decodes the "text" body, so a bare number ("24") arrives as an int
+            transcript = "" if transcript is None else str(transcript)
 
             logger.info(f"[GROQ] Transcribed: {transcript[:50] if transcript else 'empty'}...")
             return transcript.strip() if transcript else ""

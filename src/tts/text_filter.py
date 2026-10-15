@@ -47,6 +47,31 @@ STANDALONE_NUMBER_PATTERN = re.compile(
     r'(?<![0-9.,-‑–—])(\d+(?:,\d{3})*(?:\.\d+)?)(?![0-9.,-‑–—%+])'
 )
 
+# Version numbers, read the way people say them ("1.0" -> "one point oh", not "one"):
+# anything ending in ".0", multi-dot versions (1.0.2), and numbers after a version word.
+# Other decimals ("2.5", "3.50") are left to the normal number handling.
+VERSION_PATTERN = re.compile(
+    r'(?<![\d.,])(?:'
+    r'(\b(?:v|ver|version|patch|update|hotfix) )(\d+(?:\.\d+)+)'
+    r'|(\d+(?:\.\d+){2,}|\d+\.0)'
+    r')(?![\d%]|\.\d)',
+    re.IGNORECASE,
+)
+
+
+def _version_to_words(version: str) -> str:
+    """'1.0' -> 'one point oh', '1.0.2' -> 'one point oh point two', '1.05' -> '... oh five'."""
+    whole, *parts = version.split('.')
+    words = [num2words(int(whole))]
+    for part in parts:
+        if part.startswith('0'):
+            # Leading zeros are said digit by digit: "05" -> "oh five"
+            digits = ['oh' if d == '0' else num2words(int(d)) for d in part]
+            words.append(' '.join(digits))
+        else:
+            words.append(num2words(int(part)))
+    return ' point '.join(words)
+
 
 def _number_to_words(num_str: str) -> str:
     """Convert a number string to words.
@@ -102,6 +127,10 @@ def normalize_numbers_for_tts(text: str) -> str:
     if not HAS_NUM2WORDS:
         logger.debug("num2words not installed, skipping number normalization")
         return text
+
+    text = VERSION_PATTERN.sub(
+        lambda m: (m.group(1) or '') + _version_to_words(m.group(2) or m.group(3)), text
+    )
 
     # Handle number ranges (do this before standalone numbers)
     def replace_range(match: re.Match) -> str:
@@ -159,6 +188,12 @@ _GARBAGE_REGEX = [re.compile(p, re.IGNORECASE) for p in GARBAGE_PATTERNS]
 
 # Minimum content length (chars) for valid speech (excludes emotion tags)
 MIN_CONTENT_LENGTH = 5
+
+# Short sentences that are real answers ("Yes.", "Ten."); numbers ("96.") are kept too
+SHORT_ANSWERS = {
+    'ok', 'yes', 'no', 'hi', 'hey', 'bye', 'done', 'sure', 'wow', 'nice', 'yep', 'nah',
+    'zero', 'one', 'two', 'six', 'ten',
+}
 
 
 _URL = re.compile(
@@ -250,8 +285,9 @@ def is_reasoning_text(text: str) -> bool:
 
     # Filter very short fragments (unless it's just an emotion tag which is OK)
     if len(content) < MIN_CONTENT_LENGTH and len(content) > 0:
-        # Allow short interjections that make sense
-        if content.lower() not in {'ok', 'yes', 'no', 'hi', 'hey', 'bye', 'done', 'sure', 'wow', 'nice'}:
+        # Allow short answers: numbers ("96.") and known words ("Yes.")
+        word = content.strip(" .,!?;:'\"").lower()
+        if word not in SHORT_ANSWERS and not any(c.isdigit() for c in content):
             return True
 
     # Filter text that's mostly punctuation/dots/ellipsis

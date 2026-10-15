@@ -7,6 +7,8 @@
 --no-web skips the live web scenarios (web_*); --repeat=N runs each scenario N times.
 --monitor runs each turn through the live monitor (src/monitor) and lists in the report
 what it would have posted to Discord (nothing is sent).
+--listen plays the run (people and bot) into the voice channel you're in, using the
+bot's token: stop the live bot first. MONITOR_OWNER_ID picks your channel if set.
 
 Writes reports/e2e-<timestamp>/report.md, results.json and one stereo WAV per
 scenario (left = people, right = bot) so timing and pauses can be listened to.
@@ -38,7 +40,7 @@ from scripts.e2e.harness import (  # noqa: E402
 # Shared with the live monitor (src/monitor)
 from src.monitor.text_checks import give_up_phrases, spoken_artifacts  # noqa: E402
 
-TESTER = FakeMember(700000000000000001, "Tester", activity="Dune: Awakening")
+TESTER = FakeMember(700000000000000001, "Tester")  # no game: answers stay generic
 BYSTANDER = FakeMember(700000000000000002, "Bystander")
 MORGAN = FakeMember(700000000000000003, "Morgan")
 RILEY = FakeMember(700000000000000004, "Riley", activity="Enshrouded")
@@ -139,6 +141,15 @@ def turns_at_least(n: int) -> Check:
     return check
 
 
+def announced_post(r: RunResult) -> tuple[bool, str]:
+    said = "post this in chat" in r.bot_transcript.lower()
+    return said, "said it" if said else f"never said it: {r.bot_transcript[-120:]!r}"
+
+
+def no_post(r: RunResult) -> tuple[bool, str]:
+    return not r.posts, f"posts={r.posts}" if r.posts else "nothing posted"
+
+
 def posted(pattern: str) -> Check:
     def check(r):
         return any(re.search(pattern, p, re.I) for p in r.posts), f"posts={r.posts}"
@@ -194,6 +205,65 @@ def no_error(r: RunResult) -> tuple[bool, str]:
     return not r.error and not apology, r.error or ("bot apologized for an error" if apology else "ok")
 
 
+# Follow-ups without the wake word (speech index = position in the scenario's speeches)
+
+
+def turns_exactly(n: int) -> Check:
+    def check(r):
+        return len(r.turns) == n, f"{len(r.turns)} turns: {[t.user_text for t in r.turns]}"
+    check.__name__ = f"turns=={n}"
+    return check
+
+
+def asked_question(turn: int = 0) -> Check:
+    def check(r):
+        from src.llm.addressee_judge import is_question
+
+        if len(r.turns) <= turn:
+            return False, "no turn recorded"
+        answer = r.turns[turn].answer
+        return is_question(re.sub(r"\[[^\]]*\]", "", answer)), f"answer {answer!r}"
+    check.__name__ = f"bot_asked[{turn}]"
+    return check
+
+
+def _after(r: RunResult, speech: int) -> list:
+    end = r.speeches[speech].ended_at
+    return [s for s in r.segments if s.start >= end - 0.2]
+
+
+def quiet_after(speech: int) -> Check:
+    def check(r):
+        after = _after(r, speech)
+        return not after, " | ".join(s.transcript for s in after) or "bot stayed quiet"
+    check.__name__ = f"quiet_after[{speech}]"
+    return check
+
+
+def replied_within(speech: int, seconds: float) -> Check:
+    def check(r):
+        after = _after(r, speech)
+        if not after:
+            return False, "no reply"
+        delay = after[0].start - r.speeches[speech].ended_at
+        return delay <= seconds, f"first audio {delay:.2f}s after they stopped: {after[0].transcript!r}"
+    check.__name__ = f"replied_within[{speech}]({seconds}s)"
+    return check
+
+
+def no_affirmation_after(speech: int) -> Check:
+    """Follow-ups skip the "Sure, <name>..." opening (the name only appears there)."""
+    def check(r):
+        after = _after(r, speech)
+        if not after:
+            return False, "no reply"
+        name = r.speeches[speech].user.display_name.lower()
+        first = after[0].transcript
+        return name not in first.lower(), f"first clip {first!r}"
+    check.__name__ = f"no_affirmation[{speech}]"
+    return check
+
+
 # ---------------------------------------------------------------- scenarios
 
 
@@ -209,6 +279,8 @@ class Scenario:
 
 
 Q_CAPITAL = "what's the capital of Australia?"
+TRIVIA = "Hey Jarvis, ask me an easy trivia question."
+TIMES = "Hey Jarvis, what's twelve times eight?"
 
 SCENARIOS = [
     Scenario("basic", [Speech(TESTER, [f"Hey Jarvis, {Q_CAPITAL}"])],
@@ -279,10 +351,10 @@ SCENARIOS = [
              note="Mental maths with reasoning, no tools."),
     Scenario("followup_no_wake",
              [Speech(TESTER, ["Hey Jarvis, what's your favorite color?"]),
-              Speech(TESTER, ["Why that one?"])],
-             [turns_at_least(2), no_tools], between=1.0, expect_fail=True,
-             note="Second question has no wake word. Follow-up mode is switched off "
-                  "(voice_session.py `# await self._followup_loop()`), so it is ignored."),
+              Speech(TESTER, ["Why that one?"], after_reply=1.0)],
+             [turns_at_least(2), no_tools], between=1.0,
+             note="Second question has no wake word, 1 s after the answer ends: "
+                  "inside the follow-up window, so it's answered."),
     Scenario("quick_second_question",
              [Speech(TESTER, ["Hey Jarvis, what's two plus two?"]),
               Speech(TESTER, ["Hey Jarvis, and what's ten times ten?"])],
@@ -293,6 +365,94 @@ SCENARIOS = [
               Speech(TESTER, ["Hey Jarvis, stop."], at=9.0)],
              [no_llm_turn], answers=False, expect_fail=True,
              note="Known gap: no barge-in. Records what happens when the user interrupts."),
+
+    # ---- Follow-ups without the wake word. After the bot asks something, the asker has
+    # FOLLOWUP_WINDOW_SECONDS (10) to start replying; after a plain answer they have
+    # FOLLOWUP_AFTER_ANSWER_SECONDS (4), and only a new question or request counts.
+    Scenario("fu_asked_reply",
+             [Speech(TESTER, [TRIVIA]),
+              Speech(TESTER, ["I'm going to guess Paris."], after_reply=1.0)],
+             [asked_question(0), turns_exactly(2), replied_within(1, 3.0),
+              no_affirmation_after(1)], between=1.0,
+             note="Bot asks; the asker answers without the wake word (not a question)."),
+    Scenario("fu_asked_crosstalk",
+             [Speech(TESTER, [TRIVIA]),
+              Speech(TESTER, ["Riley, grab the loot by the door before we go."], after_reply=1.0)],
+             [asked_question(0), turns_exactly(1), quiet_after(1)], between=1.0,
+             note="Bot asks, but the asker turns to a friend: the check must say not for the bot."),
+    Scenario("fu_asked_other_person",
+             [Speech(TESTER, [TRIVIA]),
+              Speech(RILEY, ["I'm going to guess Paris."], after_reply=1.0, voice="dennis")],
+             [asked_question(0), turns_exactly(1), quiet_after(1)], between=1.0,
+             note="Someone else answers the bot's question: only the asker is heard."),
+    Scenario("fu_clarify",
+             [Speech(TESTER, ["Hey Jarvis, convert thirty degrees for me."]),
+              Speech(TESTER, ["Celsius to Fahrenheit."], after_reply=1.0)],
+             [asked_question(0), says_any("86", "eighty-six", "eighty six", turn=1)],
+             between=1.0,
+             note="Ambiguous request: the prompt should make it ask which way first."),
+    Scenario("fu_answer_new_question",
+             [Speech(TESTER, [TIMES]),
+              Speech(TESTER, ["And what's that divided by four?"], after_reply=1.0)],
+             [says_any("96", "ninety-six", "ninety six"),
+              says_any("24", "twenty-four", "twenty four", turn=1),
+              replied_within(1, 3.0), no_affirmation_after(1)], between=1.0,
+             note="After a plain answer, a new question without the wake word is answered."),
+    Scenario("fu_answer_chatter",
+             [Speech(TESTER, [TIMES]),
+              Speech(TESTER, ["Nice, told you it was easy."], after_reply=1.0)],
+             [turns_exactly(1), quiet_after(1)], between=1.0,
+             note="After a plain answer, a reaction to friends gets no reply."),
+    Scenario("fu_answer_thanks",
+             [Speech(TESTER, [TIMES]),
+              Speech(TESTER, ["Okay cool, thanks."], after_reply=1.0)],
+             [turns_exactly(1), quiet_after(1)], between=1.0,
+             note="Said to the bot, but not a question or request: no reply."),
+    Scenario("fu_answer_window_closed",
+             [Speech(TESTER, [TIMES]),
+              Speech(TESTER, ["And what's that divided by four?"], after_reply=6.0)],
+             [turns_exactly(1), quiet_after(1)], between=1.0,
+             note="Starts after the 4 s window: needs the wake word again."),
+    Scenario("fu_answer_late_start",
+             [Speech(TESTER, [TIMES]),
+              Speech(TESTER, ["And if I split that evenly between four people, "
+                              "how many would each of us get?"], after_reply=3.0)],
+             [says_any("24", "twenty-four", "twenty four", turn=1)], between=1.0,
+             note="Starts inside the window and keeps talking past its end: still heard."),
+    Scenario("fu_other_wake_in_window",
+             [Speech(TESTER, [TRIVIA]),
+              Speech(RILEY, ["Hey Jarvis, what's two plus two?"], after_reply=1.0, voice="dennis")],
+             [asked_question(0), turns_exactly(2), says_any("four", "4", turn=1),
+              replied_within(1, 4.0)], between=1.0,
+             note="Someone else says the wake word during the window: their turn starts now."),
+
+    # ---- Reference answers also posted to chat (Jev decides, Qwen writes the post)
+    Scenario("post_recipe",
+             [Speech(TESTER, ["Hey Jarvis, what do I need to craft a ghost glider in Enshrouded?"])],
+             [posted(r"glider"), announced_post],
+             note="Crafting recipe: answered out loud, announced, and posted (may search)."),
+    Scenario("post_ingredients",
+             [Speech(TESTER, ["Hey Jarvis, what ingredients do I need for basic pancakes?"])],
+             [says_any("flour"), no_post],
+             note="Ingredient list from the model's memory, nothing looked up: no post."),
+    Scenario("post_not_for_small_talk",
+             [Speech(TESTER, [TIMES])],
+             [no_post], note="A single number: no post."),
+
+    # ---- Official patch notes in the prompt while the game is in play (Riley: Enshrouded)
+    Scenario("notes_max_level",
+             [Speech(RILEY, ["Hey Jarvis, what's the new max level?"], voice="dennis")],
+             [says_any("50", "fifty"), web_searches_at_most(0)],
+             note="Answered straight from the 1.0 notes (50), no search needed."),
+    Scenario("notes_new_region",
+             [Speech(RILEY, ["Hey Jarvis, what's in Cinder's Cradle?"], voice="dennis")],
+             [says_any("lava", "floating", "island"), web_searches_at_most(1)],
+             note="Open-ended question about the new region, from the notes."),
+    Scenario("notes_recipe_caveat",
+             [Speech(RILEY, ["Hey Jarvis, what do I need to craft a ghost glider?"],
+                     voice="dennis")],
+             [used_tool("web_search"), says_any("changed", "change", "updated", "older", "rework")],
+             note="Recipe from the web, with a warning that 1.0 may have changed it."),
 ]
 
 
@@ -462,6 +622,10 @@ async def main(args: list[str]) -> int:
         recorder.install()
 
     rig = Rig(settings, out)
+    if "--listen" in args:
+        from scripts.e2e.discord_mirror import DiscordMirror
+
+        rig.mirror = await DiscordMirror.join(settings)
     selected = [s for s in SCENARIOS
                 if (not filters or any(f in s.name for f in filters))
                 and not (no_web and s.name.startswith("web_"))]
@@ -492,6 +656,8 @@ async def main(args: list[str]) -> int:
         sweep = await wake_sweep(rig, settings.wake_word_confidence)
     if rig.tts is not None:
         await rig.tts.close()
+    if rig.mirror is not None:
+        await rig.mirror.close()
 
     render_report(results, scenarios, sweep, settings.wake_word_confidence, out)
     (out / "results.json").write_text(

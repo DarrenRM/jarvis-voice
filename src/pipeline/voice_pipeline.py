@@ -131,6 +131,8 @@ class VoicePipeline:
         self._opening: Optional[OpeningPhrase] = None
         # Optional turn monitor (src.monitor.TurnRecorder); only notified, never awaited
         self.observer = None
+        # Optional src.llm.chat_post.ChatPoster: reference answers also go to chat
+        self.poster = None
 
     async def process(
         self,
@@ -144,6 +146,7 @@ class VoicePipeline:
         tts_synthesizer: Optional[TTSSynthesizerProtocol] = None,
         affirmation_audio: Optional[np.ndarray] = None,
         opening: Optional[OpeningPhrase] = None,
+        accept: Optional[Callable[[TranscriptionResult], Awaitable[bool]]] = None,
     ) -> Optional[str]:
         """Run full voice pipeline.
 
@@ -160,12 +163,15 @@ class VoicePipeline:
             opening: Phrase already started at speech end (affirmation in dynamic
                 mode, the thinking phrase in static mode). Cancelled on an empty
                 transcription if not yet audible; left to the caller on wake-word-only.
+            accept: Checked after transcription; False drops the turn without a reply
+                (follow-ups without the wake word that weren't meant for the bot).
 
         Returns:
             None normally
             "wake_word_only" if only wake word detected
             "cancelled" if cancelled during processing
             "empty" if no speech detected
+            "not_addressed" if accept() turned the speech down
         """
         self._cancelled = False
         self._thinking_task = None
@@ -201,6 +207,11 @@ class VoicePipeline:
 
         text = transcription_result.text
         logger.info(f"Pipeline: Transcribed: {text[:100]}...")
+
+        if accept is not None and not await accept(transcription_result):
+            if opening is not None:
+                opening.cancel_if_not_playing()
+            return "not_addressed"
 
         if self._cancelled:
             return "cancelled"
@@ -268,7 +279,34 @@ class VoicePipeline:
             if self.observer is not None:
                 self.observer.replied(getattr(self._response, "last_turn", None))
 
+        if self.poster is not None and not self._cancelled:
+            # A follow-up without the wake word may rest on the previous turn's lookup
+            await self._offer_post(text, play_audio, followup=accept is not None)
+
         return None
+
+    async def _offer_post(
+        self, text: str, play_audio: Callable[[np.ndarray], Awaitable[None]],
+        followup: bool = False,
+    ) -> None:
+        """After the answer: if it's worth having in writing, say so and post it."""
+        try:
+            earlier = ""
+            if followup and hasattr(self._response, "earlier_lookups"):
+                earlier = self._response.earlier_lookups()
+            material = await self.poster.check(
+                text, getattr(self._response, "last_turn", None), earlier
+            )
+            if material is None:
+                return
+            self.poster.write_and_post(material)  # written while the line plays
+            audio = await self.poster.announcement()
+            if audio is not None and len(audio) > 0:
+                await play_audio(audio)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.warning(f"Pipeline: Chat post check failed: {e}")
 
     async def _play_thinking_phrase(
         self,

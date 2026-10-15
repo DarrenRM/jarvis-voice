@@ -1,0 +1,10 @@
+{
+  "game": "Enshrouded",
+  "version": "1.0",
+  "released": "2026-10-15",
+  "notes": "1.0.txt",
+  "aliases": ["enshrouded", "embervale"],
+  "misheard": ["in shrouded", "en shrouded", "enshrowded", "in shrowded", "en shrowded",
+               "inshrouded", "inshrowded"],
+  "source": "Keen Games, the developer"
+}

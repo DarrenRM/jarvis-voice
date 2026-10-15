@@ -98,6 +98,10 @@ class StreamingSink(discord.sinks.Sink):
 
         # Track user for logging
         self._last_user_id = None
+        # Who start_listening() locked onto, and whether other users' wake words still
+        # count (follow-up windows, where the locked speaker didn't say the wake word)
+        self._listen_user_id: Optional[int] = None
+        self._watch_wake_word = False
         self._user_log_cooldown = 5.0  # Only log "receiving from user" after 5s of silence from them
 
         # Timing stats
@@ -187,13 +191,20 @@ class StreamingSink(discord.sinks.Sink):
         self._user_manager.cleanup_user(user_id)
         logger.debug(f"[WAKE] Removed user {user_id}")
 
-    def start_listening(self):
-        """Transition to listening state."""
+    def start_listening(self, user_id: Optional[int] = None, watch_wake_word: bool = False):
+        """Transition to listening state.
+
+        Args:
+            user_id: Speaker to listen to (follow-ups: the person the bot answered).
+                Default: the wake word speaker.
+            watch_wake_word: Keep detecting the wake word from everyone else; a hit
+                calls on_wake_word (lets someone else cut a follow-up window short)
+        """
         logger.info("[SINK] start_listening() called")
 
         # Use the user who triggered wake word (captured at detection time, not now)
         # This prevents race conditions where another user's packet arrives between detection and start_listening
-        wake_user = self._wake_processor.wake_word_user_id or self._last_user_id
+        wake_user = user_id or self._wake_processor.wake_word_user_id or self._last_user_id
 
         # Include ONLY the wake word speaker's pre-buffer (speaker isolation)
         # This captures the start of questions when user speaks continuously
@@ -210,6 +221,8 @@ class StreamingSink(discord.sinks.Sink):
 
         # Lock speaker isolation to the wake word speaker
         self._last_user_id = wake_user
+        self._listen_user_id = wake_user
+        self._watch_wake_word = watch_wake_word
 
         # Reset filtered user tracking
         self._filtered_users.clear()
@@ -233,6 +246,8 @@ class StreamingSink(discord.sinks.Sink):
         if self._filtered_users:
             logger.info(f"[SINK ISOLATION] Session filtered audio from {len(self._filtered_users)} other user(s): {self._filtered_users}")
             self._filtered_users.clear()
+        self._listen_user_id = None
+        self._watch_wake_word = False
         self.state = "idle"
 
     def get_audio_buffer(self) -> np.ndarray:
@@ -520,12 +535,15 @@ class StreamingSink(discord.sinks.Sink):
             # SPEAKER ISOLATION: Only buffer audio from the wake word speaker
             # Use wake_word_user_id (captured at detection time) to avoid race conditions
             # where packets from other users arrive between detection and start_listening()
-            wake_user = self._wake_processor.wake_word_user_id
+            # (follow-ups: the wake word user is cleared by then, so use who we locked onto)
+            wake_user = self._listen_user_id or self._wake_processor.wake_word_user_id
             if self._speaker_isolation_enabled and wake_user is not None and user_id != wake_user:
                 # Track interference for debugging (log once per user per session)
                 if user_id not in self._filtered_users:
                     logger.info(f"[SINK ISOLATION] Filtering audio from user {user_id} (locked to {wake_user})")
                     self._filtered_users.add(user_id)
+                if self._watch_wake_word:
+                    self._watch_for_wake_word(user_id, audio_16k)
                 # Don't buffer this audio - PTT timing already handled above
                 # Still process through speaking detector for awareness
                 return
@@ -610,6 +628,18 @@ class StreamingSink(discord.sinks.Sink):
                             self._on_speech_end(audio, self._last_user_id)
                         # Clear buffer after forced end
                         self._audio_buffer = []
+
+    def _watch_for_wake_word(self, user_id: int, audio_16k: np.ndarray) -> None:
+        """Follow-up window: someone other than the locked speaker says the wake word."""
+        state = self._user_manager.get_or_create(user_id)
+        state.add_to_pre_buffer(audio_16k)  # so their question's start isn't lost
+        state.update_last_seen()
+        if self._wake_processor.process_audio(user_id, audio_16k):
+            self._watch_wake_word = False
+            self._wake_word_refractory_until = time.perf_counter() + self._wake_word_refractory_seconds
+            logger.info(f"[SINK] Wake word from user {user_id} during a follow-up window")
+            if self._on_wake_word:
+                self._on_wake_word()
 
     def cleanup(self) -> None:
         """Clean up resources when recording stops."""

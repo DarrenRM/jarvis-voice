@@ -513,3 +513,52 @@ class TestOpeningPhrase:
             wait_for_silence=wait_for_silence, thinking_phrase="One moment...", opening=opening,
         )
         assert opening_finished
+
+
+class TestAccept:
+    """The follow-up gate between transcription and the reply."""
+
+    @pytest.mark.asyncio
+    async def test_rejected_speech_gets_no_reply(
+        self, pipeline, context, play_audio, wait_for_silence
+    ):
+        seen = []
+
+        async def accept(transcription):
+            seen.append(transcription.text)
+            return False
+
+        result = await pipeline.process(
+            audio=make_audio(), context=context, play_audio=play_audio,
+            wait_for_silence=wait_for_silence, accept=accept,
+        )
+        assert result == "not_addressed"
+        assert seen == ["hello world"]
+        assert play_audio.played == []
+
+    @pytest.mark.asyncio
+    async def test_accepted_speech_is_answered(
+        self, pipeline, context, play_audio, wait_for_silence
+    ):
+        async def accept(transcription):
+            return True
+
+        result = await pipeline.process(
+            audio=make_audio(), context=context, play_audio=play_audio,
+            wait_for_silence=wait_for_silence, accept=accept,
+        )
+        assert result is None
+        assert len(play_audio.played) == 2
+
+    @pytest.mark.asyncio
+    async def test_not_asked_for_empty_speech(
+        self, pipeline, mock_transcription, context, play_audio, wait_for_silence
+    ):
+        mock_transcription.process.return_value = TranscriptionResult.empty()
+        accept = AsyncMock(return_value=True)
+        result = await pipeline.process(
+            audio=make_audio(), context=context, play_audio=play_audio,
+            wait_for_silence=wait_for_silence, accept=accept,
+        )
+        assert result == "empty"
+        accept.assert_not_called()
