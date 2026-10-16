@@ -1486,6 +1486,7 @@ class VoiceSession:
         if not self.settings.followup_enabled or self._addressee_judge is None:
             return
         speaker_id = self._current_speaker_id
+        reopened = False
         while self._running and result is None:
             reply = self._last_reply()
             if not reply:
@@ -1502,7 +1503,15 @@ class VoiceSession:
                 if followup.bot_asked and self._wake_from_followup is None:
                     self._watch_for_late_reply(speaker_id, reply)
                 return
+            said_during_answer = getattr(self, "_followup_said_during_answer", False)
             result = await self._process_speech(audio, followup=followup)
+            if result == "not_addressed" and said_during_answer and not reopened:
+                # 2026-10-15: Pat's "mm-hmm" during the answer was all the window
+                # heard, so his real follow-up had no window left. Give it one.
+                logger.info("[FOLLOWUP] What they said during the answer wasn't for the "
+                            "bot; listening again for their reply")
+                reopened = True
+                result = None
 
     def _last_reply(self) -> Optional[str]:
         """What the bot just said (tags removed), if the turn finished normally."""
@@ -1532,6 +1541,7 @@ class VoiceSession:
         self._wake_from_followup = None
         self._followup_open = True
         self.sink.start_listening(user_id=speaker_id, watch_wake_word=True)
+        self._followup_said_during_answer = bool(getattr(self.sink, "seed_finished", False))
 
         start = last = time.perf_counter()
         give_up = start + self.settings.followup_max_wait_seconds

@@ -291,3 +291,69 @@ class TestLateReply:
         session._watch_for_late_reply(SPEAKER, "Want the recipe?")
         await session._late_reply_task
         assert session.turn_observer.incidents == []
+
+
+class TestSaidDuringTheAnswer:
+    """2026-10-15: Pat's "mm-hmm" during the answer started the reply window, which
+    ended at once (he'd finished 5s before); it wasn't for the bot, and his real
+    follow-up had no window left."""
+
+    def test_sink_flags_speech_that_was_already_over(self):
+        sink = make_sink()
+        sink.start_capture(SPEAKER)
+        talk(sink, SPEAKER, 1.0)
+        sink.start_listening(user_id=SPEAKER)
+        assert not sink.seed_finished  # still talking: listen on
+
+        sink = make_sink()
+        sink.start_capture(SPEAKER)
+        talk(sink, SPEAKER, 1.0)
+        sink._capture_last_voiced -= sink._silence_timeout + 3
+        sink.start_listening(user_id=SPEAKER)
+        assert sink.seed_finished and sink.check_audio_timeout()
+
+    def test_nothing_said_is_not_flagged(self):
+        sink = make_sink()
+        sink.start_capture(SPEAKER)
+        sink.start_listening(user_id=SPEAKER)
+        assert not sink.seed_finished
+
+    @staticmethod
+    def session(during_answer: list[bool], results: list) -> VoiceSession:
+        session = VoiceSession.__new__(VoiceSession)
+        session.settings = Settings(_env_file=None, DISCORD_TOKEN="x")
+        session._addressee_judge = object()
+        session._running = True
+        session._current_speaker_id = SPEAKER
+        session._wake_from_followup = None
+        session._last_reply = lambda: "It's Canberra."
+        session.listens = 0
+
+        async def listen(speaker_id, window, bot_asked):
+            session.listens += 1
+            if not during_answer:
+                return None
+            session._followup_said_during_answer = during_answer.pop(0)
+            return np.zeros(16000, dtype=np.float32)
+
+        async def process(audio, followup=None):
+            return results.pop(0)
+
+        session._listen_for_followup = listen
+        session._process_speech = process
+        return session
+
+    async def test_window_reopens_once_after_a_reaction(self):
+        session = self.session([True, True], ["not_addressed", "not_addressed"])
+        await session._followup_after(None)
+        assert session.listens == 2  # once more, not forever
+
+    async def test_reopened_window_hears_the_follow_up(self):
+        session = self.session([True, False], ["not_addressed", None])
+        await session._followup_after(None)
+        assert session.listens == 3  # reaction, the follow-up, then the next window
+
+    async def test_ordinary_not_for_the_bot_ends_it(self):
+        session = self.session([False], ["not_addressed"])
+        await session._followup_after(None)
+        assert session.listens == 1

@@ -150,6 +150,7 @@ class StreamingSink(discord.sinks.Sink):
         # Listening that started from captured speech: ends once the speaker has been
         # quiet for _silence_timeout even if Discord keeps sending (VAD never restarted)
         self._seeded = False
+        self.seed_finished = False  # see start_listening
         self._last_voiced_time: Optional[float] = None
 
         # Wake word refractory period: after detection, suppress further detections
@@ -278,6 +279,12 @@ class StreamingSink(discord.sinks.Sink):
         self._pending_speech_end_time = None  # Reset multi-speaker tolerance
         # PTT tracking: seeded listening counts from the speaker's last audio
         now = time.perf_counter()
+        # Everything captured was already over (said during the answer, e.g. "mm-hmm"):
+        # this listen ends at once with it, and their real reply may still be coming
+        self.seed_finished = bool(
+            seeded and prefix is None and captured_last_voiced is not None
+            and now - captured_last_voiced >= self._silence_timeout
+        )
         self._last_audio_time = (captured_last or now) if seeded else None
         self._last_voiced_time = (captured_last_voiced or now) if seeded else None
         self._audio_timeout_detected = False  # Reset timeout flag
