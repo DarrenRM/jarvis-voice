@@ -30,7 +30,8 @@ Known pre-existing test problems: `test_tts_stage.py::test_exclamation_splits` f
   (httpx + Trafilatura, SSRF-guarded, parallel). `WEB_BACKEND=local` forces the local path.
 - `src/monitor/` - live monitor: per-turn records (hooks in VoiceSession/VoicePipeline + a log
   handler), detectors, posts to `MONITOR_CHANNEL_NAME`; owner's check reaction appends to
-  `docs/approved-fixes.md`. Text checks are shared with `scripts/e2e` (`--monitor` dry-runs it)
+  `docs/approved-fixes.md` (a local log, gitignored: it holds Discord IDs and what people said).
+  Text checks are shared with `scripts/e2e` (`--monitor` dry-runs it)
 - `src/detection/`, `src/stt/`, `src/tts/`, `src/session/`, `src/sink/` - voice path
 - `src/config.py` - all settings (pydantic-settings, read from `.env`)
 - `docs/project-reference.md` - timing constants and voice-path details (its LLM/search

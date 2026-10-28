@@ -81,3 +81,32 @@ reports/
 
 # Real voice recordings kept by the live monitor (MONITOR_SAVE_AUDIO): friends' voices
 recordings/
+
+# Live monitor logs: they hold Discord IDs and what people actually said
+docs/approved-fixes.md
+docs/dismissed-findings.md
+
+# Never commit recorded audio (the one tracked clip is the bot's own "Yes?" ack)
+*.wav
+*.ogg
+*.mp3
+*.flac
+*.opus
+!assets/audio/*.wav
+
+# Secrets and keys
+.env.*
+!.env.example
+*.pem
+*.key
+credentials*
+service-account*.json
+
+# Local databases and data dumps
+*.sqlite
+*.sqlite3
+*.db
+
+# Tooling caches and agent worktrees
+.ruff_cache/
+.claude/worktrees/
