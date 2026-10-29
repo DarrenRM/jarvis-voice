@@ -16,8 +16,10 @@ uv venv --python 3.12 .venv && VIRTUAL_ENV=.venv uv pip install -e ".[dev]"
 .venv/Scripts/python -m ruff check src/
 ```
 
-Known pre-existing test problems: `test_tts_stage.py::test_exclamation_splits` fails, and
-`tests/test_ring_buffer.py` / `tests/test_state_machine.py` import modules that no longer exist.
+The tests run offline with no `.env` (`tests/conftest.py` sets a dummy `DISCORD_TOKEN`). The
+timeline replays in `tests/irl` run on real clocks at 0.1x, so a heavily loaded machine can make
+one of them fail once; rerun it. `ruff check` still reports older style findings (mostly
+`Optional[...]` annotations and import order); don't fix them in unrelated changes.
 
 ## Layout
 

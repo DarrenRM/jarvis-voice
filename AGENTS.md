@@ -13,9 +13,9 @@ Before editing:
 ## Working Agreements
 
 - Prefer focused patches over broad refactors unless explicitly requested.
-- Preserve provider flexibility: `claude`, `llama`, and `gpt-oss` are all supported.
+- The LLM is Qwen on Cerebras behind `src/llm/llm_factory.py`; keep provider specifics inside `src/llm/`.
 - Keep configuration env-driven; do not hardcode secrets, tokens, model names, or local paths.
-- Treat `.env` as user-owned. Update `.env.example` when configuration shape changes.
+- Treat `.env` as user-owned and never print its values. Update `.env.example` when configuration shape changes.
 - Avoid breaking streaming and async behavior with blocking calls on hot paths.
 - If touching audio, session, or Discord voice code, be extra careful about race conditions and cleanup behavior.
 
@@ -43,7 +43,8 @@ ruff check src/ tests/
 - `src/stt/`: speech-to-text providers
 - `src/llm/`: LLM clients, prompt/system prompt builders, orchestration
 - `src/tools/`: tool definitions, registry, execution, handlers
-- `src/search/`: DuckDuckGo and Firecrawl-backed search/fetch
+- `src/web/`: web search (TinyFish, or DuckDuckGo) and the SSRF-guarded page reader
+- `src/monitor/`: live monitor that posts problem turns to a Discord channel
 - `src/tts/`: text filtering and speech synthesis/streaming
 - `src/pipeline/`: voice-processing pipeline stages
 - `src/session/`: per-user conversational/session behavior
@@ -70,5 +71,5 @@ ruff check src/ tests/
 
 ## Notes
 
-- There is a local `firecrawl-repo/` directory in the workspace. Do not modify it unless the task explicitly involves that dependency.
+- `recordings/` (real voice clips kept by the monitor), `reports/` (e2e output) and `logs/` are gitignored. Never commit them.
 - Logs, local settings, and environment files may be dirty in the worktree. Leave unrelated changes alone.
