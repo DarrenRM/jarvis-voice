@@ -72,4 +72,4 @@ Designed and directed by Darren Mills, built with AI coding agents. See `AGENTS.
 
 ## License
 
-No license yet.
+MIT. See `LICENSE`.
