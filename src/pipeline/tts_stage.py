@@ -78,6 +78,7 @@ class TTSStage(StreamingPipelineStage):
         self._synthesizer = synthesizer
         self._inter_sentence_pause_ms = inter_sentence_pause_ms
         self._tasks: list[asyncio.Task] = []
+        self._playback_task: Optional[asyncio.Task] = None
         self._cancelled = False
 
     @property
@@ -86,11 +87,13 @@ class TTSStage(StreamingPipelineStage):
         return "tts"
 
     async def cancel(self) -> None:
-        """Cancel any ongoing TTS processing."""
+        """Cancel any ongoing TTS processing, including a sentence waiting to play."""
         self._cancelled = True
         for task in self._tasks:
             if not task.done():
                 task.cancel()
+        if self._playback_task is not None and not self._playback_task.done():
+            self._playback_task.cancel()
         logger.debug(f"Cancelled {len(self._tasks)} TTS tasks")
 
     async def process_stream(
@@ -123,6 +126,7 @@ class TTSStage(StreamingPipelineStage):
         playback_task = asyncio.create_task(
             self._playback_consumer(queue, playback_callback)
         )
+        self._playback_task = playback_task
 
         try:
             # Process incoming text chunks
@@ -168,19 +172,36 @@ class TTSStage(StreamingPipelineStage):
             raise
 
         finally:
-            if self._cancelled:
-                for task in self._tasks:
-                    task.cancel()
-                playback_task.cancel()
-                await asyncio.gather(*self._tasks, playback_task, return_exceptions=True)
-            else:
+            await self._finish(queue, playback_task)
+
+        logger.debug(f"TTS stage completed: {sentences_queued} sentences processed")
+
+    async def _finish(self, queue: OrderedPlaybackQueue, playback_task: asyncio.Task) -> None:
+        """Play out the rest of the answer, unless it was cancelled.
+
+        A cancel can also come after the model has finished streaming, while the last
+        sentences synthesize and the first waits for the room to go quiet. It stops the
+        answer the same way: nothing more of it plays.
+        """
+        try:
+            if not self._cancelled:
                 # Let every sentence finish synthesizing, then play out the queue
                 if self._tasks:
                     await asyncio.gather(*self._tasks, return_exceptions=True)
                 await queue.signal_end()
-                await playback_task
-
-        logger.debug(f"TTS stage completed: {sentences_queued} sentences processed")
+                await asyncio.wait({playback_task})
+                if not playback_task.cancelled():
+                    playback_task.result()  # a playback error propagates
+        except asyncio.CancelledError:
+            self._cancelled = True
+            raise
+        finally:
+            # However the answer ended, no part of it goes on playing in the background
+            pending = [task for task in (*self._tasks, playback_task) if not task.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                await asyncio.gather(*pending, return_exceptions=True)
 
     def _spawn_synthesis_task(
         self,

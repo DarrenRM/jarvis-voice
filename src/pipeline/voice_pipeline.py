@@ -264,8 +264,10 @@ class VoicePipeline:
 
                     # Wait for silence before first response sentence
                     await wait_for_silence()
-                    self.answer_started = True
 
+                if self._cancelled:
+                    return  # cancelled while it waited (cancel() opens the gate above)
+                self.answer_started = True
                 if self.observer is not None:
                     self.observer.answer_clip_next()
                 await play_audio(audio_chunk)

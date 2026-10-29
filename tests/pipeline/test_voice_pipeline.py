@@ -360,6 +360,98 @@ class TestCancellation:
         assert process.done() and process.result() == "cancelled"
         assert played == []
 
+    @pytest.mark.asyncio
+    async def test_carry_on_cancel_after_the_stream_ended_plays_nothing(
+        self, mock_transcription, context
+    ):
+        """Same carry-on cancel, but the model has finished streaming: the last sentence
+        is still synthesizing and the first waits for the room to go quiet. Cancelling
+        the pipeline opens the thinking gate; the first sentence must not play then, and
+        answer_started must stay False for the turn that starts over."""
+        from src.pipeline.tts_stage import TTSStage
+
+        played = []
+
+        async def play_audio(audio):
+            played.append(audio)
+
+        async def slow_room(*args, **kwargs):
+            await asyncio.sleep(0.2)  # the speaker is still talking
+            return True
+
+        response = MagicMock()
+
+        async def short_answer(text, ctx):
+            yield "First sentence.\n"
+            yield "Second sentence."  # the stream ends here
+
+        response.process_stream = short_answer
+
+        async def synthesize(text):
+            await asyncio.sleep(0.01 if text.startswith("First") else 10)
+            return np.ones(2400, dtype=np.float32)
+
+        synth = MagicMock()
+        synth.synthesize = synthesize
+        pipeline = VoicePipeline(
+            mock_transcription, response, TTSStage(synth, inter_sentence_pause_ms=0)
+        )
+
+        process = asyncio.create_task(pipeline.process(
+            audio=make_audio(), context=context,
+            play_audio=play_audio, wait_for_silence=slow_room,
+        ))
+        await asyncio.sleep(0.1)  # stream done, sentence 1 at the gate, sentence 2 slow
+        assert not pipeline.answer_started
+        process.cancel()  # as VoiceSession._carried_on does
+        await asyncio.wait({process}, timeout=1.0)
+        await pipeline.cancel()
+        await asyncio.sleep(0.4)  # well past the room wait
+
+        assert process.done() and process.result() == "cancelled"
+        assert played == []
+        assert not pipeline.answer_started
+        assert [t for t in asyncio.all_tasks() if t is not asyncio.current_task()] == []
+
+    @pytest.mark.asyncio
+    async def test_cancel_while_the_answer_waits_behind_the_thinking_phrase(
+        self, mock_transcription, context, wait_for_silence
+    ):
+        """pipeline.cancel() stops the thinking phrase, which opens the gate the answer
+        waits at. The answer must not slip through that gate."""
+        from src.pipeline.tts_stage import TTSStage
+
+        played = []
+
+        async def play_audio(audio):
+            played.append(len(audio))
+            if len(audio) == 100:  # the thinking phrase
+                await asyncio.sleep(10)
+
+        response = MagicMock()
+
+        async def answer(text, ctx):
+            yield "The answer is forty two."
+
+        response.process_stream = answer
+        synth = MagicMock()
+        synth.synthesize = AsyncMock(return_value=np.ones(2400, dtype=np.float32))
+        pipeline = VoicePipeline(
+            mock_transcription, response, TTSStage(synth, inter_sentence_pause_ms=0)
+        )
+
+        process = asyncio.create_task(pipeline.process(
+            audio=make_audio(), context=context, play_audio=play_audio,
+            wait_for_silence=wait_for_silence, thinking_audio=make_audio(100),
+        ))
+        await asyncio.sleep(0.1)  # thinking phrase playing, the answer at the gate
+        await pipeline.cancel()
+        await asyncio.wait({process}, timeout=1.0)
+
+        assert process.done()
+        assert played == [100]
+        assert not pipeline.answer_started
+
 
 class TestConversationReset:
     """Test conversation reset functionality."""
