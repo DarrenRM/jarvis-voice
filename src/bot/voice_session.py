@@ -7,7 +7,6 @@ for a single Discord voice channel.
 import asyncio
 import contextlib
 import logging
-import random
 import re
 import time
 from typing import TYPE_CHECKING, Optional
@@ -40,7 +39,7 @@ from ..pipeline import (
 )
 from ..tts import TTSSynthesizer
 from .discord_service import DiscordService
-from .speaker_manager import SpeakerManager, SpeakerInfo
+from .speaker_manager import SpeakerManager
 from . import pycord_dave_patch
 from .voice_sink import CARRY_ON_MIN_SPEECH_SECONDS, StreamingSink
 from .voice_source import TTSAudioSource
@@ -126,7 +125,6 @@ class VoiceSession:
         self._state = "idle"
         self._running = False
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._audio_buffer: list[np.ndarray] = []
         self._speech_started = False
         self._addressee_judge: Optional[AddresseeJudge] = None  # Follow-up gate
         self._chat_poster: Optional[ChatPoster] = None  # Reference answers to chat
@@ -146,14 +144,7 @@ class VoiceSession:
         self._speech_end_event = asyncio.Event()
         self._pending_audio: Optional[np.ndarray] = None
 
-        # Parallel TTS pipeline
-        # Queue holds (sentence_num, audio) tuples for ordered playback, or None to signal end
-        self._audio_queue: asyncio.Queue[Optional[tuple[int, np.ndarray]]] = asyncio.Queue()
-        self._playback_task: Optional[asyncio.Task] = None
-        self._tts_tasks: list[asyncio.Task] = []
-        self._thinking_task: Optional[asyncio.Task] = None
         self._warmup_task: Optional[asyncio.Task] = None
-        self._thinking_synth_time: float = 0.0
         self._ack_played: bool = False  # Track if ack played this session
         self._listen_start: float = 0.0  # Track when listening started
 
@@ -461,32 +452,6 @@ class VoiceSession:
         self._running = False
         if self._late_reply_task is not None:
             self._late_reply_task.cancel()
-
-        # Cancel thinking task
-        if self._thinking_task and not self._thinking_task.done():
-            self._thinking_task.cancel()
-            try:
-                await self._thinking_task
-            except asyncio.CancelledError:
-                pass
-            self._thinking_task = None
-
-        # Cancel playback consumer
-        if self._playback_task and not self._playback_task.done():
-            self._playback_task.cancel()
-            try:
-                await self._playback_task
-            except asyncio.CancelledError:
-                pass
-            self._playback_task = None
-
-        # Cancel TTS synthesis tasks
-        for task in self._tts_tasks:
-            if not task.done():
-                task.cancel()
-        if self._tts_tasks:
-            await asyncio.gather(*self._tts_tasks, return_exceptions=True)
-            self._tts_tasks.clear()
 
         # A shared TTS is closed by its owner (main); close one made here
         if getattr(self, "_owns_tts", False) and self.tts is not None:
@@ -931,40 +896,6 @@ class VoiceSession:
             logger.error(f"[WAKE-ONLY] Error handling wake-word-only: {e}")
             self.state = "idle"
 
-    async def _play_thinking_phrase(self, phrase: str) -> None:
-        """Play thinking phrase in background.
-
-        This runs as a task so LLM request can start in parallel.
-        Tracks timing for logging.
-
-        Args:
-            phrase: The thinking phrase to synthesize and play
-        """
-        try:
-            t0 = time.perf_counter()
-            logger.info(f"[TIMING] Synthesizing thinking phrase: '{phrase}'")
-            thinking_audio = await self.tts.synthesize_cached(phrase)
-            thinking_synth_time = time.perf_counter() - t0
-            logger.info(f"[TIMING] Thinking phrase TTS: {thinking_synth_time:.2f}s")
-
-            # Store synthesis time for final timing log
-            self._thinking_synth_time = thinking_synth_time
-
-            if len(thinking_audio) > 0:
-                t0 = time.perf_counter()
-                await self._play_audio(thinking_audio)
-                thinking_play_time = time.perf_counter() - t0
-                logger.info(f"[TIMING] Thinking phrase playback: {thinking_play_time:.2f}s")
-        except asyncio.CancelledError:
-            logger.debug("[THINKING] Playback cancelled")
-            # Stop any ongoing playback when cancelled
-            if self.voice_client and self.voice_client.is_playing():
-                self.voice_client.stop()
-            raise  # Re-raise to propagate cancellation
-        except Exception as e:
-            logger.warning(f"[THINKING] Failed to play thinking phrase: {e}")
-            self._thinking_synth_time = 0.0  # Fallback for timing log
-
     async def greet_user(self, member: discord.Member) -> None:
         """Greet a user who just joined the voice channel.
 
@@ -1033,162 +964,6 @@ class VoiceSession:
         # Clean up source and natural pause between sentences
         source.cleanup()
         await asyncio.sleep(0.15)  # 150ms gap for natural sentence pacing
-
-    async def _playback_consumer(self):
-        """Background task that plays audio from the queue seamlessly.
-
-        Receives (sentence_num, audio) tuples and plays in order.
-        Waits for:
-        1. Thinking phrase to complete (if playing)
-        2. Channel silence before playing the first sentence
-        """
-        logger.debug("[PLAYBACK] Consumer started")
-        next_to_play = 1
-        pending: dict[int, np.ndarray] = {}
-        waited_for_thinking = False
-        waited_for_silence = False
-
-        while True:
-            try:
-                item = await self._audio_queue.get()
-
-                # None signals end of stream
-                if item is None:
-                    # Play any remaining buffered audio in order
-                    while next_to_play in pending:
-                        audio = pending.pop(next_to_play)
-                        if len(audio) > 0:
-                            await self._play_audio(audio)
-                        next_to_play += 1
-                    logger.debug("[PLAYBACK] Received end signal")
-                    break
-
-                sentence_num, audio = item
-                pending[sentence_num] = audio
-                logger.debug(f"[PLAYBACK] Received sentence {sentence_num}, next_to_play={next_to_play}")
-
-                # Play all consecutive available sentences
-                while next_to_play in pending:
-                    audio = pending.pop(next_to_play)
-                    if len(audio) > 0:
-                        # Wait for thinking phrase before FIRST sentence
-                        if not waited_for_thinking and self._thinking_task is not None:
-                            logger.info("[PLAYBACK] Waiting for thinking phrase to complete...")
-                            try:
-                                await self._thinking_task
-                            except asyncio.CancelledError:
-                                logger.debug("[PLAYBACK] Thinking task was cancelled")
-                            except Exception as e:
-                                logger.warning(f"[PLAYBACK] Thinking task error: {e}")
-                            waited_for_thinking = True
-                            self._thinking_task = None
-
-                        # Wait for silence before FIRST sentence only
-                        # This handles conversations while waiting for LLM response
-                        if not waited_for_silence and self.settings.speaking_detection_enabled:
-                            logger.info("[PLAYBACK] Waiting for channel silence before response...")
-                            silence = await self._wait_for_silence(max_wait=30.0, use_debounce=True)
-                            waited_for_silence = True
-                            if not silence:
-                                logger.warning("[PLAYBACK] Timeout waiting for silence, playing anyway")
-
-                        logger.debug(f"[PLAYBACK] Playing sentence {next_to_play}")
-                        await self._play_audio(audio)
-                    next_to_play += 1
-
-                self._audio_queue.task_done()
-            except asyncio.CancelledError:
-                logger.debug("[PLAYBACK] Consumer cancelled")
-                break
-            except Exception as e:
-                logger.error(f"[PLAYBACK] Error: {e}")
-                import traceback
-                logger.debug(traceback.format_exc())
-
-        logger.debug("[PLAYBACK] Consumer stopped")
-
-    async def _synthesize_and_queue(self, text: str, sentence_num: int):
-        """Synthesize text using streaming and add to audio queue with ordering info."""
-        try:
-            t0 = time.perf_counter()
-            chunks = []
-            first_chunk_time = None
-
-            # Use streaming synthesis - yields chunks as they arrive
-            async for chunk in self.tts.synthesize_stream(text):
-                if first_chunk_time is None:
-                    first_chunk_time = time.perf_counter()
-                    ttfb = (first_chunk_time - t0) * 1000
-                    logger.debug(f"[TTS] Sentence {sentence_num} first chunk in {ttfb:.0f}ms")
-                chunks.append(chunk)
-
-            elapsed = time.perf_counter() - t0
-            if chunks:
-                audio = np.concatenate(chunks)
-                logger.debug(f"[TTS] Sentence {sentence_num}: {len(chunks)} chunks in {elapsed:.2f}s")
-            else:
-                audio = np.array([], dtype=np.float32)
-                logger.debug(f"[TTS] Sentence {sentence_num}: no audio in {elapsed:.2f}s")
-
-            # Queue with sentence number for ordered playback
-            await self._audio_queue.put((sentence_num, audio))
-        except Exception as e:
-            logger.error(f"[TTS] Error synthesizing sentence {sentence_num}: {e}")
-            # Queue empty audio to not block ordering
-            await self._audio_queue.put((sentence_num, np.array([], dtype=np.float32)))
-
-    # Wake word pattern for stripping from transcription
-    _WAKE_PATTERN = re.compile(
-        r'^(hey[,\s]*jarvis|a[,\s]*jarvis)[,.\s!?]*',
-        re.IGNORECASE
-    )
-
-    def _strip_wake_word(self, text: str) -> Optional[str]:
-        """Strip wake word from transcription.
-
-        Args:
-            text: Raw transcription text.
-
-        Returns:
-            Text with wake word stripped, or None if only wake word was said.
-        """
-        text_stripped = text.strip()
-        match = self._WAKE_PATTERN.match(text_stripped)
-
-        if match:
-            text_stripped = text_stripped[match.end():].strip()
-            if text_stripped:
-                logger.info(f"[WAKE-STRIP] Stripped wake word, remaining: '{text_stripped}'")
-            else:
-                return None
-
-        # If stripping left nothing meaningful
-        if not text_stripped or len(text_stripped) < 3:
-            return None
-
-        return text_stripped
-
-    def _build_prompt(self, text: str) -> str:
-        """Build LLM prompt with speaker context.
-
-        Args:
-            text: User's transcribed text.
-
-        Returns:
-            Prompt string with speaker info if known.
-        """
-        speaker = self._current_speaker_name
-        activity = self._current_speaker_activity
-
-        if speaker:
-            logger.info(f"{speaker} said: {text}" + (f" (Activity: {activity})" if activity else ""))
-            if activity:
-                return f"[{speaker} speaking, currently {activity}]: {text}"
-            else:
-                return f"[{speaker} speaking]: {text}"
-        else:
-            logger.info(f"User said: {text}")
-            return text
 
     async def _process_speech(
         self, audio: np.ndarray, followup: Optional[FollowUp] = None

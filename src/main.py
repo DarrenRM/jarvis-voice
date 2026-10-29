@@ -159,20 +159,6 @@ def setup_logging(level: str = "INFO") -> QueueListener:
     return listener
 
 
-def check_assets() -> None:
-    """Ensure required assets exist."""
-    assets_dir = Path(__file__).parent.parent / "assets" / "audio"
-    assets_dir.mkdir(parents=True, exist_ok=True)
-
-    ack_file = assets_dir / "yes.wav"
-    if not ack_file.exists():
-        logging.warning(
-            f"Acknowledgment audio not found: {ack_file}\n"
-            "TTS will be used for acknowledgments (slower).\n"
-            "Record a 'Yes?' audio clip and save it as assets/audio/yes.wav"
-        )
-
-
 async def run_bot(settings: Settings, components: Optional[dict] = None) -> None:
     """Run bot with graceful shutdown handling.
 
@@ -278,7 +264,6 @@ def main() -> None:
 
     # Setup async logging (returns listener for cleanup)
     log_listener = setup_logging(settings.log_level)
-    check_assets()
 
     logger.info("Starting Discord Voice Claude Bot")
     logger.info(f"Wake word: {settings.wake_word_model.replace('_', ' ')}")

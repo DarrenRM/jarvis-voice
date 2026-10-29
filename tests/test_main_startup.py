@@ -96,7 +96,6 @@ class TestPrivilegedIntents:
                 pass
 
         monkeypatch.setattr(main_module, "setup_logging", lambda level: Listener())
-        monkeypatch.setattr(main_module, "check_assets", lambda: None, raising=False)
         monkeypatch.setattr(main_module, "preload_components", lambda s: None)
 
         async def refused(settings, components):

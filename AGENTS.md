@@ -48,7 +48,6 @@ ruff check src/ tests/
 - `src/tts/`: text filtering and speech synthesis/streaming
 - `src/pipeline/`: voice-processing pipeline stages
 - `src/session/`: per-user conversational/session behavior
-- `src/core/`: shared abstractions and state helpers
 - `src/image/`: image generation integration
 - `src/sink/`: Discord audio sink and per-user audio state
 

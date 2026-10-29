@@ -18,7 +18,7 @@ from ..config import get_settings
 from ..sink import PerUserAudioManager, WakeWordProcessor
 
 if TYPE_CHECKING:
-    from ..detection import SpeakingDetector, SpeakingState, WakeWordDetector
+    from ..detection import SpeakingDetector, SpeakingState
 
 logger = logging.getLogger(__name__)
 
