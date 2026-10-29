@@ -3,11 +3,14 @@
 import asyncio
 import logging
 import queue
+import re
 import signal
 import sys
 from logging.handlers import QueueHandler, QueueListener
 from pathlib import Path
 from typing import Optional
+
+import discord
 
 # Add src to path for imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -19,6 +22,32 @@ from src.tts import TTSSynthesizer
 from src.audio import SAMPLE_RATE_PROCESSING
 
 logger = logging.getLogger(__name__)
+
+# Keys the bot can't work without: Discord, speech-to-text, the model and its voice.
+# Checked at startup so a fresh setup fails with a list, not a silent bot later.
+REQUIRED_KEYS = {
+    "DISCORD_TOKEN": "discord_token",
+    "GROQ_API_KEY": "groq_api_key",
+    "CEREBRAS_API_KEY": "cerebras_api_key",
+    "INWORLD_API_KEY": "inworld_api_key",
+}
+
+PRIVILEGED_INTENTS_HELP = (
+    "Discord refused the connection: the bot asks for privileged intents that are not "
+    "turned on for this application. In the Discord developer portal, open the "
+    "application's Bot page and turn on Presence Intent, Server Members Intent and "
+    "Message Content Intent."
+)
+
+
+def missing_settings(settings: Settings) -> list[str]:
+    """Required keys that are unset, empty, or still the .env.example placeholder."""
+    missing = []
+    for env_name, field in REQUIRED_KEYS.items():
+        value = (getattr(settings, field) or "").strip()
+        if not value or re.fullmatch(r"your_\w+_here", value):
+            missing.append(env_name)
+    return missing
 
 
 def preload_components(settings: Settings) -> dict:
@@ -188,37 +217,45 @@ async def run_bot(settings: Settings, components: Optional[dict] = None) -> None
             loop.add_signal_handler(sig, signal_handler)
 
     # Start the bot
-    async with bot:
-        await bot.login(settings.discord_token)
+    try:
+        async with bot:
+            await bot.login(settings.discord_token)
 
-        # Create task for bot connection
-        connect_task = asyncio.create_task(bot.connect())
+            # Create task for bot connection
+            connect_task = asyncio.create_task(bot.connect())
 
-        # Wait for either shutdown signal or bot disconnect
-        shutdown_wait = asyncio.create_task(shutdown_event.wait())
+            # Wait for either shutdown signal or bot disconnect
+            shutdown_wait = asyncio.create_task(shutdown_event.wait())
 
-        done, pending = await asyncio.wait(
-            [connect_task, shutdown_wait],
-            return_when=asyncio.FIRST_COMPLETED
-        )
+            done, pending = await asyncio.wait(
+                [connect_task, shutdown_wait],
+                return_when=asyncio.FIRST_COMPLETED
+            )
 
-        # Cancel pending tasks
-        for task in pending:
-            task.cancel()
-            try:
-                await task
-            except asyncio.CancelledError:
-                pass
+            # Cancel pending tasks
+            for task in pending:
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
 
-        # If shutdown was requested, close gracefully
-        if shutdown_event.is_set():
-            logger.info("Closing bot gracefully...")
-            # bot.close() is called by async context manager exit
+            # The connection failed (e.g. privileged intents not enabled): raise it so
+            # main() reports it and exits non-zero instead of "shutdown complete"
+            if connect_task in done and not connect_task.cancelled():
+                error = connect_task.exception()
+                if error is not None:
+                    raise error
 
-    # The TTS keeps one HTTP session open for the life of the bot
-    tts = (components or {}).get("tts")
-    if tts is not None:
-        await tts.close()
+            # If shutdown was requested, close gracefully
+            if shutdown_event.is_set():
+                logger.info("Closing bot gracefully...")
+                # bot.close() is called by async context manager exit
+    finally:
+        # The TTS keeps one HTTP session open for the life of the bot
+        tts = (components or {}).get("tts")
+        if tts is not None:
+            await tts.close()
 
     logger.info("Bot shutdown complete")
 
@@ -231,6 +268,12 @@ def main() -> None:
     except Exception as e:
         print(f"Failed to load settings: {e}")
         print("Make sure .env file exists with DISCORD_TOKEN")
+        sys.exit(1)
+
+    missing = missing_settings(settings)
+    if missing:
+        print(f"Missing required settings: {', '.join(missing)}")
+        print("Set them in .env (copy .env.example and fill in the keys).")
         sys.exit(1)
 
     # Setup async logging (returns listener for cleanup)
@@ -256,8 +299,11 @@ def main() -> None:
         asyncio.run(run_bot(settings, components))
     except KeyboardInterrupt:
         logger.info("Interrupted")
+    except discord.PrivilegedIntentsRequired:
+        logger.error(PRIVILEGED_INTENTS_HELP)
+        sys.exit(1)
     except Exception as e:
-        logger.error(f"Bot error: {e}")
+        logger.error(f"Bot error: {e}", exc_info=True)
         sys.exit(1)
     finally:
         # Stop log listener to flush remaining messages

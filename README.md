@@ -43,7 +43,7 @@ cp .env.example .env            # then fill in the keys below
 
 Without `uv`: `python -m venv .venv`, activate it, then `pip install -e ".[dev]"`. On Linux or macOS the interpreter is `.venv/bin/python`.
 
-Create a Discord application, copy the bot token, turn on Message Content Intent, and invite the bot with permission to view channels, send messages, attach files, read message history, connect, speak and use voice activity.
+Create a Discord application and copy the bot token. On its Bot page, turn on the three privileged intents the bot requests: Presence Intent (which game each speaker is playing), Server Members Intent (keeps members cached for that lookup) and Message Content Intent (the `!join`, `!leave` and `!status` commands). Without them Discord refuses the connection, and the bot exits with a message naming the switches to turn on. Invite the bot with permission to view channels, send messages, attach files, read message history, connect, speak and use voice activity.
 
 Required environment variables (names only; `.env.example` lists every option):
 
