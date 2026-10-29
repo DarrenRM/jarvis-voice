@@ -110,3 +110,6 @@ service-account*.json
 # Tooling caches and agent worktrees
 .ruff_cache/
 .claude/worktrees/
+
+# Third-party game patch notes (copyrighted): add your own under data/game_notes/<game>/
+data/game_notes/*/*.txt

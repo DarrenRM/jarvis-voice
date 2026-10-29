@@ -2,11 +2,15 @@
 
 import datetime as dt
 import json
+from pathlib import Path
 from unittest.mock import MagicMock
 
 from src.llm.game_notes import STICKY_SECONDS, GameNotes
 from src.pipeline.base import PipelineContext
 from src.pipeline.response_stage import ResponseStage
+
+# The real patch notes are the publisher's text and not in the repo: tests use a sample set
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "game_notes"
 
 
 def make_notes(tmp_path, now=None):
@@ -67,8 +71,8 @@ def test_missing_or_broken_dir_loads_nothing(tmp_path):
     assert GameNotes.load(tmp_path).sets == []
 
 
-def test_real_notes_load():
-    notes = GameNotes.load()
+def test_sample_notes_load():
+    notes = GameNotes.load(FIXTURES)
     assert [s.game for s in notes.sets] == ["Enshrouded"]
     assert "Cinder" in notes.sets[0].text
 
@@ -89,7 +93,7 @@ async def test_misheard_game_name_is_corrected_before_the_model_sees_it():
 
     from src.pipeline.transcription_stage import TranscriptionStage
 
-    corrections = GameNotes.load().corrections()
+    corrections = GameNotes.load(FIXTURES).corrections()
     assert corrections["in shrouded"] == "Enshrouded"
     for raw, expected in [
         ("Hey Jarvis, where do I get in shrouded oil?", "where do I get Enshrouded oil?"),

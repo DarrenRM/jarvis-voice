@@ -1,6 +1,8 @@
 """What Whisper heard and what the bot said, through the real transcription stage (with
 the real game-notes corrections) and the real TTS stage and synthesizer text path."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -11,6 +13,8 @@ from src.pipeline.tts_stage import TTSStage
 from src.tts.synthesizer import TTSSynthesizer
 
 from .cases import TRANSCRIPTS, VERSION_REPLY
+
+FIXTURES = Path(__file__).resolve().parents[1] / "fixtures" / "game_notes"
 
 
 class HeardSTT:
@@ -27,7 +31,7 @@ async def test_transcripts_reach_the_model_right(when, heard, expected):
     its web search) got the wrong name; the game notes' misheard list fixes it. Also the
     wake word stripped from real first turns ("Hey Jarvis. Sup." from 2026-10-15 10:26
     must leave "Sup.", not be taken for the wake word alone)."""
-    stage = TranscriptionStage(HeardSTT(heard), corrections=GameNotes.load().corrections())
+    stage = TranscriptionStage(HeardSTT(heard), corrections=GameNotes.load(FIXTURES).corrections())
     result = await stage.process(np.zeros(1600, dtype=np.float32), PipelineContext())
     assert not result.wake_word_only and not result.is_empty
     assert result.text == expected

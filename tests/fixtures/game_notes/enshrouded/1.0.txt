@@ -1,0 +1,2 @@
+Sample notes for the tests (not the real patch notes).
+Cinder's Cradle is a new area in the north of Embervale.
