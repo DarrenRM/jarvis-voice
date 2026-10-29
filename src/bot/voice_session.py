@@ -418,9 +418,13 @@ class VoiceSession:
         # Start recording with the sink
         logger.info("Starting voice recording...")
 
-        # py-cord 2.8 calls this synchronously with the error (if any) when recording stops
+        # py-cord 2.8 calls this with the error (if any) when recording stops. While the
+        # session is running that means the bot can no longer hear anyone: say so loudly.
         def _recording_callback(*args):
-            logger.debug(f"Recording stopped: {args}")
+            if self._running:
+                logger.error(f"[RECORDING] Voice receive stopped during the session: {args}")
+            else:
+                logger.debug(f"Recording stopped: {args}")
 
         # py-cord 2.8 no longer calls sink.init(); its decoder reads the voice client off the sink
         self.sink.init(self.voice_client)

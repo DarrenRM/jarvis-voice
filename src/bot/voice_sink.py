@@ -4,6 +4,7 @@ This sink receives Discord audio (48kHz stereo) and processes it in real-time
 for wake word detection and VAD, rather than waiting for recording to stop.
 """
 
+import functools
 import logging
 import threading
 import time
@@ -14,8 +15,6 @@ import numpy as np
 
 from ..audio import resample_48k_stereo_to_16k_mono, SAMPLE_RATE_PROCESSING
 from ..config import get_settings
-
-# Phase 3: Per-user audio management (feature flagged)
 from ..sink import PerUserAudioManager, WakeWordProcessor
 
 if TYPE_CHECKING:
@@ -27,6 +26,19 @@ logger = logging.getLogger(__name__)
 CARRY_ON_MIN_SPEECH_SECONDS = 0.4
 # Discord packets are 20 ms: about 60 s of capture at most
 _CAPTURE_MAX_CHUNKS = 3000
+# A packet that fails is dropped; the error is logged at most this often (seconds)
+_WRITE_ERROR_LOG_INTERVAL = 10.0
+
+
+def _locked(method):
+    """Run the method holding the sink's lock (see StreamingSink.__init__)."""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+
+    return wrapper
 
 
 class StreamingSink(discord.sinks.Sink):
@@ -85,6 +97,14 @@ class StreamingSink(discord.sinks.Sink):
                 hits and near misses (audio thread; the monitor saves them)
         """
         super().__init__(filters=filters)
+
+        # py-cord calls write() on its router thread while the session's event loop calls
+        # start_listening(), check_idle_audio_gap() and the state setter, which reset or
+        # feed the same VAD, speaking detector and wake detectors. Everything that touches
+        # them holds this lock (re-entrant: write()'s callbacks call back into the sink).
+        self._lock = threading.RLock()
+        self._write_errors = 0
+        self._write_error_logged_at: Optional[float] = None
 
         # Wake detection config (used by PerUserAudioManager)
         self._wake_model_name = wake_model_name
@@ -179,23 +199,24 @@ class StreamingSink(discord.sinks.Sink):
         if value not in ("idle", "listening"):
             raise ValueError(f"Invalid state: {value}")
 
-        old_state = self._state
-        self._state = value
+        with self._lock:
+            old_state = self._state
+            self._state = value
 
-        if old_state != value:
-            logger.debug(f"Sink state: {old_state} -> {value}")
+            if old_state != value:
+                logger.debug(f"Sink state: {old_state} -> {value}")
 
-            if value == "listening":
-                # Reset for new listening session
-                self._audio_buffer = []
-                self._speech_started = False
-                if self.vad:
-                    self.vad.reset()
+                if value == "listening":
+                    # Reset for new listening session
+                    self._audio_buffer = []
+                    self._speech_started = False
+                    if self.vad:
+                        self.vad.reset()
 
-            elif value == "idle":
-                # Clear buffer when going idle
-                self._audio_buffer = []
-                self._wake_processor.on_idle_transition()
+                elif value == "idle":
+                    # Clear buffer when going idle
+                    self._audio_buffer = []
+                    self._wake_processor.on_idle_transition()
 
     @property
     def last_audio_time(self) -> Optional[float]:
@@ -217,9 +238,11 @@ class StreamingSink(discord.sinks.Sink):
         Args:
             user_id: Discord user ID
         """
-        self._user_manager.cleanup_user(user_id)
+        with self._lock:
+            self._user_manager.cleanup_user(user_id)
         logger.debug(f"[WAKE] Removed user {user_id}")
 
+    @_locked
     def start_listening(
         self,
         user_id: Optional[int] = None,
@@ -296,6 +319,7 @@ class StreamingSink(discord.sinks.Sink):
             self.vad.reset()
         self._state = "listening"
 
+    @_locked
     def stop_listening(self):
         """Transition to idle state."""
         logger.info("[SINK] stop_listening() called")
@@ -307,6 +331,7 @@ class StreamingSink(discord.sinks.Sink):
         self._watch_wake_word = False
         self.state = "idle"
 
+    @_locked
     def get_audio_buffer(self) -> np.ndarray:
         """Get accumulated audio buffer.
 
@@ -409,6 +434,7 @@ class StreamingSink(discord.sinks.Sink):
         except Exception:
             return False
 
+    @_locked
     def check_audio_timeout(self) -> bool:
         """Check if audio has stopped arriving (push-to-talk released).
 
@@ -448,6 +474,7 @@ class StreamingSink(discord.sinks.Sink):
         """
         return self._speech_started and self._state == "listening"
 
+    @_locked
     def is_anyone_speaking(self) -> bool:
         """Check if anyone in the channel is speaking (with 3s debounce).
 
@@ -461,6 +488,7 @@ class StreamingSink(discord.sinks.Sink):
             return self.speaking_detector.get_state() == SpeakingState.SOMEONE_SPEAKING
         return False
 
+    @_locked
     def is_anyone_actively_speaking(self) -> bool:
         """Check if anyone is actively speaking RIGHT NOW (no debounce).
 
@@ -471,6 +499,7 @@ class StreamingSink(discord.sinks.Sink):
             return self.speaking_detector.is_anyone_actively_speaking()
         return False
 
+    @_locked
     def check_idle_audio_gap(self) -> bool:
         """Check if audio has stopped while idle and complete wake word detection.
 
@@ -529,13 +558,30 @@ class StreamingSink(discord.sinks.Sink):
     def write(self, data, user) -> None:
         """Process incoming audio data.
 
-        This is called by pycord for each audio packet received.
+        py-cord calls this for each audio packet, on its router thread. If it raises,
+        py-cord stops recording for good: the bot would stay in the channel but never
+        hear another wake word. So a packet that fails is logged and dropped instead.
 
         Args:
             data: Raw PCM audio bytes (48kHz stereo s16le), or py-cord 2.8's VoiceData
                 (PCM in .pcm)
             user: Discord user who sent the audio
         """
+        try:
+            with self._lock:
+                self._write(data, user)
+        except Exception:
+            self._write_errors += 1
+            now = time.perf_counter()
+            last = self._write_error_logged_at
+            if last is None or now - last >= _WRITE_ERROR_LOG_INTERVAL:
+                self._write_error_logged_at = now
+                logger.exception(
+                    f"[SINK] Dropped an audio packet after an error "
+                    f"({self._write_errors} so far); still recording"
+                )
+
+    def _write(self, data, user) -> None:
         if not isinstance(data, (bytes, bytearray)) and hasattr(data, "pcm"):
             data = data.pcm
             if user is None:
@@ -802,6 +848,7 @@ class StreamingSink(discord.sinks.Sink):
             if self._on_wake_word:
                 self._on_wake_word()
 
+    @_locked
     def cleanup(self) -> None:
         """Clean up resources when recording stops."""
         logger.debug("StreamingSink cleanup")

@@ -8,6 +8,7 @@ Manages the lifecycle of UserAudioState instances, including:
 """
 
 import logging
+import time
 from typing import TYPE_CHECKING, Iterator, Optional
 
 from .user_audio_state import UserAudioState
@@ -16,6 +17,9 @@ if TYPE_CHECKING:
     from ..detection import WakeWordDetector
 
 logger = logging.getLogger(__name__)
+
+# After a wake word model fails to load, wait this long before trying again (seconds)
+DETECTOR_RETRY_SECONDS = 30.0
 
 
 class PerUserAudioManager:
@@ -66,6 +70,7 @@ class PerUserAudioManager:
         self._wake_threshold = wake_threshold
         self._wake_sample_rate = wake_sample_rate
         self._max_detectors = max_detectors
+        self._detector_retry_at = 0.0  # time.monotonic() before which loading is skipped
 
     def get_or_create(self, user_id: int) -> UserAudioState:
         """Get existing state or create new one for user.
@@ -104,10 +109,13 @@ class PerUserAudioManager:
             state: User's audio state
 
         Returns:
-            WakeWordDetector instance, or None if max detectors reached
+            WakeWordDetector instance, or None if max detectors reached or the model
+            could not be loaded
         """
         if state.detector is not None:
             return state.detector
+        if time.monotonic() < self._detector_retry_at:
+            return None
 
         # Check detector limit (snapshot to avoid race condition)
         detector_count = sum(1 for s in list(self._users.values()) if s.detector is not None)
@@ -122,11 +130,21 @@ class PerUserAudioManager:
         from ..detection import WakeWordDetector
 
         logger.debug(f"[USER_MANAGER] Creating detector for user {state.user_id}")
-        state.detector = WakeWordDetector(
-            model_name=self._wake_model_name,
-            threshold=self._wake_threshold,
-            sample_rate=self._wake_sample_rate,
-        )
+        try:
+            state.detector = WakeWordDetector(
+                model_name=self._wake_model_name,
+                threshold=self._wake_threshold,
+                sample_rate=self._wake_sample_rate,
+            )
+        except Exception:
+            # This runs on py-cord's audio thread at a new speaker's first packet: a failed
+            # model download or ONNX load must not stop recording for everyone else
+            self._detector_retry_at = time.monotonic() + DETECTOR_RETRY_SECONDS
+            logger.exception(
+                f"[USER_MANAGER] Wake word model failed to load for user {state.user_id}; "
+                f"trying again in {DETECTOR_RETRY_SECONDS:g}s"
+            )
+            return None
         return state.detector
 
     def cleanup_user(self, user_id: int) -> None:
