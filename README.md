@@ -1,160 +1,75 @@
-# Discord Voice Bot
+# Jarvis: a voice assistant for Discord calls
 
-A voice assistant that sits in a Discord voice channel. Say the wake word, ask a question out loud, and it answers back in voice.
+Say "Hey Jarvis" in a Discord voice channel, ask a question out loud, and hear the answer back in the call.
+
+## What it is
+
+Jarvis joins a voice channel and listens to everyone in it. It was built for a group's game nights: ask for a crafting recipe, a patch change or a stat while you keep playing, get a spoken answer, and get the recipe or table posted in the text chat too. It looks things up on the web, tags people, and (when enabled) generates images.
+
+The repository and Python package are still called `claude-bot` after the first version, which used Claude. It now runs on Qwen.
+
+## What's interesting
+
+- **One wake-word detector per speaker.** Each person in the call gets their own openWakeWord detector (created on demand, capped at 10). "Hey Jarvis" is attributed to whoever said it at the moment it fires, and only that person's audio is transcribed for the question. See `src/sink/`.
+- **Knowing when not to answer.** After a reply, the person it answered can carry on without the wake word. Each follow-up first goes through an addressee check (is this for the bot, or for the friend next to them?), and anything uncertain counts as not addressed. Follow-up windows only count down while the room is quiet. See `src/llm/addressee_judge.py`.
+- **Speech starts before the answer is finished.** A short filler phrase plays as soon as the speaker stops. The model's reasoning never reaches TTS or the chat history, and the answer is split into sentences and synthesized as it streams. In the e2e harness a good turn starts audio about 0.6 to 0.9 s after the question ends.
+- **A monitor that watches real turns.** Detectors flag error replies, give-ups, slow or silent turns, tool failures and TTS repeats, and post them to a Discord channel where the owner reacts with a check or a cross. Real incidents are then replayed offline through the real sink and session code (`tests/irl`) so fixed bugs stay fixed.
+- **A workaround for an unfinished library path.** Discord now requires DAVE end-to-end encryption, and py-cord 2.8's voice-receive path for it is unfinished (py-cord issue 3139). `src/bot/pycord_dave_patch.py` replaces the broken decrypt step and drops undecodable packets instead of crashing.
+
+## How it works
 
 ```
-Discord voice -> wake word (openwakeword) -> VAD (Silero) -> STT (Groq Whisper)
-              -> LLM (Qwen 3.8 27B on Cerebras) -> TTS (Inworld) -> Discord voice
+Discord voice (per-speaker audio)
+  -> wake-word detector per speaker -> VAD (Silero) -> speech-to-text (Whisper on Groq)
+  -> Qwen on Cerebras, with a tool loop (web search and page reading, chat posts, tagging, images)
+  -> sentence-by-sentence TTS (Inworld) -> playback into the channel
 ```
 
-Each person in the channel gets their own session, and only the person who said the wake word is listened to for the question. The bot can also search the web, post in text channels, generate images, and say hi when people join.
+- `src/bot/` holds the Discord client and one `VoiceSession` per channel that wires the rest together.
+- `src/pipeline/` has the transcription, response and TTS stages; `src/llm/` has the Cerebras client, the tool loop and the prompt builder.
+- `src/web/` searches (TinyFish if keyed, otherwise ddgs) and reads pages locally. Web content is treated as untrusted, and the page reader rejects private, loopback and link-local addresses on every redirect hop.
+- Per-game patch notes can be dropped in `data/game_notes/`. They go into the prompt while someone in the call is playing that game, so answers about a new release don't come from stale model memory. The notes themselves are not in the repo.
+- Everything is configured through environment variables (`src/config.py`, pydantic-settings).
 
-> **⚠️ Heads up: this needs a cleanup pass.** Most of this code was written by early-2026 AI coding agents. It works, but it has real technical debt, bugs, and some architectural mistakes (for example, the voice session class does far too much). Before building on it, have a current frontier coding agent review the whole codebase and refactor it. Treat it as a working prototype, not a clean foundation.
+## Running it locally
 
-## What you need
-
-- **Python 3.11+** (3.12 recommended)
-- **A Discord bot token** (see below)
-- **Cerebras API key**: <https://cloud.cerebras.ai>. Runs the LLM (Qwen 3.8 27B). Use pay-as-you-go: the free tier's 5 requests/minute is too low for voice.
-- **Groq API key**: free tier at <https://console.groq.com>. Used for speech-to-text and the short "thinking" phrases.
-- **Inworld API key**: <https://studio.inworld.ai>. Used for the bot's voice.
-- Optional: **Gemini API key** (`NANOBANANA_API_KEY`) for image generation (also set `IMAGE_GENERATION_ENABLED=true`).
-- Linux/macOS: install `ffmpeg` and `libopus` (e.g. `apt install ffmpeg libopus0`). Windows works out of the box.
-
-## 1. Create the Discord bot
-
-1. Go to <https://discord.com/developers/applications> and click **New Application**.
-2. **Bot** tab: click **Reset Token** and copy the token. This is your `DISCORD_TOKEN`.
-3. On the same tab, turn on **Message Content Intent** under *Privileged Gateway Intents*.
-4. **OAuth2 → URL Generator**: tick the `bot` scope, then the permissions **View Channels, Send Messages, Attach Files, Read Message History, Connect, Speak, Use Voice Activity**.
-5. Open the generated URL and add the bot to your server.
-
-## 2. Install
+Developed and run on Windows with Git Bash. On Linux or macOS, install `ffmpeg` and `libopus` first. Python 3.11 or newer.
 
 ```bash
-git clone <this repo>
-cd claude-bot
-python -m venv .venv
-source .venv/bin/activate        # Windows (Git Bash): source .venv/Scripts/activate
-pip install -e .
+uv venv --python 3.12 .venv && VIRTUAL_ENV=.venv uv pip install -e ".[dev]"
+cp .env.example .env            # then fill in the keys below
+.venv/Scripts/python -m src.main
 ```
 
-## 3. Configure
+Without `uv`: `python -m venv .venv`, activate it, then `pip install -e ".[dev]"`. On Linux or macOS the interpreter is `.venv/bin/python`.
+
+Create a Discord application, copy the bot token, turn on Message Content Intent, and invite the bot with permission to view channels, send messages, attach files, read message history, connect, speak and use voice activity.
+
+Required environment variables (names only; `.env.example` lists every option):
+
+- `DISCORD_TOKEN`
+- `CEREBRAS_API_KEY` for the Qwen model
+- `GROQ_API_KEY` for Whisper speech-to-text
+- `INWORLD_API_KEY` for the bot's voice
+
+Optional: `USER_NAMES` (map Discord user IDs to friendly names), `TINYFISH_API_KEY` (hosted web search), `TYPESAFE_API_KEY` (a faster addressee check), `NANOBANANA_API_KEY` with `IMAGE_GENERATION_ENABLED` (images), and `MONITOR_ENABLED` with the other `MONITOR_*` settings (live monitor, off by default).
+
+Tests run offline and need no keys or `.env`:
 
 ```bash
-cp .env.example .env
+.venv/Scripts/python -m pytest -q
 ```
 
-Edit `.env`. These are the settings you'll want to change:
+The end-to-end audio harness (`scripts/e2e/run_voice_e2e.py`) drives the real pipeline with spoken scenarios and needs the live Groq, Cerebras and Inworld keys. It never connects to Discord unless run with `--listen`.
 
-```bash
-DISCORD_TOKEN=...
-CEREBRAS_API_KEY=...
-GROQ_API_KEY=...
-INWORLD_API_KEY=...
+## Status
 
-TTS_VOICE=sarah               # any Inworld voice: alex, sarah, luna, hades, ...
+In use at every game night by four regulars since January 2026. Python on py-cord, with a wake detector for each speaker; Whisper speech-to-text, a Qwen model on Cerebras, and streaming speech. The suite has 867 automated tests, and the audio harness covers 45 scripted scenarios and can replay clips saved from live turns. The recordings are real voices from game nights and are kept private, not in this repository.
 
-# Optional
-AUTO_JOIN_CHANNEL=General     # voice channel to join on startup (default: first one with people)
-IMAGE_GENERATION_ENABLED=true # plus NANOBANANA_API_KEY=... for image generation
-```
+## How it was built
 
-### Set up the people in your server
+Designed and directed by Darren Mills, built with AI coding agents. See `AGENTS.md` and `CLAUDE.md` for the rules the agents work under. Most commits carry the agents' `Co-Authored-By` trailers.
 
-The bot works out who is talking and addresses them by name. Names are also used when you say things like *"tag Bob and tell him dinner's ready."* Out of the box it uses each person's Discord display name. To give people friendlier names (handy when display names are like `xX_n00bslayer_Xx`), map their user IDs:
+## License
 
-1. In Discord: **User Settings → Advanced → Developer Mode** on.
-2. Right-click each person → **Copy User ID**.
-3. Add them to `.env` as JSON (IDs as strings):
-
-```bash
-USER_NAMES={"123456789012345678": "Alice", "234567890123456789": "Bob"}
-```
-
-You can also give the bot some optional running jokes. It will *rarely* work them into answers, and if someone asks it to roast a person directly, it roasts the asker instead:
-
-```bash
-USER_ROASTS={"Alice": "always goes AFK mid-raid.", "Bob": "has never won a game."}
-```
-
-Leave `USER_ROASTS` empty (the default) to turn this off.
-
-### Everything else
-
-`.env.example` lists every other option with comments (VAD sensitivity, timeouts, keep-alive, greeting, and so on). The defaults are fine to start with.
-
-The personality prompt still has some leftovers from the original server. It's tuned for Dune: Awakening (it knows about `awakening.wiki` and has gaming jokes). To change it, edit `src/llm/system_prompt_builder.py`.
-
-## 4. Run
-
-```bash
-python -m src.main
-```
-
-The bot logs in and automatically joins a voice channel. Then:
-
-1. Say **"hey jarvis"**
-2. Ask your question (you can say it in one breath, e.g. *"hey jarvis what's the weather in Tokyo"*)
-3. Wait for the spoken answer
-
-Text commands in any channel:
-
-| Command   | What it does                     |
-|-----------|----------------------------------|
-| `!join`   | Join the voice channel you're in |
-| `!leave`  | Leave voice                      |
-| `!status` | Show session status              |
-
-## Tools the bot can use
-
-| Tool | What it does | Setup |
-|------|--------------|-------|
-| `web_search` | Web search via ddgs (metasearch: Wikipedia, Bing, Brave, DuckDuckGo, Google, ...) | Nothing needed |
-| `web_extract` | Read up to 5 pages in parallel, locally (Trafilatura) | Nothing needed |
-| `tag_user` | Mention someone in the text channel | Nothing needed |
-| `post_to_chat` / `post_table` | Post a message or table to the text channel | Nothing needed |
-| `generate_image` / `edit_image` | Make or edit an image and post it | `IMAGE_GENERATION_ENABLED=true` + `NANOBANANA_API_KEY` |
-
-Web lookup runs entirely on your machine: no API keys, no hosted scraping service. The page reader only fetches public http(s) addresses (private/local network addresses are blocked on every redirect) and caps size and time. Pages that need JavaScript can't be read; the bot falls back to the search snippets. Turn the web tools off with `WEB_TOOLS_ENABLED=false`.
-
-## Keep-alive
-
-Discord kicks idle voice bots after about an hour, so every 50 minutes the bot says something short and slightly annoyed. To change it:
-
-```bash
-KEEP_ALIVE_ENABLED=true
-KEEP_ALIVE_INTERVAL_SECONDS=3000
-KEEP_ALIVE_PROMPT="Say something short to stay connected"
-```
-
-## Troubleshooting
-
-- **Bot joins but never responds:** check the logs for wake word detections. Try lowering `WAKE_WORD_CONFIDENCE` (e.g. `0.4`) and say "hey jarvis" clearly.
-- **It cuts you off mid-sentence:** raise `MIN_SILENCE_MS` / `SPEECH_PAD_MS`.
-- **No audio comes out:** check `INWORLD_API_KEY`, and on Linux check that `ffmpeg` and `libopus` are installed.
-- **Commands do nothing:** Message Content Intent isn't turned on in the developer portal.
-
-## Project layout
-
-```
-src/
-  bot/        Discord client, commands, per-channel voice session
-  detection/  Wake word + VAD
-  stt/        Speech-to-text
-  llm/        Cerebras client, tool loop, system prompt
-  tts/        Inworld TTS
-  tools/      Tool handlers (web, images, Discord actions)
-  web/        ddgs search + local page reader
-  image/      Image generation
-  pipeline/   Voice pipeline orchestration
-  config.py   All settings (read from .env)
-```
-
-## Development
-
-```bash
-pip install -e ".[dev]"
-pytest
-ruff check src/
-```
+No license yet.
