@@ -86,7 +86,6 @@ def preload_components(settings: Settings) -> dict:
     logger.info("Loading TTS (Inworld)...")
     components["tts"] = TTSSynthesizer(
         model=settings.tts_model,
-        device=settings.tts_device,
         voice=settings.tts_voice,
         api_key=settings.inworld_api_key,
         temperature=settings.tts_temperature,

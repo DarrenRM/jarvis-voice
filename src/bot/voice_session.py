@@ -231,7 +231,6 @@ class VoiceSession:
             self._owns_tts = True
             self.tts = TTSSynthesizer(
                 model=self.settings.tts_model,
-                device=self.settings.tts_device,
                 voice=self.settings.tts_voice,
                 api_key=self.settings.inworld_api_key,
                 temperature=self.settings.tts_temperature,

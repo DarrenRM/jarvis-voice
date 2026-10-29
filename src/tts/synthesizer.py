@@ -61,7 +61,6 @@ class TTSSynthesizer:
     def __init__(
         self,
         model: str = "inworld-tts-1-max",
-        device: str = "cuda:0",  # Not used for Inworld but kept for API compatibility
         voice: str = "alex",
         api_key: Optional[str] = None,
         temperature: float = 1.1,
@@ -71,14 +70,12 @@ class TTSSynthesizer:
 
         Args:
             model: Inworld model (inworld-tts-1-max or inworld-tts-1)
-            device: Compute device (not used for Inworld, kept for compatibility)
             voice: Voice name (alex, ashley, craig, deborah, etc.)
             api_key: Inworld API key (or set INWORLD_API_KEY env var)
             temperature: Expressiveness (0.0-2.0, default 1.1). Higher = more expressive.
             speed: Talking speed multiplier (0.5-1.5, default 1.0).
         """
         self.model_name = model
-        self.device = device
         self.voice = voice.lower()
         self.sample_rate = SAMPLE_RATE_TTS  # Inworld output rate
         self.temperature = max(0.0, min(2.0, temperature))

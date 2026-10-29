@@ -23,10 +23,8 @@ class Settings(BaseSettings):
     auto_join_channel: Optional[str] = Field(default=None, alias="AUTO_JOIN_CHANNEL")
 
     # Wake Word Detection
-    wake_word_method: str = Field(default="openwakeword", alias="WAKE_WORD_METHOD")
     wake_word_confidence: float = Field(default=0.5, alias="WAKE_WORD_CONFIDENCE")
     wake_word_model: str = Field(default="hey_jarvis", alias="WAKE_WORD_MODEL")
-    wake_word_phrase: str = Field(default="hey claude", alias="WAKE_WORD_PHRASE")
 
     # STT - Groq Whisper only
     groq_api_key: Optional[str] = Field(default=None, alias="GROQ_API_KEY")
@@ -34,7 +32,6 @@ class Settings(BaseSettings):
     # TTS (Inworld)
     inworld_api_key: Optional[str] = Field(default=None, alias="INWORLD_API_KEY")
     tts_model: str = Field(default="inworld-tts-2-flash", alias="TTS_MODEL")
-    tts_device: str = Field(default="cuda:0", alias="TTS_DEVICE")
     tts_voice: str = Field(default="alex", alias="TTS_VOICE")
     tts_temperature: float = Field(default=1.1, alias="TTS_TEMPERATURE")  # 0.0-2.0, higher = more expressive
     tts_speed: float = Field(default=1.0, alias="TTS_SPEED")  # 0.5-1.5, talking speed multiplier
@@ -59,9 +56,6 @@ class Settings(BaseSettings):
     web_search_max_results: int = Field(default=5, alias="WEB_SEARCH_MAX_RESULTS")
     # Text handed to the model per page is cut at this length
     web_extract_max_chars: int = Field(default=15000, alias="WEB_EXTRACT_MAX_CHARS")
-
-    # Deep research via OpenAI (Codex/ChatGPT subscription sign-in). Not wired up yet.
-    deep_research_enabled: bool = Field(default=False, alias="DEEP_RESEARCH_ENABLED")
 
     # Image Generation (Nano Banana / Gemini)
     image_generation_enabled: bool = Field(default=False, alias="IMAGE_GENERATION_ENABLED")
@@ -163,8 +157,9 @@ class Settings(BaseSettings):
     monitor_retranscribe: bool = Field(default=False, alias="MONITOR_RETRANSCRIBE")
     # Same problem again within this many minutes: the existing post's count goes up
     monitor_dedupe_minutes: float = Field(default=30.0, alias="MONITOR_DEDUPE_MINUTES")
-    # Thresholds, seconds after the speaker stops talking (good turns: ~0.6-0.9s to
-    # first audio, ~3-4s to the answer, ~0.3s between sentences)
+    # Thresholds in seconds. Turn timings count from the end of the MIN_SILENCE_MS pause,
+    # not the speaker's last word (good turns: opening phrase ~0.1-0.2s after it, answer
+    # ~4s after it, ~0.3s between sentences)
     monitor_slow_first_audio_seconds: float = Field(
         default=3.0, alias="MONITOR_SLOW_FIRST_AUDIO_SECONDS"
     )
@@ -180,23 +175,8 @@ class Settings(BaseSettings):
     def _blank_owner_is_none(cls, value):
         return None if isinstance(value, str) and not value.strip() else value
 
-    # Audio
-    sample_rate: int = Field(default=16000, alias="SAMPLE_RATE")
-    chunk_duration_ms: int = Field(default=30, alias="CHUNK_DURATION_MS")
-
     # Logging
     log_level: str = Field(default="INFO", alias="LOG_LEVEL")
-    log_latency_metrics: bool = Field(default=True, alias="LOG_LATENCY_METRICS")
-
-    @property
-    def chunk_size(self) -> int:
-        """Calculate chunk size in samples."""
-        return int(self.sample_rate * self.chunk_duration_ms / 1000)
-
-    @property
-    def bytes_per_chunk(self) -> int:
-        """Calculate bytes per chunk (16-bit mono)."""
-        return self.chunk_size * 2
 
 
 # Singleton instance

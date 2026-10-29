@@ -141,7 +141,6 @@ class TestOptionalSettings:
         assert s.cerebras_model == "qwen-3.8-27b"
         assert s.cerebras_reasoning_effort == "high"
         assert s.image_generation_enabled is False
-        assert s.deep_research_enabled is False
 
     def test_default_tts_voice(self, monkeypatch):
         """TTS voice has a default."""
@@ -156,19 +155,6 @@ class TestOptionalSettings:
 
         assert s.tts_voice is not None
         assert isinstance(s.tts_voice, str)
-
-    def test_default_sample_rate(self, monkeypatch):
-        """Sample rate defaults to 16000."""
-        monkeypatch.setenv("DISCORD_TOKEN", "fake_token")
-
-        import importlib
-        import src.config
-        importlib.reload(src.config)
-
-        from src.config import Settings
-        s = Settings()
-
-        assert s.sample_rate == 16000
 
     def test_default_log_level(self, monkeypatch):
         """Log level defaults to INFO."""

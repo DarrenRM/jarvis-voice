@@ -281,7 +281,7 @@ class SpeechFactory:
 
         if voice not in self._synths:
             self._synths[voice] = TTSSynthesizer(
-                model="inworld-tts-2-flash", device="cpu", voice=voice, api_key=self._api_key,
+                model="inworld-tts-2-flash", voice=voice, api_key=self._api_key,
                 temperature=0.8, speed=1.0,
             )
         return self._synths[voice]
