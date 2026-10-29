@@ -4,8 +4,10 @@ version = "0.1.0"
 description = "Voice-activated AI assistant for Discord"
 requires-python = ">=3.11"
 dependencies = [
-    # Discord
-    "py-cord[voice]>=2.6.0",
+    # Discord. Pinned to the releases src/bot/pycord_dave_patch.py was written against
+    # (its PATCHED_VERSIONS): Discord requires DAVE, and 2.8's receive path needs the patch.
+    "py-cord[voice]>=2.8.0,<2.8.2",
+    "davey>=0.1.4,<1",  # DAVE decryption; the patch imports it directly
 
     # Audio Processing
     "numpy>=1.24.0",
@@ -18,6 +20,7 @@ dependencies = [
     # VAD + wake word (CPU inference is plenty for these small models)
     "onnxruntime>=1.17.0",
     "silero-vad>=5.1",
+    "torch>=1.12.0",  # Silero runs on it; vad.py and speaking_detector.py import it directly
     "openwakeword>=0.6.0",
 
     # TTS (Inworld API)
