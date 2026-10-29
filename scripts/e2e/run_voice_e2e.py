@@ -747,6 +747,20 @@ def compute_metrics(r: RunResult) -> dict:
     return m
 
 
+def timing_summary(results: list[RunResult]) -> list[str]:
+    """Median and p90 of first audio and answer audio over the runs that had them."""
+    lines = []
+    for key, label in (("first_audio_s", "First audio"), ("answer_audio_s", "Answer audio")):
+        values = sorted(r.metrics[key] for r in results if r.metrics.get(key) is not None)
+        if not values:
+            continue
+        n = len(values)
+        median = (values[(n - 1) // 2] + values[n // 2]) / 2
+        p90 = values[min(n - 1, -(-9 * n // 10) - 1)]  # nearest rank
+        lines.append(f"{label}: median {median:.2f} s, p90 {p90:.2f} s ({n} runs)  ")
+    return lines
+
+
 def render_report(results: list[RunResult], scenarios: dict, sweep, threshold, out: Path):
     lines = ["# Voice E2E report", "",
              f"Run: {time.strftime('%Y-%m-%d %H:%M:%S')}  ", "",
@@ -758,7 +772,9 @@ def render_report(results: list[RunResult], scenarios: dict, sweep, threshold, o
         status = "PASS" if ok else ("KNOWN GAP" if sc.expect_fail else "FAIL")
         lines.append(f"| {r.name} | {status} | {r.metrics.get('first_audio_s', '-')} s | "
                      f"{r.metrics.get('answer_audio_s', '-')} s | {sc.note} |")
-    lines += ["", "Times are measured from the last packet of the user's speech.", ""]
+    lines += ["", "Times are measured from the last packet of the user's speech, so they include "
+              "the MIN_SILENCE_MS pause that ends a question.", ""]
+    lines += timing_summary(results) + [""]
 
     if sweep:
         lines += ["## Wake word sweep (offline)", "",
