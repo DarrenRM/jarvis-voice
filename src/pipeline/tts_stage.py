@@ -162,17 +162,24 @@ class TTSStage(StreamingPipelineStage):
                 self._spawn_synthesis_task(buffer.strip(), sentences_queued, queue)
                 sentences_queued += 1
 
+        except asyncio.CancelledError:
+            # Cancelled mid-stream (the speaker carried on, or the session stopped):
+            # nothing more of this answer plays, not even sentences already synthesized
+            self._cancelled = True
+            raise
+
         finally:
-            # Wait for all TTS tasks to complete
-            # (from voice_session.py:1134-1145)
-            if self._tasks:
-                await asyncio.gather(*self._tasks, return_exceptions=True)
-
-            # Signal end of queue
-            await queue.signal_end()
-
-            # Wait for playback to finish
-            await playback_task
+            if self._cancelled:
+                for task in self._tasks:
+                    task.cancel()
+                playback_task.cancel()
+                await asyncio.gather(*self._tasks, playback_task, return_exceptions=True)
+            else:
+                # Let every sentence finish synthesizing, then play out the queue
+                if self._tasks:
+                    await asyncio.gather(*self._tasks, return_exceptions=True)
+                await queue.signal_end()
+                await playback_task
 
         logger.debug(f"TTS stage completed: {sentences_queued} sentences processed")
 

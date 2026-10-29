@@ -290,7 +290,7 @@ class TestCancellation:
 
     @pytest.mark.asyncio
     async def test_cancel_stops_processing(self, mock_synthesizer, context):
-        """Cancellation stops processing."""
+        """stage.cancel() while sentences are still synthesizing: none of them play."""
         async def slow_synthesize(text):
             await asyncio.sleep(1)
             return make_audio()
@@ -304,22 +304,47 @@ class TestCancellation:
             yield "Third."
 
         played_audio = []
+        task = asyncio.create_task(
+            stage.process_stream(response_stream(), context, make_collector(played_audio))
+        )
+        await asyncio.sleep(0.1)
+        await stage.cancel()
+        await asyncio.wait_for(task, timeout=0.5)  # doesn't wait out the 1 s syntheses
 
-        async def run_and_cancel():
-            task = asyncio.create_task(
-                stage.process_stream(
-                    response_stream(), context,
-                    make_collector(played_audio)
-                )
-            )
-            await asyncio.sleep(0.1)
-            await stage.cancel()
-            await task
+        assert played_audio == []
 
-        await run_and_cancel()
+    @pytest.mark.asyncio
+    async def test_cancelled_mid_stream_plays_nothing_already_synthesized(
+        self, mock_synthesizer, context
+    ):
+        """The carry-on case: the model is still streaming and the first sentence is
+        synthesized, waiting for the room to go quiet, when the turn is cancelled. That
+        answer must never play, even once the room goes quiet."""
+        room_quiet = asyncio.Event()
+        played_audio = []
 
-        # Very few or no audio played due to cancellation
-        # (Depending on timing, may get some partial results)
+        async def play_when_quiet(audio):
+            await room_quiet.wait()
+            played_audio.append(audio)
+
+        async def response_stream():
+            yield "The answer is forty two.\n"
+            await asyncio.Event().wait()  # model still streaming the next sentence
+
+        stage = TTSStage(mock_synthesizer, inter_sentence_pause_ms=0)
+        task = asyncio.create_task(
+            stage.process_stream(response_stream(), context, play_when_quiet)
+        )
+        await asyncio.sleep(0.05)
+        assert mock_synthesizer.synthesize.await_count == 1
+
+        task.cancel()
+        room_quiet.set()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=0.5)
+        await asyncio.sleep(0.05)
+
+        assert played_audio == []
 
 
 class TestInterSentencePause:

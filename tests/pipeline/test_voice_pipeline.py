@@ -314,6 +314,52 @@ class TestCancellation:
         mock_transcription.cancel.assert_called()
         mock_tts.cancel.assert_called()
 
+    @pytest.mark.asyncio
+    async def test_carry_on_cancel_never_plays_the_cancelled_answer(
+        self, mock_transcription, context
+    ):
+        """VoiceSession._carried_on cancels the turn while the model is still streaming
+        and the first sentence waits for the room to go quiet. With the real TTSStage,
+        that answer must not play: the speaker is heard out and the turn starts over."""
+        from src.pipeline.tts_stage import TTSStage
+
+        played = []
+
+        async def play_audio(audio):
+            played.append(audio)
+
+        async def slow_room(*args, **kwargs):
+            await asyncio.sleep(0.2)  # room-silence debounce before the first sentence
+            return True
+
+        response = MagicMock()
+
+        async def still_streaming(text, ctx):
+            yield "The answer is forty two."
+            await asyncio.sleep(10)
+            yield " It was in the book."
+
+        response.process_stream = still_streaming
+        synth = MagicMock()
+        synth.synthesize = AsyncMock(return_value=np.ones(2400, dtype=np.float32))
+        pipeline = VoicePipeline(
+            mock_transcription, response, TTSStage(synth, inter_sentence_pause_ms=0)
+        )
+
+        process = asyncio.create_task(pipeline.process(
+            audio=make_audio(), context=context,
+            play_audio=play_audio, wait_for_silence=slow_room,
+        ))
+        await asyncio.sleep(0.1)  # answer synthesized, waiting for the room
+        assert synth.synthesize.await_count == 1 and not pipeline.answer_started
+        process.cancel()
+        await asyncio.wait({process}, timeout=1.0)
+        await pipeline.cancel()
+        await asyncio.sleep(0.3)  # past the room wait
+
+        assert process.done() and process.result() == "cancelled"
+        assert played == []
+
 
 class TestConversationReset:
     """Test conversation reset functionality."""
@@ -371,13 +417,12 @@ class TestEdgeCases:
         self, pipeline, context, wait_for_silence
     ):
         """Error in thinking phrase doesn't stop pipeline."""
-        first_call = [True]
+        played = []
 
         async def error_on_thinking(audio):
-            if first_call[0]:
-                first_call[0] = False
+            if len(audio) == 100:
                 raise RuntimeError("Play error")
-            # Subsequent calls succeed
+            played.append(audio)
 
         thinking_audio = make_audio(100)
 
@@ -391,8 +436,9 @@ class TestEdgeCases:
             thinking_audio=thinking_audio,
         )
 
-        # Pipeline continues after thinking phrase error
-        # (result depends on whether response playback also fails)
+        # The answer still plays: both response chunks from mock_tts
+        assert result is None
+        assert len(played) == 2
 
 
 class TestOpeningPhrase:
