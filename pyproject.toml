@@ -54,6 +54,15 @@ dev = [
 [project.scripts]
 claude-bot = "src.main:main"
 
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+# Install the code as the src package, so the claude-bot command can import src.main.
+# Left to itself, setuptools reads src/ as a src-layout folder and installs bot, audio...
+include = ["src", "src.*"]
+
 [tool.ruff]
 line-length = 100
 target-version = "py311"
