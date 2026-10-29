@@ -1231,7 +1231,10 @@ class VoiceSession:
         detector = self.speaking_detector
         if detector is None or not self.settings.speaking_detection_enabled:
             return False
-        return any(user != speaker_id for user in detector.get_speaking_users())
+        # The audio thread adds people to the detector as they start talking
+        with self.sink.lock if self.sink is not None else contextlib.nullcontext():
+            users = detector.get_speaking_users()
+        return any(user != speaker_id for user in users)
 
     def _watch_for_late_reply(self, speaker_id: Optional[int], question: str) -> None:
         """The bot asked a question and the reply window closed unanswered. If the person

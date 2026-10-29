@@ -190,6 +190,11 @@ class StreamingSink(discord.sinks.Sink):
         self._wake_processor.on_clip = on_wake_clip
 
     @property
+    def lock(self) -> threading.RLock:
+        """The lock that guards what py-cord's audio thread shares with the event loop."""
+        return self._lock
+
+    @property
     def state(self) -> str:
         """Current state of the sink."""
         return self._state

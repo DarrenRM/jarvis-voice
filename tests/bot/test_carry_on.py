@@ -248,6 +248,19 @@ class TestFollowUpWindow:
         await session._listen_for_followup(SPEAKER, 0.4, bot_asked=True)
         assert time.perf_counter() - started < 0.9
 
+    async def test_who_is_talking_is_read_under_the_sinks_lock(self):
+        """The audio thread adds people to the detector while this reads it."""
+        session, detector = followup_session(grace=0.6)
+        held = []
+
+        def get_speaking_users():
+            held.append(session.sink.lock._is_owned())
+            return [OTHER]
+
+        detector.get_speaking_users = get_speaking_users
+        assert session._others_talking(SPEAKER)
+        assert held == [True]
+
 
 class FakeObserver:
     def __init__(self):
