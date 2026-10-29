@@ -53,6 +53,9 @@ from ..session.thinking_phrase_generator import ThinkingPhraseGenerator
 CARRY_ON = "carry_on"
 # After a question's reply window closes unanswered, how long to watch for a late reply
 LATE_REPLY_WATCH_SECONDS = 5.0
+# py-cord calls a clip's after-callback when it ends; if it never does, stop waiting this
+# long past the clip's own length instead of hanging the session
+PLAYBACK_CALLBACK_GRACE_SECONDS = 5.0
 
 if TYPE_CHECKING:
     from ..monitor import TurnRecorder
@@ -955,7 +958,17 @@ class VoiceSession:
         self.voice_client.play(source, after=after_playback)
 
         # Wait for playback to complete
-        await playback_done.wait()
+        try:
+            await asyncio.wait_for(
+                playback_done.wait(), timeout=audio_duration + PLAYBACK_CALLBACK_GRACE_SECONDS
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"[PLAYBACK] No end-of-playback callback for a {audio_duration:.1f}s clip "
+                f"after {audio_duration + PLAYBACK_CALLBACK_GRACE_SECONDS:.1f}s; moving on"
+            )
+            if self.voice_client.is_playing():
+                self.voice_client.stop()
         if self.turn_observer:
             self.turn_observer.clip_ended(clip)
 

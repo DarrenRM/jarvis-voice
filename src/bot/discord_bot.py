@@ -74,6 +74,9 @@ class ClaudeBot(commands.Bot):
         self._session_task: Optional[asyncio.Task] = None
         self._rejoin_task: Optional[asyncio.Task] = None
         self._closing = False
+        # Greetings run in the background; held here so a task isn't garbage collected
+        # mid-greeting and its errors get logged
+        self._greetings: set[asyncio.Task] = set()
 
         # Live monitor (MONITOR_ENABLED): posts problems seen in voice turns to a text
         # channel; the owner approves them with reactions. None when off.
@@ -340,7 +343,14 @@ class ClaudeBot(commands.Bot):
         if self._session.voice_client and after.channel == self._session.voice_client.channel:
             # They just arrived (weren't in our channel before)
             if before.channel != after.channel:
-                asyncio.create_task(self._session.greet_user(member))
+                task = asyncio.create_task(self._session.greet_user(member))
+                self._greetings.add(task)
+                task.add_done_callback(self._greeting_done)
+
+    def _greeting_done(self, task: asyncio.Task) -> None:
+        self._greetings.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            logger.warning(f"Greeting failed: {task.exception()!r}")
 
     def _monitor_channel(self) -> Optional[discord.TextChannel]:
         """The monitor's text channel (MONITOR_CHANNEL_NAME), if the bot can see it."""
