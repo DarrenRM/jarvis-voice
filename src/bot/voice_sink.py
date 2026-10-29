@@ -184,6 +184,7 @@ class StreamingSink(discord.sinks.Sink):
             wake_model_name=wake_model_name,
             wake_threshold=wake_threshold,
             wake_sample_rate=wake_sample_rate,
+            load_on_demand=False,  # write() loads them outside the lock
         )
         self._wake_processor = WakeWordProcessor(self._user_manager)
         self._wake_processor.on_clip = on_wake_clip
@@ -562,6 +563,11 @@ class StreamingSink(discord.sinks.Sink):
         py-cord stops recording for good: the bot would stay in the channel but never
         hear another wake word. So a packet that fails is logged and dropped instead.
 
+        A new speaker's wake word detector is loaded after the lock is released. Loading
+        takes about 0.1 s (longer if the model files have to be downloaded), and the
+        event loop's idle poll waits on this lock. Their first packet goes without wake
+        word detection; it still lands in their pre-buffer.
+
         Args:
             data: Raw PCM audio bytes (48kHz stereo s16le), or py-cord 2.8's VoiceData
                 (PCM in .pcm)
@@ -570,6 +576,12 @@ class StreamingSink(discord.sinks.Sink):
         try:
             with self._lock:
                 self._write(data, user)
+                wanted = self._user_manager.take_detector_requests()
+            for user_id in wanted:
+                detector = self._user_manager.load_detector(user_id)
+                if detector is not None:
+                    with self._lock:
+                        self._user_manager.add_detector(user_id, detector)
         except Exception:
             self._write_errors += 1
             now = time.perf_counter()

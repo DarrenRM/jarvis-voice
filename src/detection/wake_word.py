@@ -9,6 +9,17 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def download_wake_word_models() -> None:
+    """Download openWakeWord's pretrained models if they aren't on disk yet.
+
+    Only a fresh install downloads anything, with no timeout, so main() calls this
+    once at startup, before the bot connects. After that it only checks the files.
+    """
+    import openwakeword.utils
+
+    openwakeword.utils.download_models()
+
+
 class WakeWordDetector:
     """Wake word detection using OpenWakeWord.
 
@@ -54,11 +65,10 @@ class WakeWordDetector:
     def _load_model(self, model_path: Optional[str] = None, model_name: Optional[str] = None) -> None:
         """Load OpenWakeWord model."""
         try:
-            import openwakeword
             from openwakeword import Model
 
-            # Download default models if not present
-            openwakeword.utils.download_models()
+            # Normally already done at startup; downloads again if that failed
+            download_wake_word_models()
 
             if model_path and Path(model_path).exists():
                 # Custom model

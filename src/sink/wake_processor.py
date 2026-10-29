@@ -118,7 +118,7 @@ class WakeWordProcessor:
         detector = self._user_manager.ensure_detector(state)
 
         if detector is None:
-            # Max detectors reached
+            # Max detectors reached, or the model is still loading or failed to load
             return False
 
         # Reset silence attempts on new audio

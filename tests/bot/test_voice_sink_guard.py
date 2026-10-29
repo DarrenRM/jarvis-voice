@@ -102,6 +102,94 @@ class TestWakeModelLoadFailure:
         assert loaded == ["failed", "ok"]
 
 
+class FakeDetector:
+    def __init__(self, **kwargs):
+        pass
+
+    def process(self, audio):
+        return False
+
+    def flush(self):
+        return False
+
+    def reset(self):
+        pass
+
+
+class TestSlowModelLoad:
+    def test_a_slow_load_does_not_hold_the_lock_the_event_loop_waits_on(self, monkeypatch):
+        """A new speaker's detector can take a while to load (seconds on a fresh install,
+        while the model files download). The session's idle poll runs on the event loop
+        every 200 ms and takes the sink's lock: it must not wait out the load."""
+        loading, finish = threading.Event(), threading.Event()
+
+        class SlowDetector(FakeDetector):
+            def __init__(self, **kwargs):
+                loading.set()
+                finish.wait(5.0)
+
+        monkeypatch.setattr("src.detection.WakeWordDetector", SlowDetector)
+        sink = StreamingSink(vad=None)
+        router = threading.Thread(target=sink.write, args=(pcm(), NEWCOMER))
+        router.start()
+        try:
+            assert loading.wait(2.0)
+            poll = threading.Thread(target=sink.check_idle_audio_gap)  # the idle poll
+            poll.start()
+            poll.join(1.0)
+            assert not poll.is_alive(), "the idle poll waited for the model to load"
+        finally:
+            finish.set()
+            router.join(5.0)
+
+        assert isinstance(sink._user_manager.get(NEWCOMER).detector, SlowDetector)
+        assert sink._write_errors == 0
+
+    def test_the_next_packet_uses_the_loaded_detector(self, monkeypatch):
+        heard = []
+
+        class Detector(FakeDetector):
+            def process(self, audio):
+                heard.append(len(audio))
+                return False
+
+        monkeypatch.setattr("src.detection.WakeWordDetector", Detector)
+        sink = StreamingSink(vad=None)
+        sink.write(pcm(), NEWCOMER)  # asks for a detector, loaded after the lock
+        sink.write(pcm(), NEWCOMER)
+
+        assert heard and isinstance(sink._user_manager.get(NEWCOMER).detector, Detector)
+
+    def test_models_are_downloaded_at_startup_before_the_bot_connects(self, monkeypatch):
+        import src.main as main_module
+
+        downloads = []
+        monkeypatch.setattr(main_module, "download_wake_word_models",
+                            lambda: downloads.append(True))
+        monkeypatch.setattr(main_module, "VAD", lambda **kwargs: object())
+        monkeypatch.setattr(main_module, "TTSSynthesizer", lambda **kwargs: object())
+
+        main_module.preload_components(main_module.get_settings())
+
+        assert downloads == [True]
+
+    def test_a_failed_startup_download_is_logged_not_fatal(self, monkeypatch, caplog):
+        import src.main as main_module
+
+        def offline():
+            raise OSError("no network")
+
+        monkeypatch.setattr(main_module, "download_wake_word_models", offline)
+        monkeypatch.setattr(main_module, "VAD", lambda **kwargs: object())
+        monkeypatch.setattr(main_module, "TTSSynthesizer", lambda **kwargs: object())
+
+        with caplog.at_level("ERROR", logger="src.main"):
+            components = main_module.preload_components(main_module.get_settings())
+
+        assert "Could not download the wake word models" in caplog.text
+        assert set(components) == {"vad", "tts"}
+
+
 class TestSharedModelsAreLocked:
     def test_listening_reset_waits_for_the_packet_being_processed(self):
         """vad.reset() from the event loop must not run inside detect_endpoint()."""

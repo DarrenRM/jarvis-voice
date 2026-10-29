@@ -17,7 +17,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.config import get_settings, Settings
 from src.bot import ClaudeBot
-from src.detection import VAD
+from src.detection import VAD, download_wake_word_models
 from src.tts import TTSSynthesizer
 from src.audio import SAMPLE_RATE_PROCESSING
 
@@ -63,8 +63,17 @@ def preload_components(settings: Settings) -> dict:
 
     logger.info("Pre-loading ML components...")
 
-    # Note: Wake word detectors are now created per-user in StreamingSink
-    # for accurate speaker attribution
+    # Wake word: each speaker gets their own detector in StreamingSink (for accurate
+    # attribution), loaded from these files. A fresh install downloads them here,
+    # before the bot connects, rather than when the first person speaks
+    logger.info("Checking wake word models (downloaded on first run)...")
+    try:
+        download_wake_word_models()
+    except Exception as e:
+        logger.error(
+            f"Could not download the wake word models: {e}. "
+            "Trying again when someone first speaks."
+        )
 
     # VAD
     logger.info("Loading VAD...")

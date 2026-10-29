@@ -57,7 +57,7 @@ Optional: `USER_NAMES` (map Discord user IDs to friendly names), `TINYFISH_API_K
 
 Two settings make the bot speak unprompted and are on by default: it greets people who join its voice channel (`GREETING_*`), and after 50 idle minutes it says a short line so Discord doesn't drop the connection (`KEEP_ALIVE_*`).
 
-The `hey_jarvis` wake word is openWakeWord's pretrained model, downloaded on first run. openWakeWord's pretrained models are licensed CC BY-NC-SA 4.0 (non-commercial).
+The `hey_jarvis` wake word is openWakeWord's pretrained model, downloaded at startup on first run. openWakeWord's pretrained models are licensed CC BY-NC-SA 4.0 (non-commercial).
 
 Tests run offline and need no keys or `.env`:
 
