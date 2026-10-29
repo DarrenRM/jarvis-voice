@@ -1,7 +1,7 @@
 """Tests for SpeakerManager."""
 
 import pytest
-from unittest.mock import Mock, MagicMock
+from unittest.mock import Mock
 
 from src.bot.speaker_manager import SpeakerManager, SpeakerInfo
 

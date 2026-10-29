@@ -69,7 +69,7 @@ The end-to-end audio harness (`scripts/e2e/run_voice_e2e.py`) drives the real pi
 
 ## Status
 
-In use at every game night by four regulars since January 2026. The suite has 795 automated tests, and the audio harness covers 45 scripted scenarios and can replay clips saved from live turns. The recordings are real voices from game nights and are kept private, not in this repository.
+In use at every game night by four regulars since January 2026. The suite has 802 automated tests, and the audio harness covers 45 scripted scenarios and can replay clips saved from live turns. The recordings are real voices from game nights and are kept private, not in this repository.
 
 ## How it was built
 

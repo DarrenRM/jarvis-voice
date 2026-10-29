@@ -1,7 +1,6 @@
 """Tests for system prompt builder."""
 
 import pytest
-from unittest.mock import patch
 from datetime import datetime
 
 from src.llm.system_prompt_builder import (

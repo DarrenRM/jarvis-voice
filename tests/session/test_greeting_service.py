@@ -1,11 +1,10 @@
 """Tests for greeting service."""
 
-import asyncio
 import time
 
 import numpy as np
 import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from src.session.greeting_service import GreetingService
 

@@ -353,8 +353,6 @@ class TestMultipleUsers:
         manager = PerUserAudioManager()
         processor = WakeWordProcessor(manager)
 
-        detection_order = []
-
         def make_mock_that_detects_on_second():
             mock = MagicMock()
             call_count = [0]

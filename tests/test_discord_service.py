@@ -1,6 +1,5 @@
 """Tests for DiscordService."""
 
-import asyncio
 import pytest
 from unittest.mock import Mock, AsyncMock, patch
 import discord

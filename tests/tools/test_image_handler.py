@@ -1,7 +1,7 @@
 """Tests for image tool handlers."""
 
 import pytest
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import AsyncMock
 
 from src.tools.handlers.image import GenerateImageHandler, EditImageHandler
 

@@ -11,7 +11,6 @@ import time
 from unittest.mock import MagicMock
 
 import numpy as np
-import pytest
 
 from src.sink.user_audio_state import UserAudioState, SAMPLE_RATE_PROCESSING
 

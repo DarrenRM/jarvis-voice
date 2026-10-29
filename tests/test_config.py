@@ -1,6 +1,5 @@
 """Tests for configuration parsing."""
 
-import os
 import pytest
 
 

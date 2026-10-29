@@ -1,6 +1,5 @@
 """Tests for session phrase constants and helpers."""
 
-import pytest
 
 from src.session.phrases import (
     ACK_PHRASES,

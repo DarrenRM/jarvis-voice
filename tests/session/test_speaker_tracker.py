@@ -1,7 +1,7 @@
 """Tests for speaker tracking."""
 
 import pytest
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 from src.session.speaker_tracker import SpeakerTracker, SpeakerContext
 from src.bot.speaker_manager import SpeakerManager, SpeakerInfo

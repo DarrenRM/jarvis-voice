@@ -10,7 +10,7 @@ import numpy as np
 import pytest
 
 from src.pipeline.base import PipelineContext
-from src.pipeline.tts_stage import TTSStage, INTER_SENTENCE_PAUSE_MS
+from src.pipeline.tts_stage import TTSStage
 
 
 def make_audio(samples: int = 1000, value: float = 0.5) -> np.ndarray:
@@ -368,9 +368,9 @@ class TestInterSentencePause:
         await stage.process_stream(response_stream(), context, track_time)
         end = asyncio.get_event_loop().time()
 
-        # Should have taken at least 50ms due to pause
-        assert len(play_times) == 2
         # Note: First sentence has no pause before it
+        assert len(play_times) == 2
+        assert end - start >= 0.04  # the 50 ms pause, less the clock's resolution
 
     @pytest.mark.asyncio
     async def test_no_pause_with_zero_setting(self, mock_synthesizer, context):

@@ -11,7 +11,6 @@ Tests the lifecycle management of per-user audio states including:
 from unittest.mock import MagicMock, patch
 
 import numpy as np
-import pytest
 
 from src.sink.per_user_manager import PerUserAudioManager
 from src.sink.user_audio_state import UserAudioState
