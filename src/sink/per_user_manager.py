@@ -31,8 +31,6 @@ class PerUserAudioManager:
     - User cleanup on disconnect
     - Batch reset operations
 
-    Ported from voice_sink.py:152-200 and related per-user dict management.
-
     Example:
         manager = PerUserAudioManager(
             wake_model_name="hey_jarvis",
@@ -103,8 +101,6 @@ class PerUserAudioManager:
         Each user gets their own wake word detector to prevent cross-talk
         interference and ensure accurate user attribution.
 
-        Ported from voice_sink.py:152-179.
-
         Args:
             state: User's audio state
 
@@ -151,7 +147,6 @@ class PerUserAudioManager:
         """Clean up user state on disconnect.
 
         Releases all resources associated with the user.
-        Ported from voice_sink.py:181-200.
 
         Args:
             user_id: Discord user ID
@@ -178,7 +173,6 @@ class PerUserAudioManager:
 
         Called on idle transition to clear pending detection state.
         Does not destroy detectors, just resets their internal state.
-        Ported from voice_sink.py:147-148.
         """
         # Snapshot to avoid race condition during iteration
         for state in list(self._users.values()):
@@ -188,7 +182,6 @@ class PerUserAudioManager:
         """Clear silence attempt counters for all users.
 
         Called on idle transition.
-        Ported from voice_sink.py:150.
         """
         # Snapshot to avoid race condition during iteration
         for state in list(self._users.values()):
@@ -198,7 +191,6 @@ class PerUserAudioManager:
         """Clear pre-buffers for all users.
 
         Called after wake word transfer to prevent stale audio.
-        Ported from voice_sink.py:224.
         """
         # Snapshot to avoid race condition during iteration
         for state in list(self._users.values()):

@@ -1,6 +1,6 @@
 """Streaming TTS stage with parallel synthesis and ordered playback.
 
-Extracts patterns from voice_session.py:1066-1145:
+How it works:
 - Sentence boundary detection (newlines + punctuation)
 - Parallel TTS task spawning
 - Ordered queue for out-of-order handling
@@ -20,7 +20,7 @@ from .base import PipelineContext, StreamingPipelineStage
 logger = logging.getLogger(__name__)
 
 
-# Inter-sentence pause duration (from voice_session.py:850)
+# Pause between sentences
 INTER_SENTENCE_PAUSE_MS = 150
 
 
@@ -48,7 +48,7 @@ class TTSStage(StreamingPipelineStage):
     Receives streaming text chunks, detects sentence boundaries,
     spawns parallel TTS tasks, and queues audio for ordered playback.
 
-    Key patterns preserved from voice_session.py:
+    Key patterns:
     - Sentence boundary detection (newlines + punctuation)
     - Parallel TTS task spawning per sentence
     - OrderedPlaybackQueue for out-of-order handling
@@ -139,7 +139,7 @@ class TTSStage(StreamingPipelineStage):
                         sentences_queued += 1
                     number_end = None
 
-                # Primary: Split on newlines (from voice_session.py:1096)
+                # Primary: Split on newlines
                 while "\n" in buffer:
                     line, buffer = buffer.split("\n", 1)
                     line = line.strip()
@@ -148,7 +148,6 @@ class TTSStage(StreamingPipelineStage):
                         sentences_queued += 1
 
                 # Secondary: Split on sentence-ending punctuation
-                # (from voice_session.py:1118-1122)
                 buffer = buffer.strip()
                 if buffer.endswith(".") and buffer[-2:-1].isdigit():
                     number_end = len(buffer)
@@ -220,7 +219,6 @@ class TTSStage(StreamingPipelineStage):
         """Synthesize text and queue audio for playback.
 
         On TTS failure, queues empty audio to not block ordering.
-        (Pattern from voice_session.py:950-953)
 
         Args:
             text: Text to synthesize
@@ -263,7 +261,7 @@ class TTSStage(StreamingPipelineStage):
 
             await callback(audio)
 
-            # Inter-sentence pause (from voice_session.py:850)
+            # Inter-sentence pause
             if not first_audio and self._inter_sentence_pause_ms > 0:
                 await asyncio.sleep(self._inter_sentence_pause_ms / 1000)
 

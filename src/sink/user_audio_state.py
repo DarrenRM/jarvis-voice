@@ -70,10 +70,7 @@ class UserAudioState:
         self._trim_pre_buffer()
 
     def _trim_pre_buffer(self) -> None:
-        """Trim pre-buffer to max size using FIFO eviction.
-
-        Ported from voice_sink.py:513-518.
-        """
+        """Trim pre-buffer to max size using FIFO eviction."""
         total_samples = sum(len(chunk) for chunk in self.pre_buffer)
         max_samples = self.max_pre_buffer_samples
 
@@ -120,7 +117,7 @@ class UserAudioState:
         """Increment and return silence attempt counter.
 
         Used to track silence padding attempts for wake word flush.
-        Limited to 5 attempts per gap (see refactor-edge-cases.md Section 2.3).
+        Limited to 5 attempts per gap (docs/archive/refactor-edge-cases.md, Section 2.3).
 
         Returns:
             New attempt count after increment.

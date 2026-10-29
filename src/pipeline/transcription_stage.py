@@ -1,7 +1,6 @@
 """Transcription stage for voice pipeline.
 
 This module provides STT with wake word stripping.
-Extracts pattern from voice_session.py:956-984.
 """
 
 import logging
@@ -61,8 +60,6 @@ class TranscriptionResult:
 class TranscriptionStage(PipelineStage):
     """STT stage with wake word stripping.
 
-    Extracts pattern from voice_session.py:956-984.
-
     Flow:
     1. Transcribe audio via STT client
     2. Strip wake word prefix if present
@@ -82,7 +79,6 @@ class TranscriptionStage(PipelineStage):
 
     # Wake word pattern for stripping from transcription
     # Matches variations like: "hey jarvis", "hey, jarvis", "a jarvis"
-    # Pattern extracted from voice_session.py:956-959
     DEFAULT_WAKE_PATTERN = re.compile(
         r"^(hey[,\s]*jarvis|a[,\s]*jarvis)[,.\s!?]*",
         re.IGNORECASE,
@@ -159,8 +155,6 @@ class TranscriptionStage(PipelineStage):
 
     def _strip_wake_word(self, text: str) -> Optional[str]:
         """Strip wake word from transcription.
-
-        Extracts pattern from voice_session.py:961-984.
 
         Args:
             text: Raw transcription text

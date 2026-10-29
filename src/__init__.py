@@ -1,1 +1,1 @@
-"""Discord Voice Claude Bot - Voice-activated AI assistant."""
+"""Jarvis - a voice assistant for Discord calls."""

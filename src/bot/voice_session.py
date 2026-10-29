@@ -44,7 +44,6 @@ from . import pycord_dave_patch
 from .voice_sink import CARRY_ON_MIN_SPEECH_SECONDS, StreamingSink
 from .voice_source import TTSAudioSource
 
-# Phase 4 imports (conditionally used based on feature flags)
 from ..session.speaker_tracker import SpeakerTracker
 from ..session.greeting_service import GreetingService
 from ..session.phrases import get_random_ack, get_thinking_phrase, get_affirmation_phrase
@@ -88,7 +87,7 @@ class VoiceSession:
             vad: VAD instance
             speaking_detector: SpeakingDetector instance for multi-user awareness
             groq_client: GroqWhisperClient instance (STT)
-            llm: LLM client instance (Claude or Groq)
+            llm: LLM service (Qwen on Cerebras)
             tts: TTSSynthesizer instance
             turn_observer: Live monitor's recorder (MONITOR_ENABLED); notified of each
                 turn's timings and results, never changes what the session does
@@ -114,7 +113,7 @@ class VoiceSession:
         self.llm = llm
         self.tts = tts
 
-        # New modular pipeline (Phase 2)
+        # Transcription -> response -> TTS (built in _init_components)
         self._voice_pipeline: Optional[VoicePipeline] = None
 
         # Discord voice

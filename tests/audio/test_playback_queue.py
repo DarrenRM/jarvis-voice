@@ -1,6 +1,6 @@
 """Tests for OrderedPlaybackQueue.
 
-Tests the critical sentence ordering pattern from voice_session.py:852-923.
+Tests the critical sentence ordering pattern.
 """
 
 import asyncio
@@ -99,7 +99,7 @@ class TestOrderedPlaybackQueue:
     async def test_empty_audio_doesnt_block(self, queue):
         """Empty audio (TTS failure) doesn't block subsequent sentences.
 
-        CRITICAL: From voice_session.py:950-953 - on TTS error,
+        CRITICAL: on TTS error,
         queue empty audio to not block ordering.
         """
         await queue.put(1, make_audio(100, 0.1))

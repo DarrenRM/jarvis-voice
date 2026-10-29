@@ -9,7 +9,8 @@
 Files are 16 kHz mono 16-bit WAV. Local only (the folder is gitignored); once it
 passes MONITOR_AUDIO_MAX_MB the oldest recordings are deleted. Writes happen on a
 worker thread so neither the event loop nor the audio thread waits on the disk.
-scripts/irl/replay_recordings.py plays them back through Whisper and the wake word.
+`scripts/e2e/run_voice_e2e.py --recordings` plays them back through the real pipeline
+and adds the wake clips to its wake word sweep.
 """
 
 from __future__ import annotations

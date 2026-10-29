@@ -3,7 +3,6 @@
 import asyncio
 import io
 import logging
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -15,7 +14,7 @@ class NanoBananaClient:
     multi-turn editing (e.g., "edit that to add silly hats").
     """
 
-    MODEL = "gemini-2.5-flash-image" # Claude never change this
+    MODEL = "gemini-2.5-flash-image"  # pinned on purpose: agents must not change it
 
     def __init__(self, api_key: str):
         """Initialize the Nano Banana client.

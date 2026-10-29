@@ -70,7 +70,7 @@ class StreamingTTSBuffer:
         """Add text chunk to buffer.
 
         Args:
-            text: Text chunk from Claude stream
+            text: Text chunk from the LLM stream
         """
         self._text_buffer += text
 

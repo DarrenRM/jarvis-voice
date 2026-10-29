@@ -5,7 +5,6 @@ Uses Groq's hosted Whisper Large v3 for ~189x realtime transcription.
 
 import io
 import logging
-from typing import Optional
 
 import numpy as np
 

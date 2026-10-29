@@ -1,6 +1,6 @@
 """Tests for TranscriptionStage.
 
-Tests the STT and wake word stripping logic from voice_session.py:956-984.
+Tests the STT and wake word stripping logic.
 """
 
 import re

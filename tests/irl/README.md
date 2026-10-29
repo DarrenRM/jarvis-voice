@@ -11,5 +11,5 @@ Adding a case: put the real data (who, ids, what was said, timings, expected out
 test next to the similar ones; `replay.py` has the helpers (`Room.say` sends speech to
 the sink as Discord packets, `ScriptedPipeline` stands in for the LLM/TTS pipeline).
 
-This is layer 1. Live evals against the real services live elsewhere: the addressee
-judge eval in `scripts/irl/` and the IRL voice scenarios in `scripts/e2e`.
+This is layer 1. Live checks against the real services live in `scripts/e2e`: the IRL
+voice scenarios (`--irl`), and `--recordings` to replay clips the live bot saved.

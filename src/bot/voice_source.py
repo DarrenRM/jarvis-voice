@@ -5,7 +5,6 @@ Converts TTS output (24kHz mono) to Discord format (48kHz stereo).
 
 import io
 import logging
-from typing import Optional
 
 import discord
 import numpy as np

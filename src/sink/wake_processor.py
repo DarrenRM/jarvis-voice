@@ -5,14 +5,13 @@ Handles wake word detection including:
 - Silence padding for PTT (push-to-talk) detection
 - Wake word user ID capture at detection time
 
-Critical timing constraints (from refactor-edge-cases.md Section 2.3):
+Critical timing constraints (docs/archive/refactor-edge-cases.md, Section 2.3):
 - Gap window: 250ms-2.5s (too short = false positives, too long = stale)
 - Max 5 silence attempts per user per gap
 - Capture wake_word_user_id at detection time (NOT later)
 """
 
 import logging
-import time
 from typing import TYPE_CHECKING, Callable, Optional
 
 import numpy as np
@@ -50,9 +49,6 @@ class WakeWordProcessor:
     - Wake word user captured at detection time (not start_listening time)
     - Gap window 250ms-2.5s for silence padding
     - Max 5 silence attempts per user per gap
-
-    Ported from voice_sink.py:315-380 (check_idle_audio_gap) and
-    voice_sink.py:520-533 (wake word detection in write).
 
     Example:
         processor = WakeWordProcessor(user_manager)
@@ -111,8 +107,6 @@ class WakeWordProcessor:
         Called for each audio packet in idle state.
         If wake word is detected, captures user_id for speaker isolation.
 
-        Ported from voice_sink.py:520-533.
-
         Args:
             user_id: Discord user ID
             audio_16k: Audio data (16kHz mono float32)
@@ -133,7 +127,7 @@ class WakeWordProcessor:
         # Process through detector
         if detector.process(audio_16k):
             # Wake word detected! Capture user ID at detection time.
-            # This is critical for speaker isolation (see refactor-edge-cases.md Section 3.5)
+            # This is critical for speaker isolation (docs/archive/refactor-edge-cases.md, Section 3.5)
             self._wake_word_user_id = user_id
             logger.info(f"[WAKE_PROCESSOR] Wake word detected from user {user_id}")
             self.report_clip(state, hit=True)
@@ -151,8 +145,6 @@ class WakeWordProcessor:
         "loaded" in its internal state but needs more audio to complete
         the detection.
 
-        Ported from voice_sink.py:315-380.
-
         Critical timing constraints:
         - Only check users with 250ms-2.5s gap (recent enough to be relevant)
         - Max 5 attempts per user per gap (prevents infinite loops)
@@ -161,7 +153,6 @@ class WakeWordProcessor:
         Returns:
             User ID if wake word detected, None otherwise
         """
-        now = time.time()
         silence = np.zeros(SILENCE_SAMPLES, dtype=np.float32)
 
         for state in self._user_manager:

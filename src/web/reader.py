@@ -8,7 +8,8 @@ Guards:
 - byte cap on the download and a MIME allowlist
 
 DNS is checked before each hop, not pinned for the connection, so a hostile
-DNS server could still rebind between check and connect. Fine for a home bot.
+DNS server could still rebind between check and connect. That is out of scope for
+a bot that serves one group of known people.
 """
 
 import asyncio

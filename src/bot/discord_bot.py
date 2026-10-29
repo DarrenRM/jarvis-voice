@@ -1,6 +1,6 @@
 """Discord bot with voice assistant support.
 
-Integrates voice session for wake word, STT, Claude, and TTS.
+Integrates the voice session: wake word, STT, the LLM and TTS.
 """
 
 import asyncio
@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 
 
 class ClaudeBot(commands.Bot):
-    """Discord bot with Claude voice assistant.
+    """Discord bot running the Jarvis voice assistant.
 
     Commands:
     - !join: Join your voice channel and start listening
@@ -42,7 +42,7 @@ class ClaudeBot(commands.Bot):
         Args:
             settings: Application settings
             vad: Shared VAD (optional)
-            llm: Shared LLM client (Claude or Groq) (optional)
+            llm: Shared LLM client (optional)
             tts: Shared TTSSynthesizer (optional)
         """
         intents = discord.Intents.default()

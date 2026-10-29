@@ -259,7 +259,6 @@ class VoicePipeline:
                 """Play audio, waiting for thinking phrase first."""
                 if not waited_for_thinking[0]:
                     # Wait for thinking phrase to finish
-                    # (from voice_session.py:889-899)
                     await thinking_done.wait()
                     waited_for_thinking[0] = True
 

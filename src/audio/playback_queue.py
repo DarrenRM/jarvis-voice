@@ -4,7 +4,7 @@ This module provides an ordered queue that handles out-of-order audio arrivals
 from parallel TTS tasks. Audio chunks are numbered and played back in order
 regardless of synthesis completion order.
 
-Critical pattern from voice_session.py:852-923 - MUST be preserved:
+Critical pattern - MUST be preserved:
 - pending dict for out-of-order handling
 - next_to_play counter
 - None sentinel signals end of stream
@@ -13,7 +13,7 @@ Critical pattern from voice_session.py:852-923 - MUST be preserved:
 
 import asyncio
 import logging
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import AsyncIterator, Optional
 
 import numpy as np

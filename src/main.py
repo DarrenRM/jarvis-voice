@@ -1,4 +1,4 @@
-"""Discord Voice Claude Bot - Entry Point."""
+"""Jarvis entry point."""
 
 import asyncio
 import logging
@@ -264,9 +264,9 @@ def main() -> None:
     # Setup async logging (returns listener for cleanup)
     log_listener = setup_logging(settings.log_level)
 
-    logger.info("Starting Discord Voice Claude Bot")
+    logger.info("Starting Jarvis")
     logger.info(f"Wake word: {settings.wake_word_model.replace('_', ' ')}")
-    logger.info(f"STT: Groq Whisper")
+    logger.info("STT: Groq Whisper")
     logger.info(f"TTS voice: {settings.tts_voice}")
 
     # Pre-load ML components for faster voice session startup

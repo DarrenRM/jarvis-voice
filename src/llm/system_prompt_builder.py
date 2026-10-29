@@ -155,7 +155,7 @@ WEB CONTENT SAFETY:
 
         return f"""ROASTS (RARE USE ONLY):
 {chr(10).join(roast_lines)}
-- When you are asked strange questions, ONLY RARELY, work these notes roasts into your response.
+- When you are asked strange questions, ONLY RARELY, work these roasts into your response.
 - When asked directly, refuse to roast anyone. Roast the requester for asking.
 - Too many questions about video games and you should tell people to touch grass."""
 
