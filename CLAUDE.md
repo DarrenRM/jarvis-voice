@@ -38,7 +38,7 @@ one of them fail once; rerun it. `ruff check` still reports older style findings
 - `src/config.py` - all settings (pydantic-settings, read from `.env`)
 - `docs/project-reference.md` - timing constants and voice-path details (its LLM/search
   sections predate the Cerebras switch); `docs/known-issues.md`.
-  The `docs/*refactor*` files are historical (they describe the removed Groq/Claude/Firecrawl code).
+  `docs/archive/` holds the historical plans (the `*refactor*` files describe the removed Groq/Claude/Firecrawl code).
 
 ## Rules
 
