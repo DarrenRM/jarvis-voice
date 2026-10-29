@@ -36,9 +36,8 @@ one of them fail once; rerun it. `ruff check` still reports older style findings
   Text checks are shared with `scripts/e2e` (`--monitor` dry-runs it)
 - `src/detection/`, `src/stt/`, `src/tts/`, `src/session/`, `src/sink/` - voice path
 - `src/config.py` - all settings (pydantic-settings, read from `.env`)
-- `docs/project-reference.md` - timing constants and voice-path details (its LLM/search
-  sections predate the Cerebras switch); `docs/known-issues.md`.
-  `docs/archive/` holds the historical plans (the `*refactor*` files describe the removed Groq/Claude/Firecrawl code).
+- `docs/archive/` - the January plans, reference and notes, kept as a record (see its
+  README). They describe the bot as it was then, not the current code.
 
 ## Rules
 
@@ -57,6 +56,5 @@ one of them fail once; rerun it. `ruff check` still reports older style findings
   `Settings(_env_file=None)` to avoid reading the real `.env`.
 - **Line endings are mixed (CRLF and LF).** Preserve each file's existing endings; don't
   churn whole files.
-- Features off by default: image generation (`IMAGE_GENERATION_ENABLED`), deep research
-  (`DEEP_RESEARCH_ENABLED`, planned: OpenAI via Codex/ChatGPT sign-in, not wired up),
-  live monitor (`MONITOR_ENABLED`).
+- Features off by default: image generation (`IMAGE_GENERATION_ENABLED`), dynamic thinking
+  phrases (`DYNAMIC_THINKING_ENABLED`), live monitor (`MONITOR_ENABLED`).
